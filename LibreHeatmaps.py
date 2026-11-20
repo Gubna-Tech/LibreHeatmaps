@@ -8,6 +8,7 @@ import hashlib
 import html
 import io
 import json
+import marshal
 import math
 import re
 import os
@@ -21,6 +22,9 @@ import shutil
 import struct
 import tempfile
 import threading
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import ExitStack
+import multiprocessing
 from collections import OrderedDict
 from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +34,7 @@ import webbrowser
 import zipfile
 import zlib
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 FORMATS = (".fit", ".fit.gz", ".gpx", ".gpx.gz", ".tcx", ".tcx.gz")
 MAX_MEMBER = 512 * 1024 * 1024
 MAX_UPLOAD = 8 * 1024 * 1024 * 1024
@@ -41,19 +45,55 @@ STATE_LOCK = threading.RLock()
 JOB = {"status": "idle", "processed": 0, "total": 0, "added": 0, "skipped": 0, "failed": 0, "message": "", "metadata_rows": 0, "updated": 0}
 VIEW_CACHE = OrderedDict()
 VIEW_CACHE_BYTES = 0
-MAX_VIEW_CACHE_BYTES = 32 * 1024 * 1024
-# Reuse projected GPS coordinates across pan/zoom requests, with a hard memory cap.
+MAX_VIEW_CACHE_BYTES = 64 * 1024 * 1024
 TRACK_CACHE = OrderedDict()
 TRACK_CACHE_BYTES = 0
-MAX_TRACK_CACHE_BYTES = 96 * 1024 * 1024
+MAX_TRACK_CACHE_BYTES = 256 * 1024 * 1024
 CACHE_STATE = {"epoch": 0}
+HEAT_WORKERS = None
+HEAT_WORKERS_LOCK = threading.Lock()
+HEAT_CANCEL_FLAGS = None
+HEAT_CANCEL_LOCK = threading.Lock()
+HEAT_PARALLEL_DISABLED = False
 DB_PATH = None
 UPDATE_READY = None
 UPDATE_LOCK = threading.Lock()
 RELEASE_REPO = "Gubna-Tech/LibreHeatmaps"
 ACTIVE_CLIENTS = {}
+DEPARTED_CLIENTS = {}
 CLIENT_LOCK = threading.RLock()
+CLIENT_SEEN = False
+CLIENT_EMPTY_SINCE = None
 SERVER_STARTED = time.monotonic()
+VIEW_SESSIONS = OrderedDict()
+VIEW_SESSIONS_LOCK = threading.Lock()
+
+
+class ViewCancelled(Exception):
+    pass
+
+
+def current_view_cancelled(session, serial):
+    if not session:
+        return lambda: False
+    with VIEW_SESSIONS_LOCK:
+        last=VIEW_SESSIONS.get(session,0)
+        advanced=serial>last
+        if advanced:
+            VIEW_SESSIONS[session]=serial
+            VIEW_SESSIONS.move_to_end(session)
+        while len(VIEW_SESSIONS)>64:
+            VIEW_SESSIONS.popitem(last=False)
+    if advanced and HEAT_CANCEL_FLAGS is not None:
+        slot=_heat_session_slot(session)
+        with HEAT_CANCEL_LOCK:
+            HEAT_CANCEL_FLAGS[slot]=(HEAT_CANCEL_FLAGS[slot]+1)&0xffffffffffffffff
+    def cancelled():
+        with VIEW_SESSIONS_LOCK:
+            return VIEW_SESSIONS.get(session)!=serial
+    cancelled.heat_session=session
+    return cancelled
+
 
 
 class BoundedStream:
@@ -97,6 +137,7 @@ def points_fit(stream, summary=None):
     ascent = moving = 0.0
     last_altitude = None
     altitude_samples = moving_samples = 0
+    sampled_temp_sum = sampled_temp_count = 0
     while remaining:
         h = read_exact(stream, 1)[0]
         remaining -= 1
@@ -136,14 +177,30 @@ def points_fit(stream, summary=None):
             if global_number == 18 and summary is not None:
                 at = 0
                 for number, size, base in fields:
-                    fmt = {2: "B", 4: "H", 6: "I", 5: "i"}.get(base & 31)
-                    if number in (7, 8, 9, 14, 15, 22) and fmt and size == struct.calcsize(fmt):
+                    fmt = {1: "b", 2: "B", 4: "H", 6: "I", 5: "i"}.get(base & 31)
+                    session_fields = {7: ("elapsed_seconds", 1000), 8: ("moving_seconds", 1000), 9: ("recorded_distance_m", 100), 11: ("calories_kcal", 1), 14: ("avg_speed", 1000), 15: ("max_speed", 1000), 16: ("avg_heart_rate", 1), 18: ("avg_cadence", 1), 20: ("avg_power", 1), 21: ("max_power", 1), 22: ("elevation_m", 1), 57: ("avg_temp_c", 1), 58: ("max_temp_c", 1)}
+                    if number in session_fields and fmt and size == struct.calcsize(fmt):
                         raw = struct.unpack(endian + fmt, record[at:at + size])[0]
-                        if raw >= 0 and raw != (1 << (8 * size)) - 1:
-                            name, factor = {7: ("elapsed_seconds", 1000), 8: ("moving_seconds", 1000), 9: ("recorded_distance_m", 100), 14: ("avg_speed", 1000), 15: ("max_speed", 1000), 22: ("elevation_m", 1)}[number]
-                            if raw > 0:
+                        invalid = -(1 << (8*size-1)) if fmt.islower() else (1 << (8*size))-1
+                        if raw != invalid and (number in (57,58) or raw >= 0):
+                            name, factor = session_fields[number]
+                            if number in (57,58) or raw > 0:
                                 summary[name] = raw / factor
                     at += size
+                continue
+            if global_number == 128 and summary is not None:
+                at = 0
+                fields_weather = {1:("weather_temp_c",1),4:("wind_speed_mps",1000),7:("humidity_pct",1)}
+                for number,size,base in fields:
+                    fmt={1:"b",2:"B",4:"H",6:"I"}.get(base & 31)
+                    if number in fields_weather and fmt and size==struct.calcsize(fmt):
+                        raw=struct.unpack(endian+fmt,record[at:at+size])[0]
+                        invalid=-(1 << (8*size-1)) if fmt.islower() else (1 << (8*size))-1
+                        if raw!=invalid and (number==1 or raw>=0):
+                            name,factor=fields_weather[number]
+                            if name not in summary:
+                                summary[name]=raw/factor
+                    at+=size
                 continue
             if global_number != 20:
                 continue
@@ -177,6 +234,11 @@ def points_fit(stream, summary=None):
                         speed = raw_speed / 1000
                         if math.isfinite(speed):
                             record_max_speed = max(record_max_speed or 0, speed)
+                if number == 13 and size == 1 and (base & 31) == 1:
+                    temperature=struct.unpack("b",record[pos:pos+1])[0]
+                    if temperature != -128 and -60 <= temperature <= 70:
+                        sampled_temp_sum+=temperature
+                        sampled_temp_count+=1
                 if number == 253 and size == 4 and (base & 31) == 6:
                     value = struct.unpack(endian + "I", record[pos:pos + 4])[0]
                     if value != 0xffffffff:
@@ -211,6 +273,10 @@ def points_fit(stream, summary=None):
                 yield lat, lon, stamp
     read_exact(stream, 2)
     if summary is not None:
+        if first_stamp is not None:
+            summary["_fit_start_utc"] = FIT_EPOCH.timestamp() + first_stamp
+        if summary.get("avg_temp_c") is None and sampled_temp_count:
+            summary["avg_temp_c"] = round(sampled_temp_sum/sampled_temp_count,1)
         if summary.get("max_speed") is None and record_max_speed is not None:
             summary["max_speed"] = record_max_speed
         if not summary.get("elapsed_seconds") and first_stamp is not None and last_stamp is not None and last_stamp > first_stamp:
@@ -418,6 +484,8 @@ def decode_track(stream, filename, summary=None):
         prev = current
     if prev is not None and last_emit is not None and haversine(last_emit, prev) > 0.3:
         append(prev)
+    if summary is not None and first_stamp is not None:
+        summary["_fit_start_utc"] = FIT_EPOCH.timestamp() + first_stamp
     if count < 2:
         return None
     start = (FIT_EPOCH + dt.timedelta(seconds=first_stamp)).date().isoformat() if first_stamp is not None else None
@@ -510,6 +578,17 @@ def metadata_from_csv(stream):
             "elevation_m": numeric(row, csv_number, "Elevation Gain", "Total Elevation Gain", "Total Ascent", "Elev Gain", "Elevation Gain (m)"),
             "avg_heart_rate": numeric(row, csv_number, "Average Heart Rate", "Avg Heart Rate"),
             "avg_speed": numeric(row, csv_number, "Average Speed"),
+            "avg_power": numeric(row, csv_number, "Average Power", "Average Watts", "Avg Power"),
+            "calories_kcal": numeric(row, csv_number, "Calories", "Calories Burned"),
+            "avg_temp_c": numeric(row, csv_number, "Average Temperature", "Avg Temperature"),
+            "max_temp_c": numeric(row, csv_number, "Max Temperature", "Maximum Temperature"),
+            "weather_temp_c": numeric(row, csv_number, "Weather Temperature"),
+            "wind_speed_mps": numeric(row, csv_number, "Wind Speed"),
+            "wind_gust_mps": numeric(row, csv_number, "Wind Gust"),
+            "humidity_pct": numeric(row, csv_number, "Humidity"),
+            "avg_cadence": numeric(row, csv_number, "Average Cadence", "Avg Cadence"),
+            "max_power": numeric(row, csv_number, "Max Watts", "Maximum Power"),
+            "weather_condition": cell(row, "Weather Condition")[:120],
             "max_speed": numeric(row, csv_number, "Max Speed"),
             "bike": cell(row, "Activity Gear", "Gear Name", "Bike Name"),
             "gear_id": cell(row, "Gear ID", "Bike", "Gear"),
@@ -568,6 +647,77 @@ def metadata_csv(zfile):
             info["bike"] = gear[name.casefold()]
     return lookup
 
+def garmin_summary_index(zfile):
+    records = []
+    for entry in zfile.infolist():
+        if not entry.filename.casefold().endswith("_summarizedactivities.json") or entry.file_size > 16 * 1024 * 1024:
+            continue
+        with zfile.open(entry) as stream:
+            data = json.loads(BoundedStream(stream, 16 * 1024 * 1024).read())
+        if not isinstance(data, list):
+            continue
+        for group in data:
+            if not isinstance(group, dict):
+                continue
+            for row in group.get("summarizedActivitiesExport", []):
+                if not isinstance(row, dict):
+                    continue
+                start = row.get("startTimeGmt")
+                if not isinstance(start, (int, float)) or not math.isfinite(start) or start < 1e11:
+                    continue
+                def positive(name, scale=1):
+                    value = row.get(name)
+                    return value / scale if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0 else None
+                local_start = row.get("startTimeLocal")
+                day_stamp = local_start if isinstance(local_start, (int, float)) and math.isfinite(local_start) and local_start > 1e11 else start
+                info = {
+                    "name": str(row.get("name") or "")[:300],
+                    "sport": str(row.get("activityType") or row.get("sportType") or "")[:80],
+                    "day": dt.datetime.fromtimestamp(day_stamp / 1000, dt.timezone.utc).date().isoformat(),
+                    "recorded_distance_m": positive("distance", 100),
+                    "moving_seconds": positive("movingDuration", 1000),
+                    "elapsed_seconds": positive("elapsedDuration", 1000),
+                    "elevation_m": positive("elevationGain", 100),
+                    "avg_speed": positive("avgSpeed", 10),
+                    "max_speed": positive("maxSpeed", 10),
+                    "calories_kcal": positive("calories"),
+                    "avg_cadence": positive("avgBikeCadence"),
+                    "max_temp_c": row.get("maxTemperature") if isinstance(row.get("maxTemperature"), (int, float)) and not isinstance(row.get("maxTemperature"), bool) and math.isfinite(row["maxTemperature"]) and -60 <= row["maxTemperature"] <= 70 else None,
+                    "moving_source": "garmin",
+                    "elevation_source": "garmin",
+                }
+                records.append((round(start / 1000), info))
+                if len(records) > 50000:
+                    raise ValueError("Garmin activity summary exceeds the safety limit")
+    return sorted(records, key=lambda item: item[0])
+
+
+def matching_garmin_summary(index, fit_time, distance):
+    if not index or fit_time is None:
+        return {}
+    import bisect
+    first = bisect.bisect_left(index, (round(fit_time) - 120,))
+    matching = [(abs(stamp-fit_time), info) for stamp, info in index[first:] if stamp <= fit_time + 120]
+    if len(matching) != 1 or matching[0][0] > 120:
+        return {}
+    info = matching[0][1]
+    recorded = info.get("recorded_distance_m")
+    if recorded and distance and abs(recorded-distance) > max(800.0, recorded * .27):
+        return {}
+    return info
+
+
+def garmin_safe_filename(filename):
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    if "@" not in base:
+        return filename
+    match = re.search(r"_(\d{7,})(\.fit(?:\.gz)?)$", base, re.I)
+    if match:
+        return "Garmin/" + match.group(1) + match.group(2).lower()
+    extension = ".fit.gz" if base.casefold().endswith(".fit.gz") else ".fit"
+    return "Garmin/" + hashlib.sha256(base.encode("utf-8")).hexdigest()[:20] + extension
+
+
 def apply_metadata(con, lookup):
     updates = 0
     for ident, filename in con.execute("SELECT id,filename FROM activities"):
@@ -578,15 +728,18 @@ def apply_metadata(con, lookup):
             day=COALESCE(?,day), recorded_distance_m=COALESCE(?,recorded_distance_m),
             moving_seconds=COALESCE(?,moving_seconds), elapsed_seconds=COALESCE(?,elapsed_seconds),
             elevation_m=COALESCE(?,elevation_m), avg_heart_rate=COALESCE(?,avg_heart_rate),
-            avg_speed=COALESCE(?,avg_speed), max_speed=COALESCE(?,max_speed),
+            avg_speed=COALESCE(?,avg_speed), max_speed=COALESCE(?,max_speed), avg_power=COALESCE(?,avg_power),
             bike=COALESCE(NULLIF(?,''),bike), gear_id=COALESCE(NULLIF(?,''),gear_id),
             moving_source=CASE WHEN ? IS NOT NULL THEN 'strava' ELSE moving_source END,
             elevation_source=CASE WHEN ? IS NOT NULL THEN 'strava' ELSE elevation_source END
             WHERE id=?""", ((info.get("name") or "")[:300], (info.get("sport") or "")[:80], info.get("day"),
             info.get("recorded_distance_m"), info.get("moving_seconds"), info.get("elapsed_seconds"),
-            info.get("elevation_m"), info.get("avg_heart_rate"), info.get("avg_speed"), info.get("max_speed"),
+            info.get("elevation_m"), info.get("avg_heart_rate"), info.get("avg_speed"), info.get("max_speed"), info.get("avg_power"),
             (info.get("bike") or "")[:160], (info.get("gear_id") or "")[:120],
             info.get("moving_seconds"), info.get("elevation_m"), ident))
+        extra_update=[info.get(field) for field in ADV_NUM_FIELDS]
+        extra_update.append((info.get("weather_condition") or None))
+        con.execute("UPDATE activities SET "+", ".join(field+"=COALESCE(?,"+field+")" for field in ADV_NUM_FIELDS+("weather_condition",))+" WHERE id=?",extra_update+[ident])
         updates += 1
     con.commit()
     clear_render_caches()
@@ -606,6 +759,9 @@ def strava_activity_id(filename):
     return match.group(1) if match else None
 
 
+ADV_NUM_FIELDS=("calories_kcal","avg_temp_c","max_temp_c","weather_temp_c","wind_speed_mps","wind_gust_mps","humidity_pct","avg_cadence","max_power")
+
+
 def db_connect():
     con = sqlite3.connect(str(DB_PATH), timeout=40)
     con.execute("PRAGMA busy_timeout=40000")
@@ -617,9 +773,14 @@ def init_db():
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY, unique_key TEXT NOT NULL UNIQUE, filename TEXT NOT NULL, name TEXT NOT NULL, sport TEXT NOT NULL, day TEXT, distance_m INTEGER, point_count INTEGER NOT NULL, west REAL NOT NULL, south REAL NOT NULL, east REAL NOT NULL, north REAL NOT NULL, coordinates BLOB NOT NULL)")
         columns = {row[1] for row in con.execute("PRAGMA table_info(activities)")}
-        for name in ("recorded_distance_m", "moving_seconds", "elapsed_seconds", "elevation_m", "avg_heart_rate", "avg_speed", "max_speed"):
+        for name in ("recorded_distance_m", "moving_seconds", "elapsed_seconds", "elevation_m", "avg_heart_rate", "avg_speed", "max_speed", "avg_power"):
             if name not in columns:
                 con.execute("ALTER TABLE activities ADD COLUMN {} REAL".format(name))
+        for name in ADV_NUM_FIELDS:
+            if name not in columns:
+                con.execute("ALTER TABLE activities ADD COLUMN {} REAL".format(name))
+        if "weather_condition" not in columns:
+            con.execute("ALTER TABLE activities ADD COLUMN weather_condition TEXT")
         for name in ("bike", "gear_id", "moving_source", "elevation_source"):
             if name not in columns:
                 con.execute("ALTER TABLE activities ADD COLUMN {} TEXT".format(name))
@@ -631,6 +792,8 @@ def init_db():
                 activity_id = strava_activity_id(filename)
                 if activity_id:
                     con.execute("UPDATE activities SET activity_id=? WHERE id=?", (activity_id, row_id))
+        if "fit_extended_checked" not in columns:
+            con.execute("ALTER TABLE activities ADD COLUMN fit_extended_checked INTEGER NOT NULL DEFAULT 0")
         con.execute("CREATE INDEX IF NOT EXISTS activity_id_idx ON activities(activity_id)")
         con.execute("CREATE INDEX IF NOT EXISTS activity_filename_idx ON activities(filename)")
         for row_id, filename in con.execute("SELECT id,filename FROM activities WHERE activity_id IS NULL OR activity_id='' ").fetchall():
@@ -638,6 +801,9 @@ def init_db():
             if activity_id:
                 con.execute("UPDATE activities SET activity_id=? WHERE id=?", (activity_id, row_id))
         con.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS speed_filter_exceptions (activity_id INTEGER PRIMARY KEY, included INTEGER NOT NULL DEFAULT 1 CHECK(included=1))")
+        con.execute("CREATE TABLE IF NOT EXISTS heatmap_track_cache (activity_id INTEGER PRIMARY KEY, source_digest TEXT NOT NULL, payload BLOB NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS heatmap_view_cache (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, digest TEXT NOT NULL, payload BLOB NOT NULL, used INTEGER NOT NULL DEFAULT 0)")
 
 
 
@@ -736,24 +902,31 @@ def recover_fit_summary(stream, filename):
     return summary
 
 
-def insert_activity(con, source, source_key, stream, info):
+def insert_activity(con, source, source_key, stream, info, garmin_index=None):
     filename = source.replace("\\", "/")
     activity_id = strava_activity_id(filename)
-    existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed FROM activities WHERE unique_key=?", (source_key,)).fetchone()
+    existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed,avg_power FROM activities WHERE unique_key=?", (source_key,)).fetchone()
     if not existing and activity_id:
-        existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed FROM activities WHERE activity_id=? ORDER BY id LIMIT 1", (activity_id,)).fetchone()
+        existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed,avg_power FROM activities WHERE activity_id=? ORDER BY id LIMIT 1", (activity_id,)).fetchone()
     if not existing:
-        existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed FROM activities WHERE filename=? ORDER BY id LIMIT 1", (filename,)).fetchone()
+        existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed,avg_power FROM activities WHERE filename=? ORDER BY id LIMIT 1", (filename,)).fetchone()
     if existing:
-        if filename.lower().endswith((".fit", ".fit.gz")) and any(existing[i] is None and info.get(key) is None for i,key in ((1,"moving_seconds"),(2,"elapsed_seconds"),(3,"elevation_m"),(6,"avg_speed"),(7,"max_speed"))):
+        checked=con.execute("SELECT fit_extended_checked FROM activities WHERE id=?",(existing[0],)).fetchone()[0]
+        if filename.lower().endswith((".fit", ".fit.gz")) and (not checked or garmin_index):
             try:
                 recovered = recover_fit_summary(stream, filename)
-                info = {**recovered, **{k: v for k, v in info.items() if v is not None and v != ""}}
+                match = matching_garmin_summary(garmin_index, recovered.get("_fit_start_utc"), recovered.get("recorded_distance_m"))
+                info = {**recovered, **match, **{k: v for k, v in info.items() if v is not None and v != ""}}
             except (ValueError, OSError, EOFError, gzip.BadGzipFile) as exc:
                 print("[LibreHeatmaps] FIT summary unavailable for {}: {}".format(Path(filename).name, exc), flush=True)
         if info:
-            con.execute("""UPDATE activities SET name=COALESCE(NULLIF(?,''),name),sport=COALESCE(NULLIF(?,''),sport),day=COALESCE(?,day),recorded_distance_m=COALESCE(?,recorded_distance_m),moving_seconds=COALESCE(?,moving_seconds),elapsed_seconds=COALESCE(?,elapsed_seconds),elevation_m=COALESCE(?,elevation_m),avg_heart_rate=COALESCE(?,avg_heart_rate),avg_speed=COALESCE(?,avg_speed),max_speed=COALESCE(?,max_speed),bike=COALESCE(NULLIF(?,''),bike),gear_id=COALESCE(NULLIF(?,''),gear_id),moving_source=COALESCE(?,moving_source),elevation_source=COALESCE(?,elevation_source) WHERE id=?""", ((info.get("name") or "")[:300],(info.get("sport") or "")[:80],info.get("day"),info.get("recorded_distance_m"),info.get("moving_seconds"),info.get("elapsed_seconds"),info.get("elevation_m"),info.get("avg_heart_rate"),info.get("avg_speed"),info.get("max_speed"),(info.get("bike") or "")[:160],(info.get("gear_id") or "")[:120],info.get("moving_source"),info.get("elevation_source"),existing[0]))
+            con.execute("""UPDATE activities SET name=COALESCE(NULLIF(?,''),name),sport=COALESCE(NULLIF(?,''),sport),day=COALESCE(?,day),recorded_distance_m=COALESCE(?,recorded_distance_m),moving_seconds=COALESCE(?,moving_seconds),elapsed_seconds=COALESCE(?,elapsed_seconds),elevation_m=COALESCE(?,elevation_m),avg_heart_rate=COALESCE(?,avg_heart_rate),avg_speed=COALESCE(?,avg_speed),max_speed=COALESCE(?,max_speed),avg_power=COALESCE(?,avg_power),bike=COALESCE(NULLIF(?,''),bike),gear_id=COALESCE(NULLIF(?,''),gear_id),moving_source=COALESCE(?,moving_source),elevation_source=COALESCE(?,elevation_source) WHERE id=?""", ((info.get("name") or "")[:300],(info.get("sport") or "")[:80],info.get("day"),info.get("recorded_distance_m"),info.get("moving_seconds"),info.get("elapsed_seconds"),info.get("elevation_m"),info.get("avg_heart_rate"),info.get("avg_speed"),info.get("max_speed"),info.get("avg_power"),(info.get("bike") or "")[:160],(info.get("gear_id") or "")[:120],info.get("moving_source"),info.get("elevation_source"),existing[0]))
+            values=[info.get(field) for field in ADV_NUM_FIELDS]+[(info.get("weather_condition") or None),existing[0]]
+            con.execute("UPDATE activities SET "+", ".join(field+"=COALESCE(?,"+field+")" for field in ADV_NUM_FIELDS+("weather_condition",))+" WHERE id=?",values)
+            if filename.lower().endswith((".fit", ".fit.gz")):
+                con.execute("UPDATE activities SET fit_extended_checked=1 WHERE id=?",(existing[0],))
             con.commit()
+            clear_render_caches()
         return "skipped"
     embedded = {}
     result = decode_track(stream, filename, embedded)
@@ -761,9 +934,13 @@ def insert_activity(con, source, source_key, stream, info):
     if result is None:
         return "no-gps"
     compressed, count, bbox, day, distance = result
+    match = matching_garmin_summary(garmin_index, embedded.get("_fit_start_utc"), distance)
+    info = {**embedded, **match, **{k: v for k, v in info.items() if v is not None and v != ""}}
     name = info.get("name") or Path(filename).name.split(".")[0]
     sport = info.get("sport") or "Unknown"
-    con.execute("INSERT OR IGNORE INTO activities (unique_key,filename,name,sport,day,distance_m,point_count,west,south,east,north,coordinates,recorded_distance_m,moving_seconds,elapsed_seconds,elevation_m,avg_heart_rate,avg_speed,max_speed,bike,gear_id,moving_source,elevation_source,activity_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (source_key, filename, name[:300], sport[:80], info.get("day") or day, distance, count, bbox[1], bbox[0], bbox[3], bbox[2], compressed, info.get("recorded_distance_m"), info.get("moving_seconds"), info.get("elapsed_seconds"), info.get("elevation_m"), info.get("avg_heart_rate"), info.get("avg_speed"), info.get("max_speed"), (info.get("bike") or "")[:160], (info.get("gear_id") or "")[:120], info.get("moving_source"), info.get("elevation_source"), activity_id))
+    con.execute("INSERT OR IGNORE INTO activities (unique_key,filename,name,sport,day,distance_m,point_count,west,south,east,north,coordinates,recorded_distance_m,moving_seconds,elapsed_seconds,elevation_m,avg_heart_rate,avg_speed,max_speed,avg_power,bike,gear_id,moving_source,elevation_source,activity_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (source_key, filename, name[:300], sport[:80], info.get("day") or day, distance, count, bbox[1], bbox[0], bbox[3], bbox[2], compressed, info.get("recorded_distance_m"), info.get("moving_seconds"), info.get("elapsed_seconds"), info.get("elevation_m"), info.get("avg_heart_rate"), info.get("avg_speed"), info.get("max_speed"), info.get("avg_power"), (info.get("bike") or "")[:160], (info.get("gear_id") or "")[:120], info.get("moving_source"), info.get("elevation_source"), activity_id))
+    values=[info.get(field) for field in ADV_NUM_FIELDS]+[(info.get("weather_condition") or None)]
+    con.execute("UPDATE activities SET "+", ".join(field+"=?" for field in ADV_NUM_FIELDS+("weather_condition",))+", fit_extended_checked=? WHERE id=(SELECT id FROM activities WHERE unique_key=?)",values+[1 if filename.lower().endswith((".fit", ".fit.gz")) else 0,source_key])
     con.commit()
     clear_render_caches()
     return "added"
@@ -786,26 +963,48 @@ def import_job(path, display_name):
                 updated = apply_metadata(con, lookup)
                 set_job(processed=1, added=0, skipped=0, failed=0, updated=updated)
             elif display_name.lower().endswith(".zip"):
-                with zipfile.ZipFile(path) as archive:
-                    entries = [m for m in archive.infolist() if not m.is_dir() and m.filename.lower().endswith(FORMATS)]
+                with ExitStack() as stack:
+                    archive = stack.enter_context(zipfile.ZipFile(path))
+                    entries = [(archive, member, False) for member in archive.infolist() if not member.is_dir() and member.filename.lower().endswith(FORMATS)]
+                    nested = [member for member in archive.infolist() if not member.is_dir() and member.filename.lower().endswith(".zip")]
+                    if len(nested) > 64:
+                        raise ValueError("Too many nested archives")
+                    for bundle in nested:
+                        if bundle.file_size > MAX_MEMBER or (bundle.file_size > 1024 * 1024 and bundle.file_size > 1000 * max(1, bundle.compress_size)):
+                            raise ValueError("Nested ZIP exceeds the safety limit")
+                        spool = stack.enter_context(tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024))
+                        with archive.open(bundle) as member_stream:
+                            source = BoundedStream(member_stream)
+                            while True:
+                                chunk = source.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                spool.write(chunk)
+                        spool.seek(0)
+                        inner = stack.enter_context(zipfile.ZipFile(spool))
+                        for member in inner.infolist():
+                            if not member.is_dir() and member.filename.lower().endswith(FORMATS):
+                                entries.append((inner, member, True))
                     if len(entries) > 30000:
                         raise ValueError("Too many activity files in one archive")
-                    if sum(m.file_size for m in entries) > 12 * 1024 * 1024 * 1024:
+                    if sum(member.file_size for _, member, _ in entries) > 12 * 1024 * 1024 * 1024:
                         raise ValueError("Uncompressed activity data exceeds the safety limit")
                     lookup = metadata_csv(archive)
-                    if not lookup:
+                    garmin_index = garmin_summary_index(archive)
+                    if not lookup and not garmin_index and not nested:
                         print("[LibreHeatmaps] This ZIP does not contain activities.csv. Bike names and official Strava totals may be unavailable.", flush=True)
-                    set_job(total=len(entries), message="Reading Strava export", metadata_rows=len({id(v) for v in lookup.values()}))
-                    for index, member in enumerate(entries, 1):
-                        set_job(processed=index - 1, message=Path(member.filename).name[:110])
+                    set_job(total=len(entries), message="Reading GPS activities", metadata_rows=len({id(v) for v in lookup.values()}) + len(garmin_index))
+                    for index, (source_archive, member, is_nested) in enumerate(entries, 1):
+                        safe_name = garmin_safe_filename(member.filename)
+                        set_job(processed=index - 1, message=Path(safe_name).name[:110])
                         try:
                             if member.file_size > 1000 * max(1, member.compress_size) and member.file_size > 1024 * 1024:
                                 raise ValueError("Archive entry has an unsafe compression ratio")
                             if member.file_size > MAX_MEMBER:
                                 raise ValueError("Activity entry exceeds size limit")
                             key = hashlib.sha256((member.filename.rsplit("/", 1)[-1].casefold() + ":" + str(member.CRC) + ":" + str(member.file_size)).encode()).hexdigest()
-                            with archive.open(member) as file:
-                                outcome = insert_activity(con, member.filename, key, file, get_metadata(member.filename, lookup))
+                            with source_archive.open(member) as file:
+                                outcome = insert_activity(con, safe_name, key, file, get_metadata(member.filename, lookup), garmin_index if is_nested else None)
                             if outcome == "added":
                                 added += 1
                             elif outcome == "no-gps":
@@ -814,7 +1013,7 @@ def import_job(path, display_name):
                                 skipped += 1
                         except Exception as exc:
                             failed += 1
-                            print("[LibreHeatmaps] Could not import {}: {}".format(member.filename, exc), flush=True)
+                            print("[LibreHeatmaps] Could not import {}: {}".format(Path(safe_name).name, exc), flush=True)
                         set_job(processed=index, added=added, skipped=skipped, failed=failed, no_gps=no_gps)
                     if lookup:
                         set_job(updated=apply_metadata(con, lookup))
@@ -834,6 +1033,7 @@ def import_job(path, display_name):
                     skipped = 1
                 set_job(processed=1, added=added, skipped=skipped, no_gps=no_gps)
         set_job(status="done", message="Import complete")
+        start_heat_warmup()
     except Exception as exc:
         set_job(status="error", message=str(exc)[:400])
         print("[LibreHeatmaps] Import stopped: {}".format(exc), flush=True)
@@ -860,11 +1060,155 @@ def statistics():
     return {"count": count, "mapped_gps_count":count, "points": points, "bounds": [west, south, east, north] if count else None, "focus_bounds":focus, "types": types, "bikes": [b[0] for b in bikes], "first": first, "last": last, "first_launch":first_launch}
 
 
+def anomaly_filter_enabled():
+    with db_connect() as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key='filter_speed_anomalies'").fetchone()
+    return bool(row and row[0] == '1')
+
+
+def set_anomaly_filter(enabled):
+    with db_connect() as con:
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('filter_speed_anomalies',?)", ('1' if enabled else '0',))
+    return bool(enabled)
+
+
+def statistics_preferences():
+    with db_connect() as con:
+        rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key IN ('filter_speed_anomalies','filter_speed_smart','advanced_data')"))
+    return {"filter_speed_anomalies":rows.get('filter_speed_anomalies')=='1',
+            "filter_speed_smart":rows.get('filter_speed_smart')=='1',"advanced_data":rows.get('advanced_data')=='1'}
+
+
+def store_all_settings(payload):
+    if not isinstance(payload,dict) or set(payload)!={'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data'}:
+        raise ValueError('Invalid settings fields')
+    if type(payload['filter_speed_anomalies']) is not bool or type(payload['filter_speed_smart']) is not bool or type(payload['advanced_data']) is not bool:
+        raise ValueError('Invalid statistics toggles')
+    appearance=normalize_appearance(payload['appearance'])
+    with db_connect() as con:
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('appearance',?)", (json.dumps(appearance,separators=(',',':')),))
+        for name in ('filter_speed_anomalies','filter_speed_smart','advanced_data'):
+            con.execute('INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)',(name,'1' if payload[name] else '0'))
+    return {'appearance':appearance,**{k:payload[k] for k in ('filter_speed_anomalies','filter_speed_smart','advanced_data')}}
+
+
+def robust_speed_flags(rows):
+    cohorts={}
+    for r in rows:
+        sport=(r[1] or '').casefold()
+        if not any(w in sport for w in ('ride','bik','cycl')):continue
+        avg=r[9] if r[9] is not None else ((r[3] or 0)/r[4] if r[4] and r[4]>0 else None)
+        peak=r[10]
+        cohorts.setdefault(sport,[]).append((r[14],avg,peak))
+    flagged=set()
+    for rides in cohorts.values():
+        if len(rides)<12:continue
+        for index in (1,2):
+            values=sorted(v[index] for v in rides if v[index] is not None and math.isfinite(v[index]) and v[index]>0)
+            if len(values)<12:continue
+            median=values[len(values)//2] if len(values)%2 else (values[len(values)//2-1]+values[len(values)//2])/2
+            deviations=sorted(abs(v-median) for v in values)
+            mad=deviations[len(deviations)//2] if len(deviations)%2 else (deviations[len(deviations)//2-1]+deviations[len(deviations)//2])/2
+            floor=7.15 if index==1 else 14.3
+            cutoff=max(median*1.6,median+floor,median+3.5*1.4826*mad)
+            flagged.update(r[0] for r in rides if r[index] is not None and math.isfinite(r[index]) and r[index]>cutoff)
+    return flagged
+
+
+
+SPEED_REVIEW_FIELDS = "name,sport,day,COALESCE(recorded_distance_m,distance_m),moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,avg_heart_rate,avg_speed,max_speed,bike,moving_source,elevation_source,id"
+
+
+def speed_review_snapshot():
+    prefs = statistics_preferences()
+    with db_connect() as con:
+        approved = {int(row[0]) for row in con.execute("SELECT activity_id FROM speed_filter_exceptions WHERE included=1")}
+        if not (prefs['filter_speed_anomalies'] or prefs['filter_speed_smart']):
+            return {}, approved, prefs
+        rows = con.execute("SELECT " + SPEED_REVIEW_FIELDS + " FROM activities").fetchall()
+    smart = robust_speed_flags(rows) if prefs['filter_speed_smart'] else set()
+    flagged = {}
+    for r in rows:
+        reasons = []
+        if prefs['filter_speed_anomalies'] and speed_outlier(r):
+            reasons.append('50 mph cycling speed threshold')
+        if r[14] in smart:
+            reasons.append('Unusual compared with similar rides (experimental)')
+        if reasons:
+            flagged[r[14]] = reasons
+    return flagged, approved, prefs
+
+
+def speed_review_summary():
+    flagged, approved, prefs = speed_review_snapshot()
+    active = bool(prefs['filter_speed_anomalies'] or prefs['filter_speed_smart'])
+    return {'active':active, 'excluded_count':len(flagged.keys()-approved) if active else 0,
+            'approved_count':len(flagged.keys() & approved) if active else 0}
+
+
+def speed_review(params):
+    flagged, approved, prefs = speed_review_snapshot()
+    active = prefs['filter_speed_anomalies'] or prefs['filter_speed_smart']
+    sql, args = filter_query(params)
+    with db_connect() as con:
+        rows = con.execute("SELECT " + SPEED_REVIEW_FIELDS + " FROM activities" + sql + " ORDER BY day DESC,id DESC", args).fetchall() if active else []
+    excluded = []
+    allowed = []
+    for r in rows:
+        reason = flagged.get(r[14], [])
+        if not reason and r[14] not in approved:
+            continue
+        item = {'id':r[14], 'name':r[0], 'sport':r[1], 'day':r[2], 'distance_m':r[3],
+                'avg_speed':r[9], 'max_speed':r[10], 'reasons':reason, 'approved':r[14] in approved}
+        if item['approved']:
+            allowed.append(item)
+        elif reason:
+            excluded.append(item)
+    return {'active':bool(active), 'excluded':excluded, 'allowed':allowed,
+            'excluded_count':len(excluded), 'allowed_count':len(allowed)}
+
+
+def set_speed_exception(activity_id, included):
+    if type(activity_id) is not int or activity_id < 1 or activity_id > 999999999999:
+        raise ValueError('Invalid activity selection')
+    if type(included) is not bool:
+        raise ValueError('Expected a true or false exception value')
+    with db_connect() as con:
+        if con.execute('SELECT 1 FROM activities WHERE id=?', (activity_id,)).fetchone() is None:
+            raise ValueError('Activity not found')
+        if included:
+            con.execute('INSERT OR REPLACE INTO speed_filter_exceptions(activity_id,included) VALUES (?,1)', (activity_id,))
+        else:
+            con.execute('DELETE FROM speed_filter_exceptions WHERE activity_id=?', (activity_id,))
+    flagged, approved, prefs = speed_review_snapshot()
+    return {'activity_id':activity_id, 'approved':activity_id in approved,
+            'excluded':activity_id in flagged and activity_id not in approved,
+            'reasons':flagged.get(activity_id, []), 'active':prefs['filter_speed_anomalies'] or prefs['filter_speed_smart']}
+
+
+def speed_outlier(row, threshold_mps=22.352):
+    sport = (row[1] or '').casefold()
+    if not any(word in sport for word in ('ride','cycl','bik')):
+        return False
+    for speed in (row[9],row[10]):
+        if speed is not None and (not math.isfinite(speed) or speed >= threshold_mps or speed < 0):
+            return True
+    if row[4] and row[4] > 0 and (row[3] or 0)/row[4] >= threshold_mps:
+        return True
+    return False
+
+
 def insights(params):
     sql, args = filter_query(params)
     with db_connect() as con:
         query = "SELECT name,sport,day,COALESCE(recorded_distance_m,distance_m),moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,avg_heart_rate,avg_speed,max_speed,bike,moving_source,elevation_source,id FROM activities" + sql
         rows = con.execute(query, args).fetchall()
+    flagged, approved, prefs = speed_review_snapshot()
+    with db_connect() as con:
+        extra=con.execute("SELECT day,calories_kcal,avg_temp_c,max_temp_c,weather_temp_c,wind_speed_mps,wind_gust_mps,humidity_pct,avg_cadence,avg_power FROM activities"+sql,args).fetchall() if prefs.get('advanced_data') else []
+    filter_anomalies=prefs['filter_speed_anomalies']
+    valid_speed_rows=[r for r in rows if r[14] not in flagged or r[14] in approved]
+    excluded_speeds = len(rows)-len(valid_speed_rows)
     count = len(rows)
     total_distance = sum(row[3] or 0 for row in rows)
     moving = sum(row[4] or 0 for row in rows)
@@ -917,11 +1261,13 @@ def insights(params):
     longest_moving = max((r for r in rows if r[4] is not None), key=lambda r:r[4], default=None)
     top_month = max(months.items(), key=lambda x:(x[1][0], x[0]), default=None)
     top_year = max(years.items(), key=lambda x:(x[1][0],x[0]), default=None)
-    fastest = max((r for r in rows if (r[4] or 0) >= 600 and (r[3] or 0) >= 1000), key=lambda r:r[3] / r[4], default=None)
-    peak_speed = max((r for r in rows if r[10] is not None and math.isfinite(r[10]) and 0 <= r[10] <= 200), key=lambda r:r[10], default=None)
+    fastest = max((r for r in valid_speed_rows if (r[4] or 0) >= 600 and (r[3] or 0) >= 1000), key=lambda r:r[3] / r[4], default=None)
+    peak_speed = max((r for r in valid_speed_rows if r[10] is not None and math.isfinite(r[10]) and 0 <= r[10] <= 200), key=lambda r:r[10], default=None)
     active_weeks = len({d.isocalendar()[:2] for d in dates})
     dist_per_week = total_distance / active_weeks if active_weeks else 0
-    avg_speed = total_distance / moving * 3.6 if moving > 0 and moving_count == count else None
+    speed_moving = sum(r[4] or 0 for r in valid_speed_rows)
+    speed_distance = sum(r[3] or 0 for r in valid_speed_rows)
+    avg_speed = speed_distance / speed_moving * 3.6 if speed_moving > 0 and all(r[4] is not None for r in valid_speed_rows) else None
     top_distance_month = max(months.items(), key=lambda x:(x[1][1],x[0]), default=None)
     def ride_record(row):
         return {"id":row[14], "name":row[0], "sport":row[1], "day":row[2],
@@ -930,7 +1276,7 @@ def insights(params):
     top_routes = sorted(rows, key=lambda row:(row[3] or 0, row[14]), reverse=True)[:6]
     recent_routes = sorted(rows, key=lambda row:(row[2] or "", row[14]), reverse=True)[:10]
     return {
-        "count":count,"distance_m":round(total_distance,1),"moving_seconds":round(moving),
+        "count":count,"filter_speed_anomalies":filter_anomalies,"filter_speed_smart":prefs["filter_speed_smart"],"excluded_speed_activities":excluded_speeds,"distance_m":round(total_distance,1),"moving_seconds":round(moving),
         "elapsed_seconds":round(elapsed),"elevation_m":round(ascent,2),
         "strava_distance_count":official,"mapped_gps_count":count,
         "moving_count":moving_count,"elapsed_count":sum(r[5] is not None for r in rows),"elevation_count":elevation_count,
@@ -949,13 +1295,27 @@ def insights(params):
         "average_weekly_distance_m":round(dist_per_week,1),"overall_avg_speed_kmh":round(avg_speed,2) if avg_speed is not None else None,
         "peak_speed_mps":peak_speed[10] if peak_speed else None,
         "peak_speed":dict(ride_record(peak_speed),speed_mps=peak_speed[10]) if peak_speed else None,
-        "peak_speed_count":sum(r[10] is not None and math.isfinite(r[10]) and 0 <= r[10] <= 200 for r in rows),
+        "peak_speed_count":sum(r[10] is not None and math.isfinite(r[10]) and 0 <= r[10] <= 200 for r in valid_speed_rows),
         "top_routes":[ride_record(r) for r in top_routes],"recent_routes":[ride_record(r) for r in recent_routes],
         "fastest":dict(ride_record(fastest), speed_kmh=round(fastest[3] / fastest[4] * 3.6,1)) if fastest else None,
         "biggest_distance_month":{"month":top_distance_month[0],"distance_m":round(top_distance_month[1][1],1)} if top_distance_month else None,
         "weekdays":[{"name":name,"count":weekday_counts[i],"distance_m":round(weekday_distance[i],1)} for i,name in enumerate(("Mon","Tue","Wed","Thu","Fri","Sat","Sun"))],
         "years":[{"year":k,"count":v[0],"distance_m":round(v[1],1)} for k,v in sorted(years.items())],
         "months":[{"month":k,"count":v[0],"distance_m":round(v[1],1)} for k,v in sorted(months.items())],
+        "advanced_enabled":prefs.get('advanced_data',False),
+        "advanced": {"coverage":{name:sum(v[i] is not None for v in extra) for i,name in enumerate(("calories_kcal","avg_temp_c","max_temp_c","weather_temp_c","wind_speed_mps","wind_gust_mps","humidity_pct","avg_cadence","avg_power"),1)},
+            "rides":[{"day":r[0],"calories":r[1],"temp_c":r[2],"weather_temp_c":r[4],"wind_mps":r[5],"humidity":r[7],"cadence":r[8],"power":r[9]} for r in extra if r[0]][-20000:]} if prefs.get('advanced_data') else None,
+        "analytics_limited": len(rows)>20000,
+        "analytics": {
+            "monthly_speeds":[{"month":k,"speed_kmh":round(sum(d/t*3.6 for d,t in vs)/len(vs),2),"count":len(vs)}
+                for k,vs in sorted({m:[((r[3] or 0),r[4]) for r in valid_speed_rows if r[2] and r[2][:7]==m and r[4] and r[4]>0 and r[3] is not None] for m in months}.items()) if vs],
+            "speed_history":[{"day":r[2],"speed_kmh":round((r[3] or 0)/r[4]*3.6,2),"id":r[14]} for r in sorted(valid_speed_rows,key=lambda r:(r[2] or '',r[14])) if r[2] and r[4] and r[4]>0 and r[3] is not None][-20000:],
+            "speed_vs_duration":[{"day":r[2],"minutes":round(r[4]/60,1),"speed_kmh":round((r[3] or 0)/r[4]*3.6,2),"id":r[14]} for r in valid_speed_rows if r[4] and r[4]>0 and r[3] is not None][-20000:],
+            "activity_distances":[{"day":r[2],"distance_km":round((r[3] or 0)/1000,2),"id":r[14]} for r in sorted(rows,key=lambda r:(r[2] or '',r[14])) if r[2]][-20000:],
+            "distance_vs_duration":[{"day":r[2],"minutes":round(r[4]/60,1),"distance_km":round((r[3] or 0)/1000,2),"id":r[14]} for r in valid_speed_rows if r[4] and r[4]>0 and r[3] is not None][-20000:],
+            "moving_history":[{"day":r[2],"hours":round(r[4]/3600,3),"id":r[14]} for r in sorted(rows,key=lambda r:(r[2] or '',r[14])) if r[2] and r[4] is not None and r[4]>=0][-20000:],
+            "monthly_moving_time":[{"month":k,"hours":round(sum(r[4] or 0 for r in rows if r[2] and r[2][:7]==k)/3600,2)} for k in sorted(months)],
+        },
     }
 
 
@@ -1012,6 +1372,50 @@ def filter_query(params, bounds=False):
     return (" WHERE " + " AND ".join(clauses) if clauses else ""), values
 
 
+ACTIVITY_TABLE_COLUMNS = ('day','name','sport','distance_m','moving_seconds','elapsed_seconds',
+    'avg_speed','max_speed','avg_heart_rate','avg_power','elevation_m','bike','filename','point_count','id') + ADV_NUM_FIELDS + ('weather_condition',)
+ACTIVITY_TABLE_SORT = {name:name for name in ACTIVITY_TABLE_COLUMNS}
+
+
+def activity_table(params,as_csv=False):
+    sql,args=filter_query(params)
+    try:
+        page=max(1,min(100000,int(params.get('page',['1'])[0])))
+        limit=max(10,min(200,int(params.get('limit',['50'])[0])))
+    except (TypeError,ValueError):
+        raise ValueError('Invalid table pagination')
+    sort=params.get('sort',['day'])[0]
+    if sort not in ACTIVITY_TABLE_SORT:raise ValueError('Invalid sorting field')
+    direction=params.get('direction',['desc'])[0]
+    if direction not in ('asc','desc'):raise ValueError('Invalid sort direction')
+    cols=params.get('columns',[''])[0].split(',') if as_csv else list(ACTIVITY_TABLE_COLUMNS)
+    if as_csv and (not cols or len(cols)>len(ACTIVITY_TABLE_COLUMNS) or len(set(cols))!=len(cols) or any(c not in ACTIVITY_TABLE_COLUMNS for c in cols)):
+        raise ValueError('Invalid CSV columns')
+    ordering=f' ORDER BY {ACTIVITY_TABLE_SORT[sort]} {direction.upper()}, id DESC'
+    fields='id,name,sport,day,COALESCE(recorded_distance_m,distance_m) AS distance_m,moving_seconds,elapsed_seconds,avg_speed,max_speed,avg_heart_rate,avg_power,elevation_m,bike,filename,point_count,'+','.join(ADV_NUM_FIELDS)+',weather_condition'
+    with db_connect() as con:
+        total=con.execute('SELECT COUNT(*) FROM activities'+sql,args).fetchone()[0]
+        if as_csv:
+            if total>50000:raise ValueError('CSV export limited to 50,000 activities; narrow the filters')
+            records=con.execute('SELECT '+fields+' FROM activities'+sql+ordering,args).fetchall()
+        else:
+            records=con.execute('SELECT '+fields+' FROM activities'+sql+ordering+' LIMIT ? OFFSET ?',args+[limit,(page-1)*limit]).fetchall()
+    names=['id','name','sport','day','distance_m','moving_seconds','elapsed_seconds','avg_speed','max_speed','avg_heart_rate','avg_power','elevation_m','bike','filename','point_count']+list(ADV_NUM_FIELDS)+['weather_condition']
+    rows=[dict(zip(names,r)) for r in records]
+    flagged, approved, prefs = speed_review_snapshot()
+    for row in rows:
+        row['speed_excluded']=row['id'] in flagged and row['id'] not in approved
+        row['speed_approved']=row['id'] in approved
+    if as_csv:
+        out=io.StringIO(newline='')
+        writer=csv.writer(out)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow([("'"+str(r[c])) if isinstance(r[c],str) and r[c].lstrip().startswith(('=','+','-','@')) else r[c] for c in cols])
+        return out.getvalue().encode('utf-8-sig')
+    return {'total':total,'page':page,'limit':limit,'rows':rows}
+
+
 def iter_coordinates(blob):
     raw = zlib.decompress(blob)
     for lat, lon in struct.iter_unpack("<ii", raw):
@@ -1036,7 +1440,8 @@ def activity_preview(params):
     with db_connect() as con:
         row = con.execute("""SELECT id,name,sport,day,COALESCE(recorded_distance_m,distance_m),
             moving_seconds,elapsed_seconds,elevation_m,bike,avg_heart_rate,avg_speed,max_speed,
-            coordinates,point_count,west,south,east,north FROM activities WHERE id=?""", (int(identity),)).fetchone()
+            coordinates,point_count,west,south,east,north,avg_power,filename,moving_source,
+            elevation_source,recorded_distance_m,distance_m,calories_kcal,avg_temp_c,max_temp_c,weather_temp_c,wind_speed_mps,wind_gust_mps,humidity_pct,avg_cadence,max_power,weather_condition FROM activities WHERE id=?""", (int(identity),)).fetchone()
     if row is None:
         raise ValueError("Activity not found")
     step = max(1, math.ceil(max(1, row[13]) / 3800))
@@ -1055,66 +1460,114 @@ def activity_preview(params):
         i += 1
     if last is not None and (not points or points[-1] != last):
         points.append(last)
-    return {"id":row[0],"name":row[1],"sport":row[2],"day":row[3],
+    flagged, approved, prefs = speed_review_snapshot()
+    return {"speed_review":{"active":bool(prefs['filter_speed_anomalies'] or prefs['filter_speed_smart']),
+            "excluded":row[0] in flagged and row[0] not in approved,"approved":row[0] in approved,
+            "reasons":flagged.get(row[0], [])},
+            "id":row[0],"name":row[1],"sport":row[2],"day":row[3],
             "distance_m":row[4],"moving_seconds":row[5],"elapsed_seconds":row[6],
             "elevation_m":row[7],"bike":row[8],"avg_heart_rate":row[9],
-            "avg_speed":row[10],"max_speed":row[11],
+            "avg_speed":row[10],"max_speed":row[11],"avg_power":row[18],
+            **dict(zip(ADV_NUM_FIELDS,list(row[24:33]))),"weather_condition":row[33],
+            "filename":row[19],"moving_source":row[20],"elevation_source":row[21],
+            "reported_distance_m":row[22],"gps_distance_m":row[23],"point_count":row[13],
             "bounds":[row[14],row[15],row[16],row[17]],"points":points}
 
 
 
-def cached_projected_track(activity_id, compressed, epoch):
-    """Mercator coordinates at zoom zero; pan/zoom only multiplies these values.
-
-    Existing databases remain unchanged. NaN pairs preserve track segment breaks.
-    """
+def cached_projected_track_with_chunks(activity_id, compressed, epoch, con=None, save_projection=True):
     global TRACK_CACHE_BYTES
-    cache_key = (epoch, activity_id)
+    cache_key=(epoch,activity_id)
     with STATE_LOCK:
-        track = TRACK_CACHE.get(cache_key)
-        if track is not None:
+        found=TRACK_CACHE.get(cache_key)
+        if found is not None:
             TRACK_CACHE.move_to_end(cache_key)
-            return track
-    track = array("d")
-    append = track.append
+            return found
+    source_digest=hashlib.blake2b(compressed,digest_size=12).hexdigest()
+    if con is not None:
+        try:
+            row=con.execute('SELECT payload FROM heatmap_track_cache WHERE activity_id=? AND source_digest=?',(activity_id,source_digest)).fetchone()
+            if row is not None and len(row[0])<8*1024*1024:
+                decoder=zlib.decompressobj()
+                raw=decoder.decompress(row[0],16*1024*1024+1)
+                if len(raw)<=16*1024*1024 and decoder.eof and not decoder.unconsumed_tail:
+                    coordinate_bytes,saved_chunks=marshal.loads(raw)
+                    if isinstance(coordinate_bytes,bytes) and len(coordinate_bytes)%16==0 and isinstance(saved_chunks,list) and len(saved_chunks)<=100000:
+                        restored=array('d');restored.frombytes(coordinate_bytes)
+                        value=(restored,saved_chunks)
+                        size=len(restored)*8+len(saved_chunks)*72
+                        if size<=MAX_TRACK_CACHE_BYTES:
+                            with STATE_LOCK:
+                                while TRACK_CACHE and TRACK_CACHE_BYTES+size>MAX_TRACK_CACHE_BYTES:
+                                    _,stale=TRACK_CACHE.popitem(last=False)
+                                    TRACK_CACHE_BYTES-=len(stale[0])*8+len(stale[1])*72
+                                TRACK_CACHE[cache_key]=value
+                                TRACK_CACHE_BYTES+=size
+                            return value
+        except (sqlite3.Error,ValueError,TypeError,EOFError,zlib.error,OverflowError):
+            pass
+    coords=array('d')
+    append=coords.append
     for point in iter_coordinates(compressed):
         if point is None:
-            append(float("nan"))
-            append(float("nan"))
+            append(float('nan'));append(float('nan'))
         else:
-            lat, lon = point
-            a = math.radians(max(-85.0511, min(85.0511, lat)))
-            append((lon + 180.0) * (256.0 / 360.0))
-            append((1.0 - math.asinh(math.tan(a)) / math.pi) * 128.0)
-    size = len(track) * 8
-    if size <= MAX_TRACK_CACHE_BYTES:
+            lat,lon=point
+            a=math.radians(max(-85.0511,min(85.0511,lat)))
+            append((lon+180.0)*(256.0/360.0))
+            append((1.0-math.asinh(math.tan(a))/math.pi)*128.0)
+    chunks=[]
+    count=len(coords)//2
+    for start in range(0,count,128):
+        end=min(start+128,count)
+        first=max(0,start-1)
+        xs=[coords[2*j] for j in range(first,end) if coords[2*j]==coords[2*j]]
+        ys=[coords[2*j+1] for j in range(first,end) if coords[2*j+1]==coords[2*j+1]]
+        if xs:
+            chunks.append((first*2,end*2,min(xs),min(ys),max(xs),max(ys)))
+    size=len(coords)*8+len(chunks)*72
+    value=(coords,chunks)
+    if con is not None and save_projection and size<=8*1024*1024:
+        try:
+            payload=zlib.compress(marshal.dumps((coords.tobytes(),chunks)),1)
+            if len(payload)<8*1024*1024:
+                con.execute('INSERT OR REPLACE INTO heatmap_track_cache (activity_id,source_digest,payload) VALUES (?,?,?)',(activity_id,source_digest,payload))
+        except (sqlite3.Error,ValueError,OverflowError,MemoryError):
+            pass
+    if size<=MAX_TRACK_CACHE_BYTES:
         with STATE_LOCK:
-            previous = TRACK_CACHE.get(cache_key)
+            previous=TRACK_CACHE.get(cache_key)
             if previous is not None:
                 TRACK_CACHE.move_to_end(cache_key)
                 return previous
-            while TRACK_CACHE and TRACK_CACHE_BYTES + size > MAX_TRACK_CACHE_BYTES:
-                _, stale = TRACK_CACHE.popitem(last=False)
-                TRACK_CACHE_BYTES -= len(stale) * 8
-            TRACK_CACHE[cache_key] = track
-            TRACK_CACHE_BYTES += size
-    return track
+            while TRACK_CACHE and TRACK_CACHE_BYTES+size>MAX_TRACK_CACHE_BYTES:
+                _,stale=TRACK_CACHE.popitem(last=False)
+                TRACK_CACHE_BYTES-=len(stale[0])*8+len(stale[1])*72
+            TRACK_CACHE[cache_key]=value
+            TRACK_CACHE_BYTES+=size
+    return value
+
 
 
 def clear_render_caches(include_tracks=False):
-    """Invalidate saved map views after data changes without touching user GPS."""
     global TRACK_CACHE_BYTES, VIEW_CACHE_BYTES
     with STATE_LOCK:
         CACHE_STATE["epoch"] += 1
         VIEW_CACHE.clear()
         VIEW_CACHE_BYTES = 0
         if include_tracks:
+            try:
+                with db_connect() as con:
+                    con.execute("DROP TABLE IF EXISTS heatmap_index_cache")
+                    con.execute("DELETE FROM heatmap_track_cache")
+                    con.execute("DELETE FROM heatmap_view_cache")
+            except sqlite3.Error:
+                pass
             TRACK_CACHE.clear()
             TRACK_CACHE_BYTES = 0
 
 
 def _clip_segment(x0, y0, x1, y1, xmin, ymin, xmax, ymax):
-    """Clip segments before grid walking, including both-outside crossings."""
     dx, dy = x1 - x0, y1 - y0
     start, end = 0.0, 1.0
     for p, q in ((-dx, x0 - xmin), (dx, xmax - x0), (-dy, y0 - ymin), (dy, ymax - y0)):
@@ -1132,8 +1585,186 @@ def _clip_segment(x0, y0, x1, y1, xmin, ymin, xmax, ymax):
     return x0 + dx * start, y0 + dy * start, x0 + dx * end, y0 + dy * end
 
 
-def create_view(params):
-    global VIEW_CACHE_BYTES
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def heatmap_view_fingerprint(con):
+    hasher=hashlib.blake2b(digest_size=20)
+    hasher.update(b'libre-heat-view-exact-v2')
+    for row in con.execute('SELECT id,name,sport,day,bike,west,south,east,north,point_count,LENGTH(coordinates) FROM activities ORDER BY id'):
+        hasher.update(json.dumps(row,separators=(',',':')).encode('utf-8'))
+    return hasher.hexdigest()
+
+
+def read_persisted_view(key):
+    try:
+        digest=hashlib.sha256(key.encode('utf-8')).hexdigest()
+        with db_connect() as con:
+            fingerprint=heatmap_view_fingerprint(con)
+            row=con.execute('SELECT fingerprint,digest,payload FROM heatmap_view_cache WHERE key=?',(digest,)).fetchone()
+        if not row or row[0]!=fingerprint or len(row[2])>8*1024*1024 or hashlib.sha256(row[2]).hexdigest()!=row[1]:return None
+        decoder=zlib.decompressobj()
+        data=decoder.decompress(row[2],12*1024*1024+1)
+        if len(data)>12*1024*1024 or decoder.unconsumed_tail or not decoder.eof:return None
+        parsed=json.loads(data)
+        if not isinstance(parsed,dict) or not {'z','step','segments','activities','peak'}<=parsed.keys():return None
+        return data
+    except (sqlite3.Error,ValueError,TypeError,zlib.error,OverflowError):
+        return None
+
+
+def persist_view(key,data,expected_epoch):
+    if len(data)>12*1024*1024:return
+    try:
+        zipped=zlib.compress(data,1)
+        if len(zipped)>8*1024*1024:return
+        with STATE_LOCK:
+            if CACHE_STATE['epoch']!=expected_epoch:return
+        with db_connect() as con:
+            fingerprint=heatmap_view_fingerprint(con)
+            con.execute('INSERT OR REPLACE INTO heatmap_view_cache(key,fingerprint,digest,payload,used) VALUES (?,?,?,?,?)',
+                (hashlib.sha256(key.encode('utf-8')).hexdigest(),fingerprint,hashlib.sha256(zipped).hexdigest(),zipped,int(time.time())))
+            count,size=con.execute('SELECT COUNT(*),COALESCE(SUM(LENGTH(payload)),0) FROM heatmap_view_cache').fetchone()
+            if count>128 or size>128*1024*1024:
+                for cache_key,bytes_used in con.execute('SELECT key,LENGTH(payload) FROM heatmap_view_cache ORDER BY used,key').fetchall():
+                    if count<=128 and size<=128*1024*1024:break
+                    con.execute('DELETE FROM heatmap_view_cache WHERE key=?',(cache_key,))
+                    count-=1;size-=bytes_used
+    except (sqlite3.Error,ValueError,MemoryError,OverflowError):
+        pass
+
+
+def _heat_worker_start(db_path,cancel_flags):
+    global DB_PATH, MAX_TRACK_CACHE_BYTES, HEAT_CANCEL_FLAGS
+    DB_PATH=Path(db_path)
+    HEAT_CANCEL_FLAGS=cancel_flags
+    MAX_TRACK_CACHE_BYTES=80*1024*1024
+
+
+def _heat_worker_ready():
+    return True
+
+
+def _heat_worker_chunk(task):
+    z,lo_x,hi_x,lo_y,hi_y,gscale,dscale,geom_step,ids,epoch,slot,ticket=task
+    def superseded():
+        return HEAT_CANCEL_FLAGS[slot]!=ticket
+    return _heat_accumulate(ids,z,lo_x,hi_x,lo_y,hi_y,gscale,dscale,geom_step,epoch,superseded,False)
+
+
+def _heat_accumulate(ids,z,lo_x,hi_x,lo_y,hi_y,gscale,dscale,geom_step,epoch,cancelled,save_projection=True):
+    if not ids:return set(),{},0
+    paths=set();counts={};selected=0
+    with db_connect() as con:
+        for activity_id,compressed in con.execute('SELECT id,coordinates FROM activities WHERE id IN ('+','.join('?' for _ in ids)+')',ids):
+            if cancelled():raise ViewCancelled()
+            selected+=1
+            coords,chunks=cached_projected_track_with_chunks(activity_id,compressed,epoch,con,save_projection=save_projection)
+            visited=set()
+            for chunk_start,chunk_end,cxmin,cymin,cxmax,cymax in chunks:
+                if cxmax<lo_x or cxmin>hi_x or cymax<lo_y or cymin>hi_y:
+                    continue
+                previous=None
+                for i in range(chunk_start,chunk_end,2):
+                    x,y=coords[i],coords[i+1]
+                    if x!=x:
+                        previous=None
+                        continue
+                    dg=(round(x*dscale),round(y*dscale))
+                    gg=(round(x*gscale),round(y*gscale))
+                    if previous is not None:
+                        px,py,old_d,old_g=previous
+                        if z<=12 and dg==old_d and gg==old_g and lo_x+.01<x<hi_x-.01 and lo_y+.01<y<hi_y-.01 and lo_x+.01<px<hi_x-.01 and lo_y+.01<py<hi_y-.01:
+                            visited.add(dg)
+                            continue
+                        if not(max(px,x)<lo_x or min(px,x)>hi_x or max(py,y)<lo_y or min(py,y)>hi_y):
+                            if lo_x<=px<=hi_x and lo_x<=x<=hi_x and lo_y<=py<=hi_y and lo_y<=y<=hi_y:
+                                da,db=old_d,dg
+                                ga,gb=old_g,gg
+                            else:
+                                clipped=_clip_segment(px,py,x,y,lo_x,lo_y,hi_x,hi_y)
+                                if clipped is None:
+                                    previous=(x,y,dg,gg);continue
+                                ax,ay,bx,by=clipped
+                                da=(round(ax*dscale),round(ay*dscale));db=(round(bx*dscale),round(by*dscale))
+                                ga=(round(ax*gscale),round(ay*gscale));gb=(round(bx*gscale),round(by*gscale))
+                            visited.add(da);visited.add(db)
+                            dsteps=max(abs(db[0]-da[0]),abs(db[1]-da[1]))
+                            if dsteps>2:
+                                dcx,dcy=db[0]-da[0],db[1]-da[1]
+                                sx,sy=2.0*dcx/dsteps,2.0*dcy/dsteps
+                                pxv,pyv=sx,sy
+                                for _ in range(2,dsteps,2):
+                                    visited.add((da[0]+round(pxv),da[1]+round(pyv)))
+                                    pxv+=sx;pyv+=sy
+                            if ga!=gb:
+                                span=max(abs(gb[0]-ga[0]),abs(gb[1]-ga[1]))
+                                pieces=max(1,math.ceil(span*geom_step/24.0))
+                                if pieces==1:
+                                    a,b=(ga,gb) if ga<gb else (gb,ga)
+                                    paths.add((a[0],a[1],b[0],b[1]))
+                                else:
+                                    ox,oy=ga
+                                    for k in range(1,pieces+1):
+                                        ex=round(ga[0]+(gb[0]-ga[0])*k/pieces)
+                                        ey=round(ga[1]+(gb[1]-ga[1])*k/pieces)
+                                        if (ex,ey)!=(ox,oy):
+                                            a,b=((ox,oy),(ex,ey)) if (ox,oy)<(ex,ey) else ((ex,ey),(ox,oy))
+                                            paths.add((a[0],a[1],b[0],b[1]))
+                                        ox,oy=ex,ey
+                    previous=(x,y,dg,gg)
+            for c in visited:
+                counts[c]=counts.get(c,0)+1
+    return paths,counts,selected
+
+
+def _heat_session_slot(session):
+    if not session:return 0
+    return (int.from_bytes(hashlib.blake2b(session.encode(),digest_size=4).digest(),'big')%1023)+1
+
+
+def _heat_executor():
+    global HEAT_WORKERS, HEAT_CANCEL_FLAGS
+    if HEAT_WORKERS is not None:return HEAT_WORKERS
+    with HEAT_WORKERS_LOCK:
+        if HEAT_WORKERS is None:
+            workers=min(4,max(2,os.cpu_count() or 2))
+            HEAT_CANCEL_FLAGS=multiprocessing.RawArray("Q",1024)
+            HEAT_WORKERS=ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context("spawn"),initializer=_heat_worker_start,initargs=(str(DB_PATH),HEAT_CANCEL_FLAGS))
+    return HEAT_WORKERS
+
+def warm_heat_workers():
+    if HEAT_PARALLEL_DISABLED or HEAT_WORKERS is not None:return
+    try:
+        with db_connect() as con:
+            count,points=con.execute('SELECT COUNT(*),COALESCE(SUM(point_count),0) FROM activities').fetchone()
+        if count<100 or points<350000:return
+        executor=_heat_executor()
+        for _ in range(min(4,max(2,os.cpu_count() or 2))):
+            executor.submit(_heat_worker_ready)
+    except Exception as error:
+        print('Map worker warmup skipped:',error,file=sys.stderr)
+
+
+def start_heat_warmup():
+    if not HEAT_PARALLEL_DISABLED and HEAT_WORKERS is None:
+        threading.Thread(target=warm_heat_workers,daemon=True).start()
+
+
+def create_view(params,cancelled=lambda:False):
+    global VIEW_CACHE_BYTES, HEAT_WORKERS, HEAT_PARALLEL_DISABLED
     key=json.dumps(params,sort_keys=True,separators=(',',':'))
     with STATE_LOCK:
         if key in VIEW_CACHE:
@@ -1141,76 +1772,67 @@ def create_view(params):
             return VIEW_CACHE[key]
         epoch=CACHE_STATE['epoch']
     sql,args=filter_query(params,True)
+    saved=read_persisted_view(key)
+    if saved is not None and not cancelled():
+        with STATE_LOCK:
+            if CACHE_STATE['epoch']==epoch and len(saved)<=MAX_VIEW_CACHE_BYTES:
+                while VIEW_CACHE and (len(VIEW_CACHE)>=12 or VIEW_CACHE_BYTES+len(saved)>MAX_VIEW_CACHE_BYTES):
+                    _,stale=VIEW_CACHE.popitem(last=False);VIEW_CACHE_BYTES-=len(stale)
+                VIEW_CACHE[key]=saved;VIEW_CACHE_BYTES+=len(saved)
+        return saved
     z=max(0,min(19,int(float(params.get('z',['4'])[0]))))
     scale=2**z
     west,south,east,north=[float(params[n][0]) for n in ('west','south','east','north')]
     x0,y0=project_xy(north,west,z)
     x1,y1=project_xy(south,east,z)
-    # Extend calculation outside the actual crop so features remain seamless while panning.
     left,right=min(x0,x1)-48,max(x0,x1)+48
     top,bottom=min(y0,y1)-48,max(y0,y1)+48
     lo_x,hi_x=left/scale,right/scale
     lo_y,hi_y=top/scale,bottom/scale
-    # Preserve fine-grained route geometry for smooth, anti-aliased paths.
     geom_step=1.1 if z>=13 else 1.35
     density_step=6.5 if z>=13 else 7.5
     gscale=scale/geom_step
     dscale=scale/density_step
-    paths=set();counts={};selected=0
     with db_connect() as con:
-        for activity_id,compressed in con.execute('SELECT id,coordinates FROM activities'+sql,args):
-            selected+=1
-            coords=cached_projected_track(activity_id,compressed,epoch)
-            visited=set()
-            previous=None
-            for i in range(0,len(coords),2):
-                x,y=coords[i],coords[i+1]
-                if x!=x:
-                    previous=None
-                    continue
-                if previous is not None:
-                    px,py=previous
-                    if not(max(px,x)<lo_x or min(px,x)>hi_x or max(py,y)<lo_y or min(py,y)>hi_y):
-                        if lo_x<=px<=hi_x and lo_x<=x<=hi_x and lo_y<=py<=hi_y and lo_y<=y<=hi_y:
-                            ax,ay,bx,by=px,py,x,y
-                        else:
-                            clipped=_clip_segment(px,py,x,y,lo_x,lo_y,hi_x,hi_y)
-                            if clipped is None:
-                                previous=(x,y);continue
-                            ax,ay,bx,by=clipped
-                        da=(round(ax*dscale),round(ay*dscale)); db=(round(bx*dscale),round(by*dscale))
-                        visited.add(da);visited.add(db)
-                        dsteps=max(abs(db[0]-da[0]),abs(db[1]-da[1]))
-                        if dsteps>2:
-                            dcx,dcy=db[0]-da[0],db[1]-da[1]
-                            for t in range(2,dsteps,2):
-                                visited.add((da[0]+round(dcx*t/dsteps),da[1]+round(dcy*t/dsteps)))
-                        ga=(round(ax*gscale),round(ay*gscale)); gb=(round(bx*gscale),round(by*gscale))
-                        if ga!=gb:
-                            # Sparse GPS legs can cross different-density roads.
-                            # Split those long strokes so one midpoint never colors
-                            # the whole crossing incorrectly; short legs stay intact.
-                            span=max(abs(gb[0]-ga[0]),abs(gb[1]-ga[1]))
-                            pieces=max(1,math.ceil(span*geom_step/24.0))
-                            if pieces==1:
-                                a,b=(ga,gb) if ga<gb else (gb,ga)
-                                paths.add((a[0],a[1],b[0],b[1]))
-                            else:
-                                ox,oy=ga
-                                for k in range(1,pieces+1):
-                                    ex=round(ga[0]+(gb[0]-ga[0])*k/pieces)
-                                    ey=round(ga[1]+(gb[1]-ga[1])*k/pieces)
-                                    if (ex,ey)!=(ox,oy):
-                                        a,b=((ox,oy),(ex,ey)) if (ox,oy)<(ex,ey) else ((ex,ey),(ox,oy))
-                                        paths.add((a[0],a[1],b[0],b[1]))
-                                    ox,oy=ex,ey
-                previous=(x,y)
-            for c in visited:
-                counts[c]=counts.get(c,0)+1
-    # Use continuous bilinear interpolation of nearby unique-activity visit counts.
-    # These densities color the original GPS polylines; coordinates are never
-    # snapped to the density grid. A plateau across neighboring GPS noise keeps
-    # heavily repeated roads bright with gradual color transitions.
+        activity_rows=con.execute('SELECT id,point_count FROM activities'+sql,args).fetchall()
+    ids=[r[0] for r in activity_rows]
+    point_total=sum(r[1] for r in activity_rows)
+    selected=len(ids)
+    paths=set();counts={}
+    if len(ids)<100 or point_total<350000 or HEAT_PARALLEL_DISABLED or os.environ.get('LIBREHEATMAPS_SINGLE_CORE')=='1':
+        paths,counts,_=_heat_accumulate(ids,z,lo_x,hi_x,lo_y,hi_y,gscale,dscale,geom_step,epoch,cancelled)
+    else:
+        workers=min(4,max(2,os.cpu_count() or 2))
+        batches=[ids[i::workers] for i in range(workers)]
+        try:
+            executor=_heat_executor()
+            session=getattr(cancelled,'heat_session','')
+            slot=_heat_session_slot(session)
+            with HEAT_CANCEL_LOCK:
+                HEAT_CANCEL_FLAGS[slot]=(HEAT_CANCEL_FLAGS[slot]+1)&0xffffffffffffffff
+                ticket=HEAT_CANCEL_FLAGS[slot]
+            futures=[executor.submit(_heat_worker_chunk,(z,lo_x,hi_x,lo_y,hi_y,gscale,dscale,geom_step,batch,epoch,slot,ticket)) for batch in batches if batch]
+            pending=set(futures)
+            while pending:
+                if cancelled():
+                    for future in pending:future.cancel()
+                    raise ViewCancelled()
+                finished,pending=wait(pending,timeout=0.06,return_when=FIRST_COMPLETED)
+                for future in finished:
+                    worker_paths,worker_counts,_=future.result()
+                    paths.update(worker_paths)
+                    for cell,n in worker_counts.items():
+                        counts[cell]=counts.get(cell,0)+n
+        except ViewCancelled:
+            raise
+        except Exception as error:
+            print('Multicore map rendering unavailable, using local rendering:',error,file=sys.stderr)
+            with HEAT_WORKERS_LOCK:
+                HEAT_PARALLEL_DISABLED=True
+                if HEAT_WORKERS is not None:
+                    HEAT_WORKERS.shutdown(wait=False,cancel_futures=True)
+                    HEAT_WORKERS=None
+            paths,counts,_=_heat_accumulate(ids,z,lo_x,hi_x,lo_y,hi_y,gscale,dscale,geom_step,epoch,cancelled)
     neighborhood={}
     def nearby_peak(cx,cy):
         key=(cx,cy)
@@ -1240,6 +1862,7 @@ def create_view(params):
             while VIEW_CACHE and (len(VIEW_CACHE)>=12 or VIEW_CACHE_BYTES +len(encoded)>MAX_VIEW_CACHE_BYTES):
                 _,stale=VIEW_CACHE.popitem(last=False);VIEW_CACHE_BYTES-=len(stale)
             VIEW_CACHE[key]=encoded;VIEW_CACHE_BYTES+=len(encoded)
+    if not cancelled():persist_view(key,encoded,epoch)
     return encoded
 
 def export_gpx(handler, params):
@@ -1272,6 +1895,8 @@ header .header-actions{display:flex;align-items:center}.private-pill{border:1px 
 header .logo{clip-path:none;object-fit:contain;background:none;flex:none;filter:none} .stats-cta,.stats-header{background:#8b72b3;color:#fff;border-color:#9a84b8;font-weight:700}.stats-cta:hover,.stats-header:hover{background:#9d87c4}.stats-header{font-size:12px;padding:8px 12px}button.primary:not(.stats-cta):not(.stats-header){background:#b5a3cd}section{padding-bottom:15px;margin-bottom:15px} .metric-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.weekday-panel{background:#242033;border:1px solid #40364b;border-radius:13px;padding:15px;margin:12px 0}.weekday-chart{display:grid;gap:8px;margin-top:10px}.weekday-row{display:grid;grid-template-columns:55px 1fr 62px;gap:9px;align-items:center;font-size:11px}.weekday-row .chart-track{height:11px}#legendLabel{color:#c7b9d1}select#palette{width:100%}@media(max-width:750px){}
  .settings-stack{display:grid;gap:5px}.settings-section{margin-bottom:5px;padding-bottom:17px}.settings-section h2{font-size:13px;letter-spacing:.07em}.settings-note{font-size:12px;line-height:1.55;margin:12px 0}.settings-actions{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #3e354b}.settings-actions strong{display:block;font-size:13px;color:#f0e7fc}.settings-actions small{display:block;max-width:460px;line-height:1.5;margin-top:5px;color:#b7a9c4}.settings-actions button{flex:none}.settings-status{min-height:18px;font-size:12px;color:#ccb6e7;white-space:pre-wrap}.settings-status.error{color:#ffa5a5}button.danger{border-color:#994d61;color:#ffc5cf;background:#3c202d}button.danger:hover{background:#532735}#openSettings{padding:8px 12px;font-size:12px}#settingsDialog .field select{max-width:100%;width:100%}@media(max-width:670px){.settings-actions{align-items:stretch;flex-direction:column}.settings-actions button{align-self:flex-start}}
 .bike-row{padding-left:16px;margin-left:9px;border-left:2px solid #655078;font-size:12px;color:#cdbed9}.bike-row strong{font-weight:600}.local-storage{padding:14px 0}.local-storage>strong{display:block;font-size:13px;margin-bottom:8px}.path-label{font-size:11px;color:#b8a9cb;margin-top:10px}.local-storage code{display:block;word-break:break-all;font-size:12px;line-height:1.5;padding:9px 10px;background:#171421;border:1px solid #42374f;border-radius:7px;color:#e2d4f0}#releaseLink{display:inline-block;margin-top:8px;color:#cdb4f0}#updateStatus{margin-top:8px}#settingsDialog .settings-stack{display:block}
+.anomaly-setting{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;font-size:13px;color:#e6d7f3;cursor:pointer}.anomaly-setting input{accent-color:#b779ec;width:19px;height:19px}
+.analytics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.analytics-plot{min-height:200px;overflow:hidden}.analytics-plot svg{display:block;width:100%;height:210px}.analytics-plot .axis-label{fill:#c8b5d5;font-size:11px}.analytics-plot .gridline{stroke:#52435e;stroke-width:1}.analytics-plot .plot-line{stroke:#e69ac6;stroke-width:2.5;fill:none;stroke-linecap:round;stroke-linejoin:round}.analytics-plot .plot-dot{fill:#ffc08b;stroke:#231730;stroke-width:1}.analytics-plot .empty-chart{color:#b8a8c6;padding:45px 0;text-align:center}@media(max-width:850px){.analytics-grid{grid-template-columns:minmax(0,1fr)}}
 .palette-preview{height:22px;margin-top:10px;border-radius:6px;border:1px solid #665474;background:linear-gradient(90deg,#a16cdf,#df398f,#f34547,#ff8d23,#fff3dd)}.palette-ends{display:flex;justify-content:space-between;font-size:11px;color:#b9a9cb;margin-top:5px}#releaseLink[hidden]{display:none!important}#settingsDialog{padding:0;overflow:auto;scrollbar-gutter:stable}#settingsDialog>.dialog-head{position:sticky;top:0;z-index:4;align-items:center;margin:0;border-bottom:1px solid #4e3e61;box-shadow:0 3px 10px #09061255}#settingsDialog .settings-close{display:grid;place-items:center;flex:none;border-radius:10px;line-height:1;color:#f5edf8;background:#33263f}#settingsDialog .settings-close:hover{background:#51395b}#settingsDialog .settings-savebar{position:sticky;bottom:0;z-index:4;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #4e3e61;box-shadow:0 -3px 12px #09061255}.settings-save-state{font-size:12px;color:#bcb2c8}.settings-save-state.dirty{color:#ffcb79}.settings-save-state.error{color:#ff9eaa}#saveSettings{min-width:142px;font-weight:750}#saveSettings:disabled{opacity:.55;cursor:default}@media(max-width:560px){#settingsDialog>.dialog-head,#settingsDialog>.settings-stack,#settingsDialog .settings-savebar{padding-left:14px;padding-right:14px}}
 aside .status,aside .foot,#dateRange{font-size:13px}
 #statsDialog h2{font-size:14px}
@@ -1745,7 +2370,6 @@ header .header-actions{gap:6px}
 @media(max-width:700px){#ridePreviewDialog .ride-preview-detail{padding:12px}#ridePreviewDialog .ride-preview-detail strong{font-size:16px}}
 
 
-/* Unified statistical language across the overview, personal records, and route previews. */
 #statsDialog #metricGrid{gap:12px;margin-bottom:25px}
 #statsDialog #metricGrid .metric{min-height:128px;gap:13px}
 #statsDialog #metricGrid .metric:nth-child(4n+1){--lh-accent:#b98af0;--lh-wash:#bb8bfb20}
@@ -1775,6 +2399,8 @@ header .header-actions{gap:6px}
 #ridePreviewDialog .ride-preview-detail{min-height:85px;padding:15px}
 #ridePreviewDialog .ride-preview-detail strong{font-size:18px;font-weight:700}
 #ridePreviewDialog .ride-preview-detail span{font-size:13px;margin:0 0 10px}
+#ridePreviewDialog .ride-preview-source{margin:12px 0 15px;padding:10px 12px;border:1px solid #493b57;border-radius:10px;background:#241c30;color:#cbbbd7;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+#ridePreviewDialog .ride-preview-source:empty{display:none}
 .legend{padding:12px 14px;min-width:235px;backdrop-filter:blur(12px);z-index:2}
 .legend .bar{height:9px}
 .legend-select{margin-top:11px;padding-top:10px;border-top:1px solid #594568;display:flex;justify-content:space-between;gap:11px;align-items:center}
@@ -1785,7 +2411,6 @@ header .header-actions{gap:6px}
 @media(max-width:520px){#statsDialog #facts{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}#statsDialog #facts .record-metric{min-height:125px;padding:13px}#statsDialog #facts .record-metric strong{font-size:20px}#statsDialog #metricGrid .metric{min-height:105px}#statsDialog #metricGrid{margin-bottom:20px}.legend{left:10px;bottom:10px;max-width:calc(100% - 96px);min-width:215px}}
 
 
-/* Overview is one coherent story: totals, records, trends, history, and activity mix. */
 #statsDialog .stats-tabs{padding-top:22px}
 #statsDialog .stats-story-section{min-width:0;margin:0 0 31px}
 #statsDialog .stats-story-heading{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:0 0 17px}
@@ -1847,28 +2472,13 @@ header .header-actions{gap:6px}
 }
 @media(max-width:375px){#statsDialog #facts,#statsDialog #milestones{grid-template-columns:1fr}}
 
-/* Discreet, consistent contextual help. The tooltip lives at body level so modal scrolling never clips it. */
 .lh-help-trigger{display:inline-flex;flex:none;align-items:center;justify-content:center;width:19px;height:19px;min-width:19px;min-height:19px;padding:0;border:1px solid #8a719d;border-radius:50%;background:#30263c;color:#e2c9f4;font:700 12px/1 system-ui,sans-serif;cursor:help;vertical-align:middle;box-shadow:0 0 0 1px #100c18aa;z-index:3}
 .lh-help-trigger:hover,.lh-help-trigger:focus-visible{color:#1b1324;background:#e7c2ff;border-color:#efceff;outline:2px solid #d19eeb;outline-offset:2px}
 #lhHelpPopover{position:fixed;z-index:2147483647;max-width:350px;padding:14px 16px 15px;border:1px solid #aa87bf;border-radius:12px;background:#221a2e;color:#f6effa;box-shadow:0 14px 42px #000b;pointer-events:none;font-size:13px;line-height:1.55;white-space:normal;overflow-wrap:break-word}
 #lhHelpPopover[hidden]{display:none!important}
 #lhHelpPopover strong{display:block;margin-bottom:5px;font-size:14px;color:#f0ceff;font-weight:750}
 #lhHelpPopover span{display:block;color:#e7daee}
-.lh-help-heading{display:inline-flex;align-items:center;gap:9px;flex-wrap:wrap;max-width:100%}
-.lh-help-heading .lh-help-trigger{font-size:11px;width:18px;height:18px;min-width:18px;min-height:18px}
-.lh-help-field{position:relative;min-width:0}.lh-help-field>label{padding-right:26px}.lh-help-field>.lh-help-trigger{position:absolute;right:0;top:0}
-.lh-help-toggle-wrap,.lh-help-label-wrap{display:flex;align-items:center;gap:7px;min-width:0}
-.lh-help-toggle-wrap>label,.lh-help-label-wrap>label{flex:1;min-width:0}
-.lh-help-label-wrap{align-items:flex-start}.lh-help-label-wrap>.lh-help-trigger{margin-top:2px}
-.lh-help-action-wrap{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%}
-.lh-help-action-wrap>button:not(.lh-help-trigger){min-width:0}.lh-help-action-wrap>.lh-help-trigger{align-self:center}
-.lh-help-action-full{display:flex;width:100%}.lh-help-action-full>button:not(.lh-help-trigger){flex:1;width:auto;margin-top:0}
-.row>.lh-help-action-wrap{flex:1}
-.header-actions>.lh-help-action-wrap{flex:none}
-.tools>.lh-help-action-wrap{display:flex;align-items:center;gap:5px}
 .tools .lh-help-trigger{width:18px!important;min-width:18px!important;height:18px!important;min-height:18px!important;padding:0!important;font-size:12px!important}
-#statsDialog .stats-tabs .lh-help-tab{position:relative;padding-right:29px}
-.lh-tab-question{position:absolute;right:7px;top:8px;width:17px;height:17px;border-radius:50%;border:1px solid #997baa;display:grid;place-items:center;font-size:11px;font-weight:700;color:#d9b9ee}
 .lh-help-card{position:relative;min-width:0;padding-right:max(25px,1em)}
 .lh-help-card>.lh-help-trigger{position:absolute;right:9px;top:9px}
 .lh-help-cardwrap{position:relative;min-width:0;display:flex;max-width:100%;height:100%}
@@ -1876,46 +2486,24 @@ header .header-actions{gap:6px}
 .lh-help-cardwrap>.lh-help-trigger{position:absolute;top:9px;right:8px}
 #statsDialog .stats-metric-cards>.lh-help-cardwrap,#statsDialog #facts>.lh-help-cardwrap,#statsDialog #milestones>.lh-help-cardwrap{width:100%}
 #statsDialog .stats-metric-cards>.lh-help-cardwrap .metric,#statsDialog #facts>.lh-help-cardwrap .metric,#statsDialog #milestones>.lh-help-cardwrap .metric{width:100%}
-#statsDialog .ride-list>.lh-help-action-wrap{display:flex;width:100%;min-width:0}
-#statsDialog .ride-list>.lh-help-action-wrap>.ride-list-item{width:100%;flex:1}
 #statsDialog .insights-content-card.lh-help-card{padding-right:33px}
 #statsDialog .insights-content-card.lh-help-card>.lh-help-trigger{top:15px;right:12px}
 #statsDialog .stats-metric-group-label .lh-help-trigger{position:static}
-#statsDialog .stats-accuracy .lh-help-heading{cursor:pointer}
-#settingsDialog .settings-actions .lh-help-heading{display:inline-flex}
-#settingsDialog .settings-section>.lh-help-heading{margin-right:0}
-#settingsDialog .settings-savebar>.lh-help-action-wrap{flex:none}
 .legend.lh-help-card{padding-right:13px}.legend.lh-help-card>.lh-help-trigger{right:9px;top:8px}
-.legend .lh-help-label-wrap{gap:5px}.legend .lh-help-label-wrap select{max-width:117px}
 .maptop.lh-help-card{padding-right:35px}.maptop.lh-help-card>.lh-help-trigger{pointer-events:auto}
 .empty .panel.lh-help-card{padding-right:36px}
 .ride-preview-map.lh-help-card{padding-right:0}.ride-preview-map.lh-help-card>.lh-help-trigger{top:10px;right:10px;z-index:7}
-@media(max-width:600px){#lhHelpPopover{font-size:12px;padding:12px 13px}.lh-help-action-wrap{gap:4px}.lh-help-trigger{width:18px;height:18px;min-width:18px;min-height:18px}#statsDialog .stats-tabs .lh-help-tab{padding-right:20px}.lh-tab-question{top:3px;right:3px}}
+@media(max-width:600px){#lhHelpPopover{font-size:12px;padding:12px 13px}.lh-help-trigger{width:18px;height:18px;min-width:18px;min-height:18px}}
 
 #statsDialog #metricGrid .metric.lh-help-card,#statsDialog .record-metric.lh-help-card{padding-right:35px!important}
-#statsDialog .insights-intro>.lh-help-label-wrap{flex:none;align-items:center}
-#statsDialog .insights-intro>.lh-help-label-wrap>label{flex:none}
 
-@media(max-width:1060px){#statsDialog .details-repair{flex-direction:column;align-items:stretch}#statsDialog .details-repair>.lh-help-action-wrap{width:fit-content;max-width:100%}#statsDialog .details-repair>.lh-help-action-wrap>button:not(.lh-help-trigger){white-space:normal}}
+@media(max-width:1060px){#statsDialog .details-repair{flex-direction:column;align-items:stretch}}
 #statsDialog .details-repair>div:first-child{min-width:0}
 #statsDialog .insights-filter-drawer summary>.lh-help-trigger{margin-left:2px;order:2}
 
-.lh-help-date-wrap{display:flex;flex:1;align-items:center;gap:5px;min-width:0}
-.lh-help-date-wrap>input{flex:1;width:100%;min-width:0}
-.lh-help-date-wrap>.lh-help-trigger{min-width:18px}
-@media(max-width:420px){.lh-help-date-wrap{gap:2px}.lh-help-date-wrap>.lh-help-trigger{width:16px;min-width:16px;height:16px;min-height:16px;font-size:10px}}
 
-/* Positioned map overlays must not inherit the generic help-card position. */
-#map .maptop.lh-help-card{position:absolute;top:17px;left:18px;width:max-content;max-width:min(380px,calc(100% - 85px))}
-#map .legend.lh-help-card{position:absolute;bottom:16px;left:16px;top:auto;width:238px;max-width:calc(100% - 95px);padding-right:28px}
-@media(max-width:540px){#map .maptop.lh-help-card{top:12px;left:10px;max-width:calc(100% - 100px)}#map .legend.lh-help-card{bottom:10px;left:10px;max-width:calc(100% - 98px)}}
 
-/* Hide help for conditionally hidden actions, without changing their existing show/hide logic. */
-.lh-help-action-wrap:has(>button[hidden]){display:none!important}
-#map .legend.lh-help-card{width:268px}
-.legend .lh-help-label-wrap select{max-width:139px}
 
-/* Uniform help affordance: no inherited button sizing, pills, or oval shapes. */
 button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog button.lh-help-trigger,#map button.lh-help-trigger{
  box-sizing:border-box!important;inline-size:18px!important;block-size:18px!important;min-inline-size:18px!important;min-block-size:18px!important;
  max-inline-size:18px!important;max-block-size:18px!important;flex:0 0 18px!important;
@@ -1923,14 +2511,12 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
  font:700 11px/16px system-ui,sans-serif!important;letter-spacing:0!important;white-space:nowrap!important;
  text-align:center!important;display:inline-flex!important;align-items:center!important;justify-content:center!important;
 }
-/* Keep card explanations clear of text, values, and actions. */
 #statsDialog .stats-sport-card.lh-help-card{padding-top:39px;padding-right:21px}
 #statsDialog .details-repair.lh-help-card{padding-right:38px}
 #statsDialog .details-repair.lh-help-card>.lh-help-trigger{top:10px;right:10px}
 #statsDialog .insights-content-card.lh-help-card .insights-card-title{padding-right:20px}
 #statsDialog .insights-content-card.lh-help-card>.lh-help-trigger{top:13px;right:12px}
 
-/* Keep dialog branding and contextual help aligned with the layout. */
 #statsDialog .insights-heading .insights-mark{width:50px;height:50px;display:grid;place-items:center;padding:0;border:0;background:none;box-shadow:none}
 #statsDialog .insights-mark img{display:block;width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 0 9px #db72e750)}
 #settingsDialog .settings-dialog-brand{display:flex;align-items:center;gap:13px;min-width:0}
@@ -1975,16 +2561,166 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
  #settingsDialog>.dialog-head .muted{font-size:12px;line-height:1.35}
  #statsDialog #closeStats{padding:8px;min-width:40px}
 }
+
+#statsDialog .analytics-studio{padding:0;border:0}
+#statsDialog .analytics-studio-header{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-bottom:16px}
+#statsDialog .analytics-studio-header h4{margin:4px 0 5px;font-size:22px;letter-spacing:-.35px;line-height:1.25}
+#statsDialog .analytics-studio-header p{max-width:590px;margin:0;font-size:14px;line-height:1.5;color:#d0bfdb}
+#statsDialog .analytics-count{flex:none;font-size:12px;line-height:1.5;color:#eacbf0;border:1px solid #574366;border-radius:10px;padding:9px 12px;background:#2a2034}
+#statsDialog .analytics-toolbar{display:flex;align-items:end;flex-wrap:wrap;gap:11px 12px;padding:15px;border:1px solid #4c3b5a;border-radius:13px;background:#211b2d}
+#statsDialog .analytics-toolbar label{display:flex;flex:1 1 135px;flex-direction:column;gap:6px;min-width:105px;max-width:220px;font-size:12px;font-weight:650;line-height:1.35;color:#d3c4df}
+#statsDialog .analytics-toolbar select{min-width:0;width:100%;font-size:13px;min-height:39px;border-radius:8px;background:#30283c;color:#f5eefe}
+#statsDialog .analytics-toolbar .analytics-reset{min-height:39px;white-space:nowrap;font-size:13px;padding:8px 12px;border-radius:8px}
+#statsDialog .analytics-categories{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 10px}
+#statsDialog .analytics-categories button{font-size:13px;font-weight:650;border-radius:999px;border:1px solid #564667;padding:9px 15px;background:#251f31;min-height:37px}
+#statsDialog .analytics-categories button[aria-pressed=true]{background:#a987c7;color:#1c1127;border-color:#c4a5e3}
+#statsDialog .analytics-guidance{margin:0 0 17px;font-size:13px;line-height:1.55;color:#c8b7d5;max-width:870px}
+#statsDialog .analytics-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;align-items:start}
+#statsDialog .analytics-grid.layout-double{grid-template-columns:repeat(2,minmax(0,1fr))}
+#statsDialog .analytics-card{position:relative;display:flex;flex-direction:column;gap:0;min-width:0;border-radius:15px;padding:22px!important;background:linear-gradient(155deg,#292137,#201c2c);border:1px solid #554264;box-shadow:0 8px 22px #0a061325}
+#statsDialog .analytics-card[hidden]{display:none!important}
+#statsDialog .analytics-card.expanded{grid-column:1/-1}
+#statsDialog .analytics-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-right:28px;min-height:51px}
+#statsDialog .analytics-card-head h5{margin:0;font-size:18px;font-weight:750;color:#f7eefa;line-height:1.3}
+#statsDialog .analytics-card-head p{font-size:13px;line-height:1.45;color:#c7b7d4;margin:4px 0 0}
+#statsDialog .analytics-card .lh-help-trigger{position:absolute;top:18px;right:17px}
+#statsDialog .analytics-card-tools{display:flex;align-items:center;flex-wrap:wrap;justify-content:space-between;gap:8px;margin:16px 0 0}
+#statsDialog .analytics-card-tools label{display:flex;align-items:center;gap:8px;font-size:12px;color:#cbbbd9;font-weight:650}
+#statsDialog .analytics-card-tools select{min-width:115px;max-width:160px;border-radius:8px;padding:7px 10px;min-height:37px;font-size:13px}
+#statsDialog .analytics-card-buttons{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
+#statsDialog .analytics-card-buttons button{min-height:34px;font-size:12px;padding:7px 10px;border-radius:8px}
+#statsDialog .analytics-card .analytics-plot{position:relative;min-height:250px;overflow:visible;width:100%;margin-top:12px}
+#statsDialog .analytics-card .analytics-plot svg{width:100%;height:auto;max-height:none;display:block;overflow:visible}
+#statsDialog .analytics-plot .plot-grid{stroke:#665470;stroke-width:1;opacity:.48;stroke-dasharray:3 5}
+#statsDialog .analytics-plot .plot-axis{stroke:#776282;stroke-width:1;opacity:.8}
+#statsDialog .analytics-plot .plot-label{fill:#d5c5e0;font:12px Inter,system-ui,sans-serif}
+#statsDialog .analytics-plot .plot-tick{fill:#bfaecf;font:12px Inter,system-ui,sans-serif}
+#statsDialog .analytics-plot .plot-line-new{stroke:#e18bc7;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;fill:none}
+#statsDialog .analytics-plot .plot-area-new{fill:#ca7dc7;opacity:.22;stroke:none}
+#statsDialog .analytics-plot .plot-bar-new{fill:#be84df;opacity:.87;rx:3}
+#statsDialog .analytics-plot .plot-dot-new{fill:#eda6cf;stroke:#21192c;stroke-width:1.1}
+#statsDialog .analytics-plot .plot-hit{cursor:crosshair;outline:none}
+#statsDialog .analytics-plot .plot-hit:focus{stroke:#fff;stroke-width:2;outline:none}
+#statsDialog .analytics-tooltip{position:absolute;z-index:8;max-width:230px;min-width:125px;padding:9px 11px;border:1px solid #ba92d0;border-radius:9px;background:#15111feb;box-shadow:0 8px 22px #0008;color:#f8edff;font-size:12px;line-height:1.5;pointer-events:none;white-space:normal}
+#statsDialog .analytics-tooltip[hidden]{display:none!important}
+#statsDialog .analytics-card-summary{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:8px;color:#cab9d7;font-size:12px;line-height:1.5}
+#statsDialog .analytics-card-summary strong{color:#efd5f7;font-weight:700}
+#statsDialog .analytics-table{margin-top:11px;border-top:1px solid #4d3c58;padding-top:10px}
+#statsDialog .analytics-table summary{cursor:pointer;list-style:auto;color:#dbbceb;font-size:13px;font-weight:650;padding:6px 0}
+#statsDialog .analytics-table table{border-collapse:collapse;width:100%;font-size:12px;line-height:1.4;margin-top:10px}
+#statsDialog .analytics-table th,#statsDialog .analytics-table td{text-align:left;padding:8px 9px;border-bottom:1px solid #43384d}
+#statsDialog .analytics-table th{color:#ebd8f4;background:#30253b}
+#statsDialog .analytics-table td{color:#d4c4dc;font-variant-numeric:tabular-nums}
+#statsDialog .analytics-table-note{font-size:12px;color:#bcb0ca;margin:8px 0 0}
+#statsDialog .analytics-empty{border:1px dashed #60516b;padding:45px 12px;border-radius:10px;text-align:center;color:#c4b2d5;font-size:14px}
+@media(max-width:1100px){#statsDialog .analytics-grid.layout-double{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:720px){#statsDialog .analytics-studio-header{align-items:flex-start;flex-direction:column}#statsDialog .analytics-count{flex:none}#statsDialog .analytics-toolbar label{max-width:none;flex-basis:calc(50% - 12px)}#statsDialog .analytics-card{padding:15px!important}#statsDialog .analytics-card-head{padding-right:26px}#statsDialog .analytics-card-tools{align-items:flex-start}#statsDialog .analytics-card-buttons button{min-height:38px}}
+@media(max-width:420px){#statsDialog .analytics-toolbar label{flex-basis:calc(50% - 8px)}#statsDialog .analytics-toolbar .analytics-reset{width:100%}#statsDialog .analytics-card-tools label{flex:1;width:100%;justify-content:space-between}#statsDialog .analytics-card-tools select{flex:1;max-width:none}#statsDialog .analytics-card-buttons{width:100%}#statsDialog .analytics-card-buttons button{flex:1}#statsDialog .analytics-count{max-width:100%}}
+
+
+#statsDialog .data-studio{min-width:0}
+#statsDialog .data-header{display:flex;justify-content:space-between;gap:15px;align-items:center;margin-bottom:17px}
+#statsDialog .data-header h4{font-size:22px;margin:5px 0 7px}
+#statsDialog .data-header p{font-size:13px;color:#c8b8d5;line-height:1.5;margin:0}
+#statsDialog .data-header button{flex:none;min-height:38px}
+#statsDialog .data-filters{display:flex;flex-wrap:wrap;gap:12px;align-items:end;padding:16px;border-radius:13px;border:1px solid #554565;background:#251e30}
+#statsDialog .data-filters label{display:flex;flex:1 1 140px;flex-direction:column;gap:5px;min-width:125px;color:#d4c5e0;font-size:12px;font-weight:650}
+#statsDialog .data-filters input,#statsDialog .data-filters select{max-width:100%;min-width:0;width:100%;min-height:38px;background:#342b40;color:#f5effa;border-radius:8px;font-size:13px}
+#statsDialog .data-filters button{min-height:38px}
+#statsDialog .data-columns{margin:15px 0;border:1px solid #574666;border-radius:12px;padding:13px 16px;background:#24202f}
+#statsDialog .data-columns summary{cursor:pointer;font-weight:700;font-size:13px}
+#statsDialog .data-column-choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:9px;margin:14px 0}
+#statsDialog .data-column-choices label{display:flex;gap:8px;align-items:center;color:#e2d4ec;font-size:13px}
+#statsDialog .data-column-choices input{accent-color:#ad82d5;width:16px;height:16px}
+#statsDialog .data-summary{font-size:13px;color:#d6c3e3;margin:15px 0 10px;min-height:18px}
+#statsDialog .data-scroll{max-width:100%;max-height:490px;overflow:auto;border:1px solid #60506f;border-radius:13px;background:#201a2b;scrollbar-color:#786186 #241e30}
+#statsDialog .data-scroll:focus-visible{outline:2px solid #c99deb;outline-offset:2px}
+#statsDialog #dataTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+#statsDialog #dataTable th{position:sticky;top:0;z-index:1;text-align:left;padding:0;background:#342840;border-bottom:1px solid #6f5979}
+#statsDialog #dataTable th button{font:inherit;color:#f3e7fa;background:none;border:0;padding:13px 11px;white-space:nowrap;cursor:pointer;font-weight:700}
+#statsDialog #dataTable th button:focus-visible{outline:2px solid #f0b4e9;outline-offset:-3px}
+#statsDialog #dataTable td{padding:11px 12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #453850;color:#ddcfe8}
+#statsDialog #dataTable tr:nth-child(even) td{background:#271f32}
+#statsDialog #dataTable tr:hover td{background:#3b2b48}
+#statsDialog #dataTable td.data-name{font-weight:750;color:#eac3f1}
+#statsDialog #dataTable td.data-name button{color:inherit;background:none;border:0;padding:0;text-align:left;font:inherit;cursor:pointer;text-decoration:underline;text-decoration-color:#8b7095;text-underline-offset:4px}
+#statsDialog #dataTable .data-excluded{margin-left:6px;color:#ffcb93;font-size:11px}
+#statsDialog .data-pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-top:13px;color:#d4c5e3;font-size:13px}
+#statsDialog .data-pagination button{min-width:90px}
+#statsDialog .data-note{color:#bfadd0;font-size:12px;line-height:1.65;margin:12px 0}
+#statsDialog #statsData .insights-content-card.lh-help-card>.lh-help-trigger{top:14px;right:13px}
+#settingsDialog .smart-filter-row{border-top:1px solid #4e3d5a;padding-top:17px;margin-top:14px}
+#settingsDialog .settings-save-state.saved{color:#bce7bb}
+#settingsDialog .anomaly-review-count{display:block;margin-top:7px;color:#e6c4f4;font-weight:750;font-size:13px;line-height:1.45}
+@media(max-width:650px){#statsDialog .data-header{align-items:stretch;flex-direction:column}#statsDialog .data-header button{align-self:flex-start}#statsDialog .data-filters label{flex-basis:calc(50% - 8px)}#statsDialog .data-pagination{justify-content:center;flex-wrap:wrap}}
+@media(max-width:400px){#statsDialog .data-filters label{flex-basis:100%}}
+#statsDialog .stats-tabs button[hidden]{display:none!important}
+#statsDialog .review-summary{padding:14px 17px;border:1px solid #635072;border-radius:12px;background:#292036;color:#f1e4fa;font-weight:650;margin:16px 0 23px}
+#statsDialog .review-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:20px 0 10px}
+#statsDialog .review-heading h5{font-size:17px;margin:0}
+#statsDialog .review-heading span{font-size:13px;color:#d1b5df}
+#statsDialog .review-list{display:grid;gap:9px}
+#statsDialog .review-item{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 17px;width:100%;text-align:left;border-radius:12px;background:#251d31;border:1px solid #51405f;min-width:0}
+#statsDialog .review-item:hover,#statsDialog .review-item:focus-visible{border-color:#b584cd;background:#332541}
+#statsDialog .review-item>span:first-child{display:grid;gap:5px;min-width:0}
+#statsDialog .review-item strong{font-size:15px;overflow-wrap:anywhere}
+#statsDialog .review-item small{font-size:13px;color:#c7b6d3}
+#statsDialog .review-reasons{font-size:12px;color:#f3ba96;line-height:1.4}
+#statsDialog .review-open{font-size:13px;color:#e3b9f5;flex:none}
+#statsDialog .review-note{font-size:13px;line-height:1.6;color:#c9b8d3}
+#ridePreviewDialog .review-preview{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:15px;padding:15px 16px;border:1px solid #875c93;background:#35233e;border-radius:12px}
+#ridePreviewDialog .review-preview strong{font-size:15px;color:#fff0ff}
+#ridePreviewDialog .review-preview p{font-size:13px;line-height:1.55;color:#e2d0ed;margin:5px 0 0}
+#ridePreviewDialog .review-preview button{flex:none;max-width:45%;white-space:normal;line-height:1.4}
+@media(max-width:630px){#statsDialog .review-item{align-items:flex-start;flex-direction:column}#statsDialog .review-open{align-self:flex-start}#ridePreviewDialog .review-preview{align-items:stretch;flex-direction:column}#ridePreviewDialog .review-preview button{max-width:none;align-self:flex-start}}
+
+#captureDialog{width:min(970px,96vw);max-width:min(970px,96vw);padding:22px;max-height:94vh;overflow-y:auto}
+#captureDialog .capture-brand{display:flex;align-items:center;gap:12px;min-width:0}
+#captureDialog .capture-brand h2{font-size:22px;margin:0}
+#captureDialog .capture-brand p{margin:2px 0 0;color:#c9b7d7;font-size:13px;line-height:1.5}
+#captureDialog .dialog-head{align-items:center;margin-bottom:14px}
+#captureDialog .capture-settings{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 14px}
+#captureDialog .capture-settings label{min-width:155px;flex:1;display:flex;flex-direction:column;align-items:stretch;gap:5px;color:#dcd0e7;font-size:12px;font-weight:650}
+#captureDialog .capture-settings select{min-height:39px;background:#2d2538;color:#fff;border:1px solid #645473;border-radius:8px}
+#captureDialog .capture-zoom-row{display:flex;align-items:center;gap:12px;margin:0 0 13px;padding:10px 13px;border:1px solid #51405f;border-radius:10px;background:#241b30;flex-wrap:wrap}
+#captureDialog .capture-zoom-row label{display:flex;gap:9px;align-items:center;font-size:12px;color:#e6d6ec;font-weight:650;white-space:nowrap}
+#captureDialog .capture-zoom-row input{flex:1 1 190px;min-width:100px;accent-color:#bd85d8;cursor:pointer}
+#captureDialog .capture-zoom-row output{font-size:12px;color:#e7cfef;font-variant-numeric:tabular-nums;min-width:38px;text-align:right}
+#captureDialog .capture-zoom-row small{flex-basis:100%;color:#c1adcd;font-size:11px}
+.settings-attribution{text-align:center;font-size:12px;padding:9px 12px 14px;line-height:1.6}
+.settings-attribution a{color:#d5a3f6;text-decoration:underline;text-underline-offset:3px}
+#captureDialog .capture-stage.transparent-preview{background-color:#dfd9e8;background-image:linear-gradient(45deg,#ffffff 25%,transparent 25%),linear-gradient(-45deg,#ffffff 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ffffff 75%),linear-gradient(-45deg,transparent 75%,#ffffff 75%);background-size:26px 26px;background-position:0 0,0 13px,13px -13px,-13px 0}
+#captureDialog .capture-stage.light-preview{background:#e7e9eb}
+#captureDialog .capture-stage.dark-preview{background:#100b1c}
+.advanced-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:10px 0 22px}.advanced-summary{padding:15px;border:1px solid #574467;border-radius:10px;background:#2a2134}.advanced-summary strong{display:block;font-size:17px;color:#f3ddf7}.advanced-summary span{display:block;font-size:12px;color:#c9b4d7;margin-top:6px}.advanced-graph-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.advanced-graph{background:#292132;border:1px solid #594666;border-radius:12px;padding:16px;min-width:0}.advanced-graph h5{font-size:15px;margin:0 0 16px}.advanced-plot{height:150px;display:flex;align-items:flex-end;gap:3px;border-bottom:1px solid #7a6283;padding:6px 6px 0}.advanced-plot-bar{flex:1;max-width:28px;min-width:2px;background:linear-gradient(180deg,#f2a1bd,#aa7ce2);border-radius:3px 3px 0 0}.advanced-graph p{font-size:11px;margin-top:10px}.advanced-chart svg{display:block;width:100%;height:auto;overflow:hidden}.advanced-table{margin-top:10px;color:#d9c9e3;font-size:12px}.advanced-table summary{cursor:pointer;list-style:none;padding:6px 0}.advanced-table summary::-webkit-details-marker{display:none}.advanced-table table{border-collapse:collapse;width:100%;font-size:11px}.advanced-table th,.advanced-table td{border-bottom:1px solid #51415a;padding:6px;text-align:left}.advanced-table th:last-child,.advanced-table td:last-child{text-align:right}@media(max-width:760px){.advanced-graph-grid{grid-template-columns:minmax(0,1fr)}}
+#captureDialog .capture-stage{position:relative;overflow:hidden;width:min(100%,calc(50vh * var(--capture-ratio,1.7777778)));aspect-ratio:var(--capture-ratio,1.7777778);margin-inline:auto;border:1px solid #665171;border-radius:13px;background:#100b1c;touch-action:none;cursor:grab}
+#captureDialog .capture-stage:active{cursor:grabbing}
+#captureDialog .capture-stage canvas{position:relative;z-index:2;display:block;width:100%;height:100%;pointer-events:none}
+#captureDialog .capture-tiles{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:1}
+#captureDialog .capture-tiles img{position:absolute;left:0;top:0;width:256px;height:256px;pointer-events:none;user-select:none}
+#captureDialog .capture-tiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}
+#captureDialog .capture-map-credit{position:absolute;bottom:9px;right:9px;z-index:4;font-size:10px;color:#e9e1f1;background:#171523cf;padding:3px 6px;border-radius:4px;pointer-events:none}
+#captureDialog .capture-controls{position:absolute;right:10px;top:10px;display:grid;gap:7px}
+#captureDialog .capture-controls button{padding:0 9px;min-width:38px;min-height:38px;font-size:16px;background:#281c38e8;border:1px solid #7b6492;color:#fff;border-radius:9px}
+#captureDialog .capture-overlay-status{position:absolute;bottom:12px;left:12px;padding:8px 12px;background:#1d1629eb;border:1px solid #685174;border-radius:8px;pointer-events:none;font-size:12px;color:#e8d8f5}
+#captureDialog .capture-overlay-status[hidden]{display:none}
+#captureDialog .capture-editor-foot{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px;margin-top:14px}
+#captureDialog .capture-editor-foot p{margin:0;flex:1 1 290px;color:#cdbdd9;font-size:13px;line-height:1.55}
+#captureDialog .capture-editor-actions{display:flex;flex-wrap:wrap;gap:9px;justify-content:flex-end}
+#captureDialog .capture-editor-actions button{min-height:42px}
+#captureDialog .capture-status{min-height:18px;font-size:13px;color:#d6c1e4;margin-top:9px}
+@media(max-width:560px){#captureDialog{padding:14px}#captureDialog .capture-settings label{min-width:125px}#captureDialog .capture-editor-actions{width:100%}#captureDialog .capture-editor-actions button{flex:1}#captureDialog .capture-stage{width:min(100%,calc(46vh * var(--capture-ratio,1.7777778)))}#captureDialog .capture-zoom-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}#captureDialog .capture-zoom-row label{grid-column:1;grid-row:1}#captureDialog .capture-zoom-row output{grid-column:2;grid-row:1}#captureDialog .capture-zoom-row input{grid-column:1/-1;grid-row:2;width:100%;min-width:0;margin:0}#captureDialog .capture-zoom-row small{grid-column:1/-1;grid-row:3}#captureDialog .capture-overlay-status{top:9px;bottom:auto;left:9px;max-width:calc(100% - 69px);font-size:11px;padding:6px 8px}#captureDialog .capture-map-credit{bottom:6px;right:6px;font-size:9px;max-width:85%}}
+.brand-text{min-width:0}.brand-title-row{display:flex;align-items:baseline;flex-wrap:wrap;column-gap:13px;row-gap:0}.brand-title-row h1{flex:0 0 auto}.brand-credit{font-size:16px;font-weight:650;line-height:1.35;color:#f0e3fa;white-space:nowrap}.brand-credit a{color:#ffe4fa;font-weight:750;text-decoration:none;border-bottom:1px solid #dba0db}.brand-credit a:hover,.brand-credit a:focus-visible{color:#ffffff;border-color:#ebd1ff}@media(max-width:1120px){.brand-credit{font-size:14px}.brand-title-row{gap:9px}}@media(max-width:900px){header .brand small{display:none}}@media(max-width:830px){.brand-credit{font-size:14px}}@media(max-width:640px){.brand-title-row{gap:3px}.brand-credit{display:block;width:100%;font-size:14px;line-height:1.35}header{min-height:76px}}
 </style></head>
-<body><header><div class="brand"><img class="logo" src="/logo.png" alt="LibreHeatmaps route heatmap"><div><h1>LibreHeatmaps</h1><small>Free, open-source GPS heatmaps. Your data stays local. Your history stays yours.</small></div></div><div class="header-actions"><button class="primary stats-header" id="statsTop">Activity statistics</button><button id="openSettings" title="Adjust appearance and manage your local activity data">Settings</button><button id="shutdown" title="Stop the local application">Exit app</button></div></header>
+<body><header><div class="brand"><img class="logo" src="/logo.png" alt="LibreHeatmaps route heatmap"><div class="brand-text"><div class="brand-title-row"><h1>LibreHeatmaps</h1><span class="brand-credit">In collaboration with <a href="https://trailsidecycles.com/" target="_blank" rel="noopener noreferrer">Trailside Cycles</a></span></div><small>Free, open-source GPS heatmaps. Your data stays local. Your history stays yours.</small></div></div><div class="header-actions"><button class="primary stats-header" id="statsTop">Activity statistics</button><button id="openSettings" title="Adjust appearance and manage your local activity data">Settings</button><button id="shutdown" title="Stop the local application">Exit app</button></div></header>
 <div class="workspace"><aside>
-<section><h2>Import activities</h2><div class="muted">Choose your complete Strava export ZIP as-is—no extraction needed—or import activities.csv or individual FIT, GPX, and TCX tracks.</div><button class="primary full" id="import">Import Strava ZIP, activity, or CSV</button><input id="file" type="file" accept=".zip,.csv,.fit,.fit.gz,.gpx,.gpx.gz,.tcx,.tcx.gz"><div class="status" id="importStatus">Your activities remain on your computer. No uploads to external services.</div><div class="stats"><div class="stat"><strong id="activityCount">0</strong><span>Activities</span></div><div class="stat"><strong id="pointCount">0</strong><span>Route points</span></div></div></section>
+<section><h2>Import activities</h2><div class="muted">Import your complete Strava or Garmin account ZIP without extraction, or choose activities.csv or individual FIT, GPX, and TCX tracks.</div><button class="primary full" id="import">Import GPS files or account ZIP</button><input id="file" type="file" accept=".zip,.csv,.fit,.fit.gz,.gpx,.gpx.gz,.tcx,.tcx.gz"><div class="status" id="importStatus">Your activities remain on your computer. No uploads to external services.</div><div class="stats"><div class="stat"><strong id="activityCount">0</strong><span>Activities</span></div><div class="stat"><strong id="pointCount">0</strong><span>Route points</span></div></div></section>
 <section><h2>Map view</h2><label class="toggle" for="onlineTiles">Online map tiles <input id="onlineTiles" type="checkbox" checked></label><div class="muted privacy-notice" id="tileNotice">Online basemaps load map tiles from third-party providers. Your Strava files and statistics stay local.</div><div class="row"><button data-map="dark" class="primary">Dark</button><button data-map="light">Light</button><button data-map="satellite">Satellite</button></div><label class="toggle">Show all routes <input type="checkbox" id="routes" checked></label><label class="toggle">Heatmap layer <input type="checkbox" id="heat" checked></label><div class="field"><label>Route definition <output id="definitionValue">78%</output></label><input type="range" id="definition" min="15" max="100" value="78"></div><div class="field"><label>Glow radius <output id="radiusValue">5 px</output></label><input type="range" id="radius" min="2" max="24" value="5"></div><div class="field"><label>Intensity <output id="intensityValue">120%</output></label><input type="range" id="intensity" min="10" max="200" value="120"></div><div class="field"><label>Transparency <output id="opacityValue">84%</output></label><input type="range" id="opacity" min="10" max="100" value="84"></div></section>
 <section><h2>Filter activities</h2><div class="field"><label for="sport">Activity type</label><select id="sport"><option value="">All activity types</option></select></div><div class="field"><label for="search">Activity name</label><input type="search" id="search" placeholder="Search activities..."></div><div class="field"><label>Date range</label><div class="row"><input id="dateFrom" type="date" aria-label="Start date"><input id="dateTo" type="date" aria-label="End date"></div><div id="dateRange"></div></div><button class="full subtle" id="clear">Clear filters</button></section>
 <section><h2>Activity insights</h2><div class="muted">Explore your habits, totals, streaks, yearly trends, personal records, and data coverage.</div><button class="primary full stats-cta" id="statsButton">Open activity statistics</button></section>
-<section><h2>Export</h2><button class="full" id="gpx">Download filtered GPX</button><button class="full" id="png">Download routes-only PNG</button><p class="foot">GPX uses evenly sampled route coordinates. PNG contains the heatmap and route overlay on a solid background; third-party map imagery is not included.</p></section>
+<section><h2>Export</h2><button class="full" id="gpx">Download filtered GPX</button><button class="full" id="png">Create heatmap PNG</button><p class="foot">GPX uses evenly sampled route coordinates. PNG opens a capture editor where you can pan, zoom, change the framing and save the route overlay. Third-party map imagery is never exported.</p></section>
 <div class="foot">Your GPS tracks and statistics are stored locally. Online map tiles are enabled by default and contact third-party map providers; turning them off keeps your map requests local.</div>
-</aside><main id="map"><div id="tiles" class="dark"></div><canvas id="overlay"></canvas><div id="interaction"></div><div class="maptop" id="mapCaption"><span class="map-caption-title">Your GPS heatmap</span><span id="mapDetail">Import a Strava ZIP to begin</span><button id="clearRide" type="button" hidden>Show all activities</button></div><div class="tools" role="group" aria-label="Map zoom controls"><button id="plus" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button id="minus" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><button id="fit" type="button" title="Focus on main activity area. Shift-click to show every route." aria-label="Fit map to activities"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="3"/></svg></button></div><div class="legend">LESS TRAVELED · MORE TRAVELED<div class="bar" id="legendBar"></div><span id="legendLabel">Purple → red → orange → white</span><label class="legend-select" for="legendPalette"><span>Heat colors</span><select id="legendPalette" aria-label="Heatmap color scale"><option value="classic">Classic glow</option><option value="ember">Ember</option><option value="violet">Violet</option><option value="ocean">Ocean</option><option value="forest">Forest</option></select></label></div><div class="attribution" id="attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></div><div class="empty" id="empty"><div class="panel"><strong>Explore everywhere you’ve been</strong><span>Import a Strava backup or GPS track to see your routes on an interactive heatmap. No GIS tools or Python packages required.</span></div></div><div id="busy" class="hidden">Loading map data…</div></main></div><dialog id="statsDialog" aria-labelledby="insightsTitle">
+</aside><main id="map"><div id="tiles" class="dark"></div><canvas id="overlay"></canvas><div id="interaction"></div><div class="maptop" id="mapCaption"><span class="map-caption-title">Your GPS heatmap</span><span id="mapDetail">Import a GPS archive to begin</span><button id="clearRide" type="button" hidden>Show all activities</button></div><div class="tools" role="group" aria-label="Map zoom controls"><button id="plus" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button id="minus" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><button id="fit" type="button" title="Focus on main activity area. Shift-click to show every route." aria-label="Fit map to activities"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="3"/></svg></button></div><div class="legend">LESS TRAVELED · MORE TRAVELED<div class="bar" id="legendBar"></div><span id="legendLabel">Purple → red → orange → white</span><label class="legend-select" for="legendPalette"><span>Heat colors</span><select id="legendPalette" aria-label="Heatmap color scale"><option value="classic">Classic glow</option><option value="ember">Ember</option><option value="violet">Violet</option><option value="ocean">Ocean</option><option value="forest">Forest</option></select></label></div><div class="attribution" id="attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></div><div class="empty" id="empty"><div class="panel"><strong>Explore everywhere you’ve been</strong><span>Import a Strava or Garmin account ZIP, or GPS tracks, to see your routes on an interactive heatmap. No GIS tools or Python packages required.</span></div></div><div id="busy" class="hidden">Loading map data…</div></main></div><dialog id="statsDialog" aria-labelledby="insightsTitle">
   <div class="insights-shell">
     <div class="insights-topbar">
       <div class="insights-heading"><div class="insights-mark" aria-hidden="true"><img src="/logo.png" alt="" width="46" height="46"></div><div><h2 id="insightsTitle">Activity insights</h2><p>Every journey adds another line to your story</p></div></div>
@@ -1994,7 +2730,11 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
       <nav aria-label="Activity insights sections" class="stats-tabs" role="tablist" aria-orientation="vertical">
         
         <button aria-controls="statsOverview" aria-selected="true" data-stats-tab="overview" id="tabOverview" role="tab" type="button"><span class="insights-nav-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span><strong>Overview</strong><small>The big picture</small></span></button>
+        <button aria-controls="statsAnalytics" aria-selected="false" data-stats-tab="analytics" id="tabAnalytics" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">◔</span><span><strong>Analytics</strong><small>Patterns &amp; speed</small></span></button>
+        <button aria-controls="statsAdvanced" aria-selected="false" data-stats-tab="advanced" id="tabAdvanced" role="tab" tabindex="-1" type="button" hidden><span class="insights-nav-symbol" aria-hidden="true">◈</span><span><strong>Advanced data</strong><small>Garmin &amp; weather</small></span></button>
         <button aria-controls="statsActivities" aria-selected="false" data-stats-tab="activities" id="tabActivities" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18c3-1 2-6 6-6s3 5 7 3 2-8 3-9"/><circle cx="4" cy="18" r="1.5"/><circle cx="20" cy="6" r="1.5"/></svg></span><span><strong>Activities</strong><small>Individual routes</small></span></button>
+        <button aria-controls="statsData" aria-selected="false" data-stats-tab="data" id="tabData" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">▦</span><span><strong>Data explorer</strong><small>Filter &amp; compare rows</small></span></button>
+        <button aria-controls="statsReview" aria-selected="false" data-stats-tab="review" id="tabReview" role="tab" tabindex="-1" type="button" hidden><span class="insights-nav-symbol" aria-hidden="true">◇</span><span><strong>Review anomalies</strong><small id="reviewNavCount">Flagged rides</small></span></button>
         <div class="insights-nav-privacy"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M12 2 4 6v5c0 5 3.4 8.4 8 11 4.6-2.6 8-6 8-11V6z" fill="none" stroke="currentColor" stroke-width="1.7"/></svg><span>Activity data stored locally</span></div>
       </nav>
       <div class="insights-main" id="insightsMain">
@@ -2034,6 +2774,34 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
             <article class="insights-content-card stats-sport-card"><div class="sport-summary" id="sportSummary"></div></article>
           </section>
         </div>
+        <div aria-labelledby="tabAnalytics" class="stats-panel" data-stats-panel="analytics" hidden id="statsAnalytics" role="tabpanel">
+          <section class="stats-story-section analytics-studio" aria-label="Analytics chart explorer">
+            <div class="analytics-studio-header"><div><span class="stats-story-kicker">YOUR ACTIVITY DATA, YOUR VIEW</span><h4>Build your view</h4><p>Compare how far, how fast, and how often you go. Each chart can be changed or explored individually.</p></div><div class="analytics-count" id="analyticsCount" aria-live="polite">Loading activity data…</div></div>
+            <div class="analytics-toolbar" role="group" aria-label="Chart display preferences">
+              <label>Period <select id="analyticsPeriod"><option value="all">Entire history</option><option value="12">Latest 12 months</option><option value="36">Latest 3 years</option><option value="60">Latest 5 years</option></select></label>
+              <label>Group by <select id="analyticsGrain"><option value="week">Week</option><option value="month" selected>Month</option><option value="year">Year</option></select></label>
+              <label>Typical speed <select id="analyticsTypical"><option value="mean">Average</option><option value="median">Median</option></select></label>
+              <label>Vertical scale <select id="analyticsScale"><option value="zero">Start at zero</option><option value="focus">Focus changes</option></select></label>
+              <label>Arrangement <select id="analyticsLayout"><option value="single" selected>Large charts</option><option value="double">Side by side</option></select></label>
+              <button type="button" id="analyticsReset" class="analytics-reset">Reset views</button>
+            </div>
+            <div class="analytics-categories" role="group" aria-label="Explore chart categories"><button type="button" data-analytics-category="all" aria-pressed="true">All charts</button><button type="button" data-analytics-category="speed" aria-pressed="false">Speed</button><button type="button" data-analytics-category="distance" aria-pressed="false">Distance</button><button type="button" data-analytics-category="time" aria-pressed="false">Time &amp; frequency</button></div>
+            <p class="analytics-guidance">Timelines summarize recorded activities by period. Comparison charts plot whole activities, not second-by-second GPS speed. Filters and the optional speed-anomaly setting also affect these charts.</p>
+            <div class="analytics-grid" id="analyticsGrid">
+              <article class="insights-content-card analytics-card" data-analytics-id="speedHistoryChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Typical riding speed</h5><p>How the average speed of your rides changes with time</p></div></div><div class="analytics-plot" id="speedHistoryChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="speedDistributionChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Speed distribution</h5><p>How often your rides fall in each speed range</p></div></div><div class="analytics-plot" id="speedDistributionChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="speedDurationChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Speed versus ride duration</h5><p>See whether longer rides tend to be slower or faster</p></div></div><div class="analytics-plot" id="speedDurationChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="distanceHistoryChart" data-analytics-family="distance"><div class="analytics-card-head"><div><h5>Distance by period</h5><p>Total distance recorded each week, month, or year</p></div></div><div class="analytics-plot" id="distanceHistoryChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="distanceDistributionChart" data-analytics-family="distance"><div class="analytics-card-head"><div><h5>Ride distance distribution</h5><p>Short outings, long adventures, and everything between</p></div></div><div class="analytics-plot" id="distanceDistributionChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="distanceDurationChart" data-analytics-family="distance"><div class="analytics-card-head"><div><h5>Distance versus moving time</h5><p>Explore how distance relates to time in motion</p></div></div><div class="analytics-plot" id="distanceDurationChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="movingHistoryChart" data-analytics-family="time"><div class="analytics-card-head"><div><h5>Hours on the move</h5><p>Total moving time across the selected periods</p></div></div><div class="analytics-plot" id="movingHistoryChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="activityFrequencyChart" data-analytics-family="time"><div class="analytics-card-head"><div><h5>How often you ride</h5><p>Activity counts across your recorded history</p></div></div><div class="analytics-plot" id="activityFrequencyChart"></div></article>
+            </div>
+          </section>
+        </div>
+        <div aria-labelledby="tabAdvanced" class="stats-panel" data-stats-panel="advanced" hidden id="statsAdvanced" role="tabpanel">
+          <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">DEVICE &amp; WEATHER INSIGHTS</span><h4>Ride conditions &amp; effort</h4><p>Recorded Garmin and Strava measurements only. Device temperature can differ from ambient weather; missing values are left blank.</p></div></div><div class="advanced-cards" id="advancedCards"></div><div class="advanced-graph-grid" id="advancedGraphs"></div><p class="muted settings-note">These charts compare activity summaries, not second-by-second sensor traces. Weather speed comes from the original FIT or Strava metadata; no live weather is requested.</p></section>
+        </div>
         <div aria-labelledby="tabActivities" class="stats-panel" data-stats-panel="activities" hidden id="statsActivities" role="tabpanel">
           <section class="stats-story-section" aria-labelledby="recentActivityHeading">
             <div class="stats-story-heading"><div><span class="stats-story-kicker">ACTIVITY LIBRARY</span><h4 id="recentActivityHeading">Recently recorded</h4><p>Open a route for its map, moving time, speeds, elevation and gear.</p></div></div>
@@ -2044,11 +2812,38 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
             <article class="insights-content-card insights-activities-card"><div class="ride-list" id="topRoutes"></div></article>
           </section>
         </div>
+        <div aria-labelledby="tabData" class="stats-panel" data-stats-panel="data" hidden id="statsData" role="tabpanel">
+          <section class="stats-story-section data-studio" aria-label="Activity data explorer">
+            <div class="data-header"><div><span class="stats-story-kicker">EXPLORE YOUR RECORDINGS</span><h4>Activity data explorer</h4><p>Browse recorded metrics from FIT, GPX, TCX and Strava imports. Missing data stays clearly marked rather than estimated.</p></div><button id="dataExport" type="button">Export filtered CSV</button></div>
+            <div class="data-filters">
+              <label>Find an activity<input type="search" id="dataSearch" placeholder="Search activity names"></label>
+              <label>From<input type="date" id="dataFrom"></label><label>To<input type="date" id="dataTo"></label>
+              <label>Rows per page<select id="dataPageSize"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+              <button id="dataClear" type="button">Clear table filters</button>
+            </div>
+            <details class="data-columns"><summary>Choose visible columns</summary><div class="data-column-choices" id="dataColumns"></div><button type="button" id="dataResetColumns">Restore default columns</button></details>
+            <div class="data-summary" id="dataSummary" role="status" aria-live="polite">Loading recorded activities…</div>
+            <div class="data-scroll" tabindex="0" role="region" aria-label="Scrollable activity table"><table id="dataTable"><thead><tr id="dataHead"></tr></thead><tbody id="dataBody"></tbody></table></div>
+            <div class="data-pagination"><button type="button" id="dataPrev">Previous</button><span id="dataPageStatus">Page 1</span><button type="button" id="dataNext">Next</button></div>
+            <p class="data-note">Speed anomalies are flagged but original values remain visible here. CSV exports use unrounded SI measurements (meters, seconds, meters/second and watts) for accuracy. Average power is shown only when supplied in the original activity or account metadata.</p>
+          </section>
+        </div>
+        <div aria-labelledby="tabReview" class="stats-panel" data-stats-panel="review" hidden id="statsReview" role="tabpanel">
+          <section class="stats-story-section" aria-label="Review speed anomalies">
+            <div class="stats-story-heading"><div><span class="stats-story-kicker">DATA QUALITY</span><h4>Review flagged activities</h4><p>These rides were flagged by your enabled speed filters. Open a ride to inspect its route and measurements, then keep its speed excluded or approve it for statistics. Your original recording is never modified.</p></div></div>
+            <div class="review-summary" id="reviewSummary" role="status" aria-live="polite">Loading flagged activities…</div>
+            <div class="review-heading"><h5>Currently excluded</h5><span id="reviewExcludedCount"></span></div>
+            <div class="review-list" id="reviewExcluded"></div>
+            <div class="review-heading"><h5>Approved exceptions</h5><span id="reviewAllowedCount"></span></div>
+            <p class="review-note">Approved activities can be returned to automatic filtering at any time. Approval affects speed statistics and charts only; it does not change your route or other totals.</p>
+            <div class="review-list" id="reviewAllowed"></div>
+          </section>
+        </div>
         <div class="stats-footer"><div class="details-repair"><div><strong>Want more complete activity information?</strong><span>Import your full Strava account ZIP to add available moving time, elevation, and gear information to matching activities. Existing routes are not duplicated.</span></div><button id="repairDetails" type="button">Add activity details</button></div><details class="stats-accuracy"><summary>About these statistics &amp; data coverage</summary><div class="muted" id="statAccuracy"></div></details></div>
       </div>
     </div>
   </div>
-</dialog><dialog id="ridePreviewDialog" class="ride-preview-dialog" aria-labelledby="ridePreviewTitle"><div class="dialog-head"><div><h2 id="ridePreviewTitle">Ride preview</h2><div class="muted" id="ridePreviewSubtitle">Recorded activity</div></div><button id="closeRidePreview" type="button">Close preview</button></div><div class="ride-preview-map"><div id="ridePreviewTiles" class="dark" aria-hidden="true"></div><canvas id="ridePreviewCanvas" role="img" aria-label="GPS activity route over a dark online map when online tiles are enabled"></canvas><span class="ride-preview-badge" id="ridePreviewBadge">Dark map · GPS route</span><a class="ride-preview-attribution" id="ridePreviewAttribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><div id="ridePreviewDetails" class="ride-preview-details"></div><div class="ride-preview-actions"><button id="showRideMap" class="primary" type="button" disabled>Show only this activity on map</button><button id="backToStats" type="button">Back to statistics</button></div><div id="ridePreviewStatus" class="muted" role="status" aria-live="polite"></div></dialog><dialog id="welcomeDialog" aria-labelledby="welcomeTitle"><div class="welcome-icon" aria-hidden="true">✦</div><h2 id="welcomeTitle">Welcome to LibreHeatmaps</h2><p>Your own GPS heatmaps and activity history, on your computer. Get started by importing a Strava account ZIP (no extraction needed) or FIT, GPX, or TCX track.</p><div class="welcome-steps"><strong>Have a Strava account?</strong><span>Strava → Settings → My Account → Download My Account → Get Started. Select the entire downloaded ZIP here when it arrives—do not extract it or select the activity files individually.</span></div><p class="welcome-privacy">Your GPS data stays on this device. Online map backgrounds request map tiles from external providers.</p><div class="welcome-actions"><button id="welcomeLater" type="button">Explore first</button><button id="welcomeImport" type="button" class="primary">Import my GPS data</button></div></dialog><dialog id="settingsDialog"><div class="dialog-head"><div class="settings-dialog-brand"><img src="/logo.png" alt="" aria-hidden="true" width="44" height="44"><div><h2>Settings</h2><div class="muted">Customize the map and manage locally stored activity data</div></div></div><button id="closeSettings" type="button" class="settings-close" aria-label="Close settings" title="Close settings">×</button></div><div class="settings-stack"><section class="settings-section"><h2>Appearance</h2><div class="field"><label for="palette">Heat color scale</label><select id="palette"><option value="classic">Purple → red → orange → white</option><option value="ember">Ember · red → orange → gold</option><option value="violet">Violet · purple → magenta → white</option><option value="ocean">Ocean · blue → cyan → white</option><option value="forest">Forest · teal → lime → yellow</option></select><div id="palettePreview" class="palette-preview" role="img" aria-label="Selected heat scale preview"></div><div class="palette-ends"><span>Less traveled</span><span>More traveled</span></div></div><div class="field"><label for="defaultMap">Default map background</label><select id="defaultMap"><option value="dark">Dark</option><option value="light">Light</option><option value="satellite">Satellite</option></select></div><p class="muted settings-note">Changes can be previewed immediately and saved to your local data folder. Close without saving to discard them. Online map tiles can be disabled in Map view at any time.</p><button id="resetAppearance">Restore appearance defaults</button></section><section class="settings-section"><h2>Local data &amp; cache</h2><p class="muted settings-note">LibreHeatmaps stores imported GPS activities locally in a SQLite database. These options never delete your original downloaded files.</p><div class="settings-actions"><div><strong>Refresh rendered map data</strong><small>Discard temporary map calculations and reload the current view. Imported activities remain untouched.</small></div><button id="clearViewCache">Refresh map cache</button></div><div class="settings-actions danger-block"><div><strong>Delete all imported activities</strong><small>Permanently remove imported tracks and statistics from this local LibreHeatmaps database. Reimport the original files to restore them.</small></div><button id="clearActivities" class="danger">Delete local activity data</button></div><div class="local-storage"><strong>Local data location</strong><div class="path-label">Data folder</div><code id="dataFolder">Loading…</code><div class="path-label">SQLite database</div><code id="dataFile">Loading…</code><div class="settings-actions"><div><strong>Open local data folder</strong><small>View your database and diagnostic log in your file manager. Your original exports are never moved or deleted by this control.</small></div><button id="openDataFolder">Open folder</button></div></div><div id="settingsStatus" role="status" aria-live="polite" class="settings-status"></div></section><section class="settings-section"><h2>Software update</h2><p class="muted settings-note">Current version: <strong id="installedVersion">1.0.0</strong>. Updates are checked only when you request them. Downloads are from Gubna-Tech GitHub releases and SHA-256 verified before installation.</p><div class="settings-actions"><div><strong>Check for updates</strong><small>Contact GitHub for the latest published release. Your activity data is not transmitted.</small></div><button id="checkUpdate">Check for updates</button></div><div class="settings-actions"><div><strong>Install a verified release</strong><small>Back up the app files before installing. Your SQLite database is preserved. Restart the app afterward.</small></div><button id="installUpdate" disabled>Install update</button></div><div id="updateStatus" class="settings-status" role="status" aria-live="polite"></div><a id="releaseLink" href="https://github.com/Gubna-Tech" rel="noreferrer noopener" target="_blank" hidden>View release on GitHub</a></section></div><div class="settings-savebar"><div id="settingsSaveState" role="status" aria-live="polite" class="settings-save-state">All changes saved</div><button id="saveSettings" class="primary" disabled>Save changes</button></div></dialog>
+</dialog><dialog id="captureDialog" class="capture-dialog" aria-labelledby="captureTitle"><div class="dialog-head"><div class="capture-brand"><img src="/logo.png" alt="" aria-hidden="true" width="40" height="40"><div><h2 id="captureTitle">Export heatmap image</h2><p>Frame an exact area of your routes before saving.</p></div></div><button id="captureClose" type="button" aria-label="Close image editor">Close</button></div><div class="capture-settings"><label>Canvas shape<select id="captureShape"><option value="16:9">Wide · 16:9</option><option value="3:2">Landscape · 3:2</option><option value="1:1">Square · 1:1</option><option value="4:5">Portrait · 4:5</option></select></label><label>PNG width<select id="captureWidth"><option value="1600">1600 px</option><option value="2400" selected>2400 px</option><option value="3200">3200 px</option></select></label><label>PNG background<select id="captureBackground"><option value="dark">Dark · map preview</option><option value="light">Light · map preview</option><option value="transparent">Transparent · checkerboard</option></select></label></div><div class="capture-zoom-row"><label for="captureZoomSlider">Zoom</label><input type="range" id="captureZoomSlider" min="1" max="18" step="0.25" value="12" aria-label="Fine-adjust PNG framing zoom"><output id="captureZoomValue" for="captureZoomSlider">12.00</output><small>Use the slider for precise framing, scroll over an area to zoom toward it, or choose Fit to center your recorded routes.</small></div><div class="capture-stage" id="captureStage"><div class="capture-tiles dark" id="captureTiles" aria-hidden="true"></div><canvas id="captureCanvas" aria-label="Editable preview of the geographic area that will be exported"></canvas><div class="capture-controls" role="group" aria-label="Adjust captured area"><button type="button" id="capturePlus" aria-label="Zoom capture in">+</button><button type="button" id="captureMinus" aria-label="Zoom capture out">−</button><button type="button" id="captureFit" aria-label="Fit recorded routes in capture">Fit</button></div><div class="capture-overlay-status" id="captureProgress" role="status" aria-live="polite">Preparing capture…</div><span class="capture-map-credit" id="captureMapCredit" hidden>© OpenStreetMap contributors · preview only</span></div><div class="capture-editor-foot"><p>Drag to reposition, use fine zoom to frame the route, or choose Fit for balanced padding. Dark and light map tiles are preview guides only. PNGs save the route overlay on a solid dark, solid light, or transparent background without third-party map imagery.</p><div class="capture-editor-actions"><button type="button" id="captureReset">Use current map view</button><button type="button" id="captureSave" class="primary" disabled>Save PNG</button></div></div><div id="captureStatus" role="status" aria-live="polite" class="capture-status"></div></dialog><dialog id="ridePreviewDialog" class="ride-preview-dialog" aria-labelledby="ridePreviewTitle"><div class="dialog-head"><div><h2 id="ridePreviewTitle">Ride preview</h2><div class="muted" id="ridePreviewSubtitle">Recorded activity</div></div><button id="closeRidePreview" type="button">Close preview</button></div><div class="ride-preview-map"><div id="ridePreviewTiles" class="dark" aria-hidden="true"></div><canvas id="ridePreviewCanvas" role="img" aria-label="GPS activity route over a dark online map when online tiles are enabled"></canvas><span class="ride-preview-badge" id="ridePreviewBadge">Dark map · GPS route</span><a class="ride-preview-attribution" id="ridePreviewAttribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><div id="ridePreviewDetails" class="ride-preview-details"></div><div class="ride-preview-source" id="ridePreviewSource"></div><div class="review-preview" id="rideReviewPanel" hidden><div><strong id="rideReviewHeading">Speed filter review</strong><p id="rideReviewText"></p></div><button type="button" id="rideReviewAction"></button></div><div class="ride-preview-actions"><button id="showRideMap" class="primary" type="button" disabled>Show only this activity on map</button><button id="backToStats" type="button">Back to statistics</button></div><div id="ridePreviewStatus" class="muted" role="status" aria-live="polite"></div></dialog><dialog id="welcomeDialog" aria-labelledby="welcomeTitle"><div class="welcome-icon" aria-hidden="true">✦</div><h2 id="welcomeTitle">Welcome to LibreHeatmaps</h2><p>Your own GPS heatmaps and activity history, on your computer. Get started by importing a complete Strava or Garmin account ZIP (no extraction needed) or individual FIT, GPX, or TCX tracks.</p><div class="welcome-steps"><strong>Have a Strava account?</strong><span>Strava → Settings → My Account → Download My Account → Get Started. Select the entire downloaded ZIP here when it arrives—do not extract it or select the activity files individually.</span><strong>Have a Garmin account?</strong><span>Select your complete Garmin account export ZIP as downloaded. LibreHeatmaps also reads FIT tracks stored inside its nested ZIP files.</span></div><p class="welcome-privacy">Your GPS data stays on this device. Online map backgrounds request map tiles from external providers.</p><div class="welcome-actions"><button id="welcomeLater" type="button">Explore first</button><button id="welcomeImport" type="button" class="primary">Import my GPS data</button></div></dialog><dialog id="settingsDialog"><div class="dialog-head"><div class="settings-dialog-brand"><img src="/logo.png" alt="" aria-hidden="true" width="44" height="44"><div><h2>Settings</h2><div class="muted">Customize the map and manage locally stored activity data</div></div></div><button id="closeSettings" type="button" class="settings-close" aria-label="Close settings" title="Close settings">×</button></div><div class="settings-stack"><section class="settings-section"><h2>Appearance</h2><div class="field"><label for="palette">Heat color scale</label><select id="palette"><option value="classic">Purple → red → orange → white</option><option value="ember">Ember · red → orange → gold</option><option value="violet">Violet · purple → magenta → white</option><option value="ocean">Ocean · blue → cyan → white</option><option value="forest">Forest · teal → lime → yellow</option></select><div id="palettePreview" class="palette-preview" role="img" aria-label="Selected heat scale preview"></div><div class="palette-ends"><span>Less traveled</span><span>More traveled</span></div></div><div class="field"><label for="defaultMap">Default map background</label><select id="defaultMap"><option value="dark">Dark</option><option value="light">Light</option><option value="satellite">Satellite</option></select></div><p class="muted settings-note">Changes can be previewed immediately and saved to your local data folder. Close without saving to discard them. Online map tiles can be disabled in Map view at any time.</p><button id="resetAppearance">Restore appearance defaults</button></section><section class="settings-section"><h2>Local data &amp; cache</h2><p class="muted settings-note">LibreHeatmaps stores imported GPS activities locally in a SQLite database. These options never delete your original downloaded files.</p><div class="settings-actions"><div><strong>Refresh rendered map data</strong><small>Discard temporary map calculations and reload the current view. Imported activities remain untouched.</small></div><button id="clearViewCache">Refresh map cache</button></div><div class="settings-actions danger-block"><div><strong>Delete all imported activities</strong><small>Permanently remove imported tracks and statistics from this local LibreHeatmaps database. Reimport the original files to restore them.</small></div><button id="clearActivities" class="danger">Delete local activity data</button></div><div class="local-storage"><strong>Local data location</strong><div class="path-label">Data folder</div><code id="dataFolder">Loading…</code><div class="path-label">SQLite database</div><code id="dataFile">Loading…</code><div class="settings-actions"><div><strong>Open local data folder</strong><small>View your database and diagnostic log in your file manager. Your original exports are never moved or deleted by this control.</small></div><button id="openDataFolder">Open folder</button></div></div><div id="settingsStatus" role="status" aria-live="polite" class="settings-status"></div></section><section class="settings-section"><h2>Statistics &amp; data quality</h2><div class="settings-actions"><div><strong>Filter unlikely cycling speeds</strong><small>Optional: exclude cycling activities with a reported or calculated speed of 50 mph (80.5 km/h) or higher from speed statistics and Analytics. Other totals, routes, and original data stay unchanged. High-speed descents can be genuine.</small></div><label class="anomaly-setting"><input id="filterSpeedAnomalies" type="checkbox"><span>Enable filter</span></label></div><div class="settings-actions smart-filter-row"><div><strong>Experimental · Detect unusual speeds</strong><small>Compare cycling speeds with your own rides of the same activity type using a robust median-based method. Only substantial outliers are excluded from speed analysis. Works best with at least 12 comparable rides; genuine exceptional performances may be flagged.</small></div><label class="anomaly-setting"><input id="filterSpeedSmart" type="checkbox"><span>Enable anomaly filter</span></label></div><p class="muted settings-note" id="anomalyStatus">Both filters are optional and off by default. Your original rides, routes and non-speed totals are never changed.</p><div class="settings-actions"><div><strong>Review flagged rides</strong><small>Inspect excluded recordings, approve accurate rides, or return them to automatic filtering.</small><small id="anomalyReviewCount" class="anomaly-review-count" role="status" aria-live="polite">Checking saved filters…</small></div><button type="button" id="openSpeedReview">Review anomalies</button></div></section><section class="settings-section"><h2>Garmin &amp; advanced activity data</h2><div class="settings-actions"><div><strong>Show advanced activity insights</strong><small>Include available calories, recorded temperatures, cadence, weather observations, wind speed and additional power measurements in Statistics, activity previews and Data Explorer. FIT device measurements and Strava weather observations remain separate; unrecorded values are never estimated. Existing activity data can be enriched by reimporting your original Strava or Garmin account ZIP.</small></div><label class="anomaly-setting"><input id="advancedData" type="checkbox"><span>Enable advanced insights</span></label></div><p class="muted settings-note">Optional and off by default. Weather values depend on information contained in the original files; LibreHeatmaps does not request historical weather or upload routes.</p></section><section class="settings-section"><h2>Software update</h2><p class="muted settings-note">Current version: <strong id="installedVersion">1.1.0</strong>. Updates are checked only when you request them. Downloads are from Gubna-Tech GitHub releases and SHA-256 verified before installation.</p><div class="settings-actions"><div><strong>Check for updates</strong><small>Contact GitHub for the latest published release. Your activity data is not transmitted.</small></div><button id="checkUpdate">Check for updates</button></div><div class="settings-actions"><div><strong>Install a verified release</strong><small>Back up the app files before installing. Your SQLite database is preserved. Restart the app afterward.</small></div><button id="installUpdate" disabled>Install update</button></div><div id="updateStatus" class="settings-status" role="status" aria-live="polite"></div><a id="releaseLink" href="https://github.com/Gubna-Tech" rel="noreferrer noopener" target="_blank" hidden>View release on GitHub</a></section></div><div class="settings-savebar"><div id="settingsSaveState" role="status" aria-live="polite" class="settings-save-state">Checking saved settings…</div><button id="saveSettings" class="primary">Save settings</button></div></dialog>
 <script>
 const TOKEN = '__APP_TOKEN__';
 const PALETTES={
@@ -2089,9 +2884,8 @@ $('attribution').innerHTML=state.mode==='satellite'?'Imagery © <a href="https:/
 }
 let tileFrame=0;function queueTiles(){if(tileFrame)return;tileFrame=requestAnimationFrame(()=>{tileFrame=0;tileMap()})}
 const renderSurface=document.createElement('canvas'),renderContext=renderSurface.getContext('2d',{alpha:true});
-let renderFrame=0,previousGeometry=null,zoomWaiting=false;
+let renderFrame=0,previousGeometry=null,zoomWaiting=false,paintCache=null;
 function queueRender(){if(renderFrame)return;renderFrame=requestAnimationFrame(()=>{renderFrame=0;render()})}
-// Interpolated heat colors use reusable canvas paths for efficient drawing.
 const LH_HEAT_BANDS=32;
 function heatColor(stops,t){
  const u=clamp(t,0,1)*(stops.length-1),i=Math.min(stops.length-2,Math.floor(u)),f=u-i;
@@ -2100,20 +2894,17 @@ function heatColor(stops,t){
  const a=toRgb(ca),b=toRgb(cb);
  return 'rgb('+a.map((n,j)=>Math.round(n+(b[j]-n)*f)).join(',')+')';
 }
-function geometry(){
- if(previousGeometry&&previousGeometry.data===state.data)return previousGeometry;
- const step=state.data.step||1,segments=state.data.segments||[];
+function createGeometry(data){
+ const step=data.step||1,segments=data.segments||[];
  const originX=segments.length?segments[0][0]*step:0,originY=segments.length?segments[0][1]*step:0;
  const all=new Path2D(),bands=Array.from({length:LH_HEAT_BANDS},()=>new Path2D());
- const peak=Math.max(1,state.data.peak||0),logPeak=Math.log1p(peak);
+ const peak=Math.max(1,data.peak||0),logPeak=Math.log1p(peak);
  const toLevel=n=>clamp(Math.log1p(Math.max(0,n))/logPeak,0,1);
  for(const [ax,ay,bx,by,visitsStart,visitsEnd=visitsStart] of segments){
   const x=ax*step-originX,y=ay*step-originY,x2=bx*step-originX,y2=by*step-originY;
   if(x===x2&&y===y2)continue;
   all.moveTo(x,y);all.lineTo(x2,y2);
   const t0=toLevel(visitsStart),t1=toLevel(visitsEnd);
-  // Interpolate transitions *along* longer lines, so intersections and other
-  // density changes never turn an entire GPS segment into one flat color.
   const len=Math.hypot(x2-x,y2-y),changes=Math.abs(t1-t0);
   const pieces=Math.min(24,Math.max(1,Math.ceil(changes*LH_HEAT_BANDS/1.5)));
   for(let j=0;j<pieces;j++){
@@ -2122,18 +2913,11 @@ function geometry(){
    const p=bands[level];p.moveTo(x+(x2-x)*a,y+(y2-y)*a);p.lineTo(x+(x2-x)*b,y+(y2-y)*b);
   }
  }
- previousGeometry={data:state.data,zoom:state.data.z??state.z,originX,originY,all,bands};return previousGeometry;
+ return {data,zoom:data.z??state.z,originX,originY,all,bands};
 }
-function render(){
- if(pointer!==null)return;
- const w=map.clientWidth,h=map.clientHeight;if(!w||!h)return;
- const dpr=clamp(Math.max(2,window.devicePixelRatio||1),1,2),rw=Math.round(w*dpr),rh=Math.round(h*dpr);
- if(renderSurface.width!==rw||renderSurface.height!==rh){renderSurface.width=rw;renderSurface.height=rh}
- const rc=renderContext;rc.setTransform(dpr,0,0,dpr,0,0);rc.clearRect(0,0,w,h);
- const g=geometry(),v=viewport(),definition=+$('definition').value/100,opacity=+$('opacity').value/100,intensity=+$('intensity').value/100,radius=+$('radius').value;
- const factor=Math.pow(2,state.z-g.zoom);
- rc.translate(g.originX*factor-v.left,g.originY*factor-v.top);
- rc.scale(factor,factor);
+function geometry(){if(!previousGeometry||previousGeometry.data!==state.data)previousGeometry=createGeometry(state.data);return previousGeometry;}
+function drawHeatLayers(rc,g,factor){
+ const definition=+$('definition').value/100,opacity=+$('opacity').value/100,intensity=+$('intensity').value/100,radius=+$('radius').value;
  const width=value=>value/factor;
  const colors=PALETTES[$('palette').value].colors;
  const satellite=state.mode==='satellite',light=state.mode==='light';
@@ -2143,6 +2927,7 @@ function render(){
   rc.globalAlpha=definition*(satellite?.88:.82);rc.lineWidth=width(satellite?4.2:3.8);rc.stroke(g.all);
  }
  if($('heat').checked){
+  rc.lineCap='butt';
   if(radius>0){for(let band=0;band<LH_HEAT_BANDS;band++){
    rc.strokeStyle=heatColor(colors,band/(LH_HEAT_BANDS-1));
    rc.lineWidth=width(Math.max(2.2,radius*(1.3+(band/(LH_HEAT_BANDS-1))*.36)));
@@ -2152,15 +2937,43 @@ function render(){
    rc.strokeStyle=heatColor(colors,band/(LH_HEAT_BANDS-1));rc.lineWidth=width(1.95);
    rc.globalAlpha=Math.min(1,opacity*Math.max(.82,intensity));rc.stroke(g.bands[band]);
   }
+  rc.lineCap='round';
  }else if($('routes').checked){
   rc.strokeStyle=satellite?'#ffdfaf':light?'#643b80':'#e2c7f2';
   rc.lineWidth=width(1.45);rc.globalAlpha=Math.min(1,definition*(satellite?.95:light?.78:.8));rc.stroke(g.all);
  }
  rc.globalAlpha=1;
+}
+
+function render(){
+ if(pointer!==null)return;
+ const w=map.clientWidth,h=map.clientHeight;if(!w||!h)return;
+ const dpr=clamp(Math.max(2,window.devicePixelRatio||1),1,2),rw=Math.round(w*dpr),rh=Math.round(h*dpr);
+ const v=viewport(),pad=Math.round(clamp(Math.min(w,h)*.35,96,256)),padPx=Math.round(pad*dpr);
+ const style=[state.mode,$('palette').value,$('routes').checked,$('heat').checked,$('definition').value,$('opacity').value,$('intensity').value,$('radius').value].join('|');
  if(canvas.width!==rw||canvas.height!==rh){canvas.width=rw;canvas.height=rh}
- ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,rw,rh);ctx.drawImage(renderSurface,0,0);canvas.style.transform='';canvas.style.opacity='1';
+ ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,rw,rh);
+ if(paintCache&&paintCache.data===state.data&&paintCache.zoom===state.z&&paintCache.style===style&&paintCache.w===w&&paintCache.h===h&&paintCache.dpr===dpr){
+   const sx=Math.round((pad+v.left-paintCache.left)*dpr),sy=Math.round((pad+v.top-paintCache.top)*dpr);
+   if(sx>=0&&sy>=0&&sx+rw<=renderSurface.width&&sy+rh<=renderSurface.height){
+     ctx.drawImage(renderSurface,sx,sy,rw,rh,0,0,rw,rh);
+     canvas.style.transform='';canvas.style.opacity='1';return;
+   }
+ }
+ const sw=rw+padPx*2,sh=rh+padPx*2;
+ if(renderSurface.width!==sw||renderSurface.height!==sh){renderSurface.width=sw;renderSurface.height=sh}
+ const rc=renderContext;rc.setTransform(dpr,0,0,dpr,0,0);rc.clearRect(0,0,sw/dpr,sh/dpr);
+ const g=geometry();
+ const factor=Math.pow(2,state.z-g.zoom);
+ rc.translate(g.originX*factor-v.left+pad,g.originY*factor-v.top+pad);
+ rc.scale(factor,factor);
+ drawHeatLayers(rc,g,factor);
+ rc.globalAlpha=1;
+ paintCache={data:state.data,zoom:state.z,style,w,h,dpr,left:v.left,top:v.top};
+ ctx.drawImage(renderSurface,padPx,padPx,rw,rh,0,0,rw,rh);canvas.style.transform='';canvas.style.opacity='1';
 }
 function prepareZoom(){
+ cancelHeatPrefetch();
  zoomWaiting=true;
  ++state.generation;clearTimeout(timer);
  if(controller)controller.abort();
@@ -2168,22 +2981,43 @@ function prepareZoom(){
  queueRender();
 }
 function updateMap(deferRender=false){if(deferRender)prepareZoom();else zoomWaiting=false;state.lat=clamp(state.lat,-85,85);state.lon=clamp(state.lon,-180,180);tileMap();queueRender();scheduleData(deferRender?35:100)}
-let timer=null,controller=null,loadedKey='';function scheduleData(delay=100){clearTimeout(timer);if(controller)controller.abort();++state.generation;timer=setTimeout(loadView,delay)}
+const viewSession=Math.random().toString(36).slice(2)+Date.now().toString(36);
+let viewSequence=0;
+let timer=null,controller=null,loadedKey='';function scheduleData(delay=100){cancelHeatPrefetch();clearTimeout(timer);if(controller)controller.abort();++state.generation;timer=setTimeout(loadView,delay)}
 function filterParams(){const p=new URLSearchParams();if(state.activeRideId){p.set('activity_id',String(state.activeRideId));return p}for(const [key,id] of [['sport','sport'],['from','dateFrom'],['to','dateTo'],['q','search']]){const val=$(id).value.trim();if(val)p.set(key,val)}return p}
 async function getJson(url){const res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error((await res.text()).slice(0,300));return await res.json()}
+function heatViewRequest(z){
+ const [w,h]=dimensions(),center=px(state.lat,state.lon,z),t=256;
+ const left=center[0]-w/2,top=center[1]-h/2;
+ const x0=Math.floor((left-256)/t)*t,x1=Math.ceil((left+w+256)/t)*t;
+ const y0=Math.floor((top-256)/t)*t,y1=Math.ceil((top+h+256)/t)*t;
+ const nw=geo(x0,y0,z),se=geo(x1,y1,z),p=filterParams();
+ p.set('west',clamp(nw[1],-180,180).toString());p.set('east',clamp(se[1],-180,180).toString());
+ p.set('north',clamp(nw[0],-85,85).toString());p.set('south',clamp(se[0],-85,85).toString());p.set('z',z);
+ return p.toString();
+}
+let heatPrefetchTimer=0,heatPrefetchController=null;
+function cancelHeatPrefetch(){clearTimeout(heatPrefetchTimer);heatPrefetchTimer=0;if(heatPrefetchController){heatPrefetchController.abort();heatPrefetchController=null;}}
+function scheduleHeatPrefetch(){
+ cancelHeatPrefetch();if(state.z<=1||state.known<100||document.hidden||state.activeRideId)return;
+ const targetZoom=state.z-1,expectedGeneration=state.generation;
+ heatPrefetchTimer=setTimeout(async()=>{
+   heatPrefetchTimer=0;
+   if(zoomWaiting||state.generation!==expectedGeneration||document.hidden)return;
+   heatPrefetchController=new AbortController();
+   const key=heatViewRequest(targetZoom),serial=String(++viewSequence);
+   try{await fetch('/api/view?'+key,{signal:heatPrefetchController.signal,headers:{'X-LibreHeatmaps-View-Session':viewSession,'X-LibreHeatmaps-View-Serial':serial}})}
+   catch(e){if(e.name!=='AbortError')console.debug('Map preview unavailable:',e.message)}
+   finally{heatPrefetchController=null}
+ },1500);
+}
 async function loadView(){
 if(state.known===0){zoomWaiting=false;canvas.style.opacity='1';$('busy').classList.add('hidden');queueRender();return;}
-const v=viewport(),t=256;
-const x0=Math.floor((v.left-256)/t)*t,x1=Math.ceil((v.left+v.w+256)/t)*t;
-const y0=Math.floor((v.top-256)/t)*t,y1=Math.ceil((v.top+v.h+256)/t)*t;
-const nw=geo(x0,y0),se=geo(x1,y1),p=filterParams();
-p.set('west',clamp(nw[1],-180,180).toString());p.set('east',clamp(se[1],-180,180).toString());
-p.set('north',clamp(nw[0],-85,85).toString());p.set('south',clamp(se[0],-85,85).toString());p.set('z',state.z);
-const key=p.toString();if(key===loadedKey){zoomWaiting=false;canvas.style.transform='';canvas.style.opacity='1';$('busy').classList.add('hidden');queueRender();return;}
+const key=heatViewRequest(state.z);if(key===loadedKey){zoomWaiting=false;canvas.style.transform='';canvas.style.opacity='1';$('busy').classList.add('hidden');queueRender();return;}
 const id=state.generation;if(controller)controller.abort();controller=new AbortController();$('busy').textContent='Refining heatmap…';$('busy').classList.remove('hidden');
-try{const res=await fetch('/api/view?'+key,{signal:controller.signal});if(!res.ok)throw Error('Map request failed: '+res.status);
+try{const res=await fetch('/api/view?'+key,{signal:controller.signal,headers:{'X-LibreHeatmaps-View-Session':viewSession,'X-LibreHeatmaps-View-Serial':String(++viewSequence)}});if(!res.ok)throw Error('Map request failed: '+res.status);
 const data=await res.json();if(id!==state.generation)return;state.data=data;previousGeometry=null;loadedKey=key;zoomWaiting=false;
-$('mapDetail').textContent=state.activeRideId?'Selected route · '+data.activities.toLocaleString()+' matching activity':data.activities.toLocaleString()+' matching activities in map area';queueRender()}
+$('mapDetail').textContent=state.activeRideId?'Selected route · '+data.activities.toLocaleString()+' matching activity':data.activities.toLocaleString()+' matching activities in map area';queueRender();scheduleHeatPrefetch()}
 catch(e){if(e.name!=='AbortError'){zoomWaiting=false;canvas.style.transform='';canvas.style.opacity='1';$('busy').classList.add('hidden');loadedKey='';queueRender();$('mapDetail').textContent='Map update failed: '+e.message}}
 finally{if(id===state.generation)$('busy').classList.add('hidden')}
 }
@@ -2199,13 +3033,13 @@ updatePrivacy();
 
 let currentInsights=null,statsYears=[],welcomeHandled=false;
 function selectStatsTab(target){
-if(!['overview','activities'].includes(target))target='overview';
+if(!['overview','analytics','advanced','activities','data','review'].includes(target))target='overview';
 for(const tab of document.querySelectorAll('[data-stats-tab]')){const active=tab.dataset.statsTab===target;tab.setAttribute('aria-selected',String(active));tab.tabIndex=active?0:-1}
 for(const panel of document.querySelectorAll('[data-stats-panel]'))panel.hidden=panel.dataset.statsPanel!==target;
-const labels={overview:['OVERVIEW','Your activity, at a glance','Totals, personal records and trends—together in one view.'],activities:['ACTIVITIES','Your recorded routes','Browse your recent and longest GPS activities.']};
-const item=labels[target];$('insightsEyebrow').textContent=item[0];$('insightsViewTitle').textContent=item[1];$('insightsViewDesc').textContent=item[2];$('insightsMain').scrollTop=0;
+const labels={overview:['OVERVIEW','Your activity, at a glance','Totals, personal records and trends—together in one view.'],analytics:['ANALYTICS','Your riding patterns','Explore activity-level speed, time and distance across your history.'],activities:['ACTIVITIES','Your recorded routes','Browse your recent and longest GPS activities.'],data:['DATA EXPLORER','Every ride, in detail','Sort, filter, and choose which recorded measurements you want to see.'],advanced:['ADVANCED DATA','Garmin & weather insights','Explore available calories, temperature, wind, cadence and power measurements.'],review:['DATA QUALITY','Review your speed outliers','Inspect flagged rides and approve genuine high-speed performances.']};
+const item=labels[target];$('insightsEyebrow').textContent=item[0];$('insightsViewTitle').textContent=item[1];$('insightsViewDesc').textContent=item[2];$('insightsMain').scrollTop=0;if(target==='analytics'&&currentInsights)requestAnimationFrame(()=>renderAnalytics(currentInsights.analytics));if(target==='advanced'&&currentInsights)requestAnimationFrame(()=>renderAdvanced(currentInsights.advanced));if(target==='data')loadDataTable();if(target==='review')loadSpeedReview();
 }
-for(const tab of document.querySelectorAll('[data-stats-tab]')){tab.onclick=()=>selectStatsTab(tab.dataset.statsTab);tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(e.key))return;e.preventDefault();const tabs=Array.from(document.querySelectorAll('[data-stats-tab]'));let i=tabs.indexOf(tab);i=e.key==='Home'?0:e.key==='End'?tabs.length-1:(i+(['ArrowRight','ArrowDown'].includes(e.key)?1:-1)+tabs.length)%tabs.length;selectStatsTab(tabs[i].dataset.statsTab);tabs[i].focus()}}
+for(const tab of document.querySelectorAll('[data-stats-tab]')){tab.onclick=()=>selectStatsTab(tab.dataset.statsTab);tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(e.key))return;e.preventDefault();const tabs=Array.from(document.querySelectorAll('[data-stats-tab]:not([hidden])'));let i=tabs.indexOf(tab);i=e.key==='Home'?0:e.key==='End'?tabs.length-1:(i+(['ArrowRight','ArrowDown'].includes(e.key)?1:-1)+tabs.length)%tabs.length;selectStatsTab(tabs[i].dataset.statsTab);tabs[i].focus()}}
 async function dismissWelcome(){if(!$('welcomeDialog').open)return;$('welcomeDialog').close();try{await protectedAction('/api/welcome/dismiss')}catch(e){console.warn('Could not save welcome choice:',e.message)}}
 $('welcomeLater').onclick=()=>dismissWelcome();
 $('welcomeImport').onclick=()=>{dismissWelcome();$('file').click()};
@@ -2215,8 +3049,77 @@ function distanceLabel(m){const miles=$('units').value==='mi';return nice(m/(mil
 function timeLabel(s){if(s===null||s===undefined||!Number.isFinite(s))return 'Not recorded';return s<3600?Math.round(Math.max(0,s)/60).toLocaleString()+' min':nice(s/3600,1)+' h'}
 function statsParams(){const p=new URLSearchParams();for(const [k,id] of [['sport','statsSport'],['bike','statsBike'],['year','statsYear'],['month','statsMonth']]){const v=$(id).value;if(v)p.set(k,v)}return p}
 function bars(root,rows,key,asDistance=true){const el=$(root);el.replaceChildren();if(!rows.length){el.textContent='No dated activities in this selection.';return}const top=Math.max(...rows.map(r=>r[key]),1);for(const row of rows){const line=document.createElement('div');line.className='chart-row';const label=document.createElement('span'),track=document.createElement('div'),bar=document.createElement('div'),value=document.createElement('strong');label.textContent=row.year||(row.month?new Date(row.month+'-01T12:00:00').toLocaleDateString(undefined,{month:'short',year:'2-digit'}):'');track.className='chart-track';bar.className='chart-bar';bar.style.width=Math.max(1.5,100*row[key]/top)+'%';track.append(bar);value.textContent=asDistance?distanceLabel(row[key]):nice(row[key]);line.append(label,track,value);el.append(line)}}
+const ANALYTICS_SPECS={
+ speedHistoryChart:{family:'speed',kind:'timeline',source:'speed_history',value:'speed_kmh',summary:'typical',unit:'speed',defaultStyle:'line',styles:['line','area','bar'],help:'Compares the typical average moving speed of recorded rides in each time period. Average gives equal weight to each eligible ride; Median reduces the influence of exceptionally fast or slow rides. Missing moving times are excluded.'},
+ speedDistributionChart:{family:'speed',kind:'histogram',source:'speed_history',value:'speed_kmh',unit:'speed',defaultStyle:'bar',styles:['bar','area','cumulative'],help:'Counts how many recorded activities fall into each average-speed range. This is a distribution of whole-ride averages, not of instantaneous speeds. The optional cycling anomaly filter affects which rides contribute.'},
+ speedDurationChart:{family:'speed',kind:'relationship',source:'speed_vs_duration',value:'speed_kmh',unit:'speed',defaultStyle:'density',styles:['density','scatter','trend'],help:'Each ride has a moving duration and an overall average moving speed. Density highlights where many rides overlap; scatter shows individual rides; binned trend summarizes their relationship. It does not show speed changing within one ride.'},
+ distanceHistoryChart:{family:'distance',kind:'timeline',source:'activity_distances',value:'distance_km',summary:'sum',unit:'distance',defaultStyle:'bar',styles:['bar','line','area'],help:'Adds the imported or GPS-estimated distance for all activities recorded in each time period. Missing activity dates are omitted. Changes in activity frequency affect these totals.'},
+ distanceDistributionChart:{family:'distance',kind:'histogram',source:'activity_distances',value:'distance_km',unit:'distance',defaultStyle:'bar',styles:['bar','area','cumulative'],help:'Groups activities by their recorded or GPS-derived trip length. Each activity counts once. Typical rides groups the majority into readable equal-distance ranges and keeps unusually long rides in a clearly marked final range; Full range shows the full distance spread. Switch views without changing your underlying activity data.'},
+ distanceDurationChart:{family:'distance',kind:'relationship',source:'distance_vs_duration',value:'distance_km',unit:'distance',defaultStyle:'density',styles:['density','scatter','trend'],help:'Compares recorded route distance and moving duration per activity. Density reveals the most commonly traveled combinations. Activities without moving-time information cannot appear.'},
+ movingHistoryChart:{family:'time',kind:'timeline',source:'moving_history',value:'hours',summary:'sum',unit:'hours',defaultStyle:'area',styles:['area','bar','line'],help:'Adds the moving time of rides in each period. Resting time is not included, and activities without reliable moving-time information do not contribute.'},
+ activityFrequencyChart:{family:'time',kind:'timeline',source:'activity_distances',value:'count',summary:'sum',unit:'count',defaultStyle:'bar',styles:['bar','line','area'],help:'Counts dated activities in each time period. It measures frequency, not duration or distance, so several short rides count separately.'},
+};
+const ANALYTICS_DEFAULTS={period:'all',grain:'month',typical:'mean',scale:'zero',layout:'single',category:'all',distanceRange:'typical',styles:{}};
+function analyticsReadPrefs(){let p={};try{p=JSON.parse(localStorage.getItem('libreheatmaps_analytics_views_v1')||'{}')||{}}catch(e){}return {period:['all','12','36','60'].includes(p.period)?p.period:'all',grain:['week','month','year'].includes(p.grain)?p.grain:'month',typical:['mean','median'].includes(p.typical)?p.typical:'mean',scale:['zero','focus'].includes(p.scale)?p.scale:'zero',layout:['single','double'].includes(p.layout)?p.layout:'single',category:['all','speed','distance','time'].includes(p.category)?p.category:'all',distanceRange:['typical','full'].includes(p.distanceRange)?p.distanceRange:'typical',styles:typeof p.styles==='object'&&p.styles&&!Array.isArray(p.styles)?p.styles:{}}}
+let analyticsPrefs=analyticsReadPrefs(),analyticsSeries={};
+function analyticsSavePrefs(){try{localStorage.setItem('libreheatmaps_analytics_views_v1',JSON.stringify(analyticsPrefs))}catch(e){}}
+function analyticsDateNumber(day){const t=Date.parse(String(day||'')+'T12:00:00Z');return Number.isFinite(t)?Math.floor(t/86400000):null}
+function analyticsDateString(n,kind){const d=new Date(n*86400000);if(!Number.isFinite(d.getTime()))return '';if(kind==='year')return d.getUTCFullYear().toString();if(kind==='month')return d.toLocaleDateString(undefined,{month:'short',year:'2-digit',timeZone:'UTC'});return d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'2-digit',timeZone:'UTC'})}
+function analyticsTimeBucket(day,grain){const d=new Date(day*86400000);if(grain==='year'){d.setUTCMonth(0,1)}else if(grain==='month'){d.setUTCDate(1)}else{d.setUTCDate(d.getUTCDate()-(d.getUTCDay()+6)%7)}return Math.floor(d.getTime()/86400000)}
+function analyticsMedian(values){const a=values.slice().sort((x,y)=>x-y),n=a.length;return n?(n%2?a[(n-1)/2]:(a[n/2-1]+a[n/2])/2):0}
+function analyticsNiceStep(value){if(!(value>0))return 1;const order=Math.pow(10,Math.floor(Math.log10(value))),scaled=value/order;return (scaled<=1?1:scaled<=2?2:scaled<=2.5?2.5:scaled<=5?5:10)*order}
+function analyticsUnits(){return $('units').value==='mi'?{distance:'mi',speed:'mph',factor:.621371}:{distance:'km',speed:'km/h',factor:1}}
+function analyticsValue(n,unit,short=false){if(!Number.isFinite(n))return '—';if(unit==='count')return Math.round(n).toLocaleString();if(unit==='percent')return (short?Math.round(n):n.toFixed(1))+'%';const u=analyticsUnits(),s=unit==='speed'?u.speed:unit==='distance'?u.distance:'h';const digits=unit==='hours'?(Math.abs(n)>=10?1:2):(Math.abs(n)>=100?0:1);return n.toLocaleString(undefined,{maximumFractionDigits:short?Math.min(1,digits):digits})+(short?'':' '+s)}
+function analyticsPeriodRows(a,spec){const u=analyticsUnits(),rs=a[spec.source]||[],latest=(a.activity_distances||[]).reduce((m,r)=>Math.max(m,analyticsDateNumber(r.day)??-Infinity),-Infinity);let cutoff=-Infinity;
+ if(analyticsPrefs.period!=='all'&&Number.isFinite(latest)){const d=new Date(latest*86400000);d.setUTCMonth(d.getUTCMonth()-Number(analyticsPrefs.period));cutoff=Math.floor(d.getTime()/86400000)}
+ const rows=[];for(const r of rs){const day=analyticsDateNumber(r.day);if(analyticsPrefs.period!=='all'&&(day===null||day<cutoff))continue;const num=spec.value==='count'?1:Number(r[spec.value]);if(!Number.isFinite(num)||num<0)continue;const v=(spec.unit==='speed'||spec.unit==='distance')?num*u.factor:num;const x=spec.kind==='relationship'?Number(r.minutes):day;if(spec.kind==='relationship'&&!Number.isFinite(x))continue;if((spec.kind==='timeline'||spec.kind==='histogram')&&day===null)continue;rows.push({day,x,y:v,id:r.id??null})}
+ return rows}
+function analyticsChartRows(a,spec,style){const raw=analyticsPeriodRows(a,spec),out={raw,rows:[],xUnit:'day',yUnit:spec.unit,labels:[],limited:0};if(!raw.length)return out;
+ if(spec.kind==='timeline'){const groups=new Map();for(const r of raw){const b=analyticsTimeBucket(r.day,analyticsPrefs.grain);if(!groups.has(b))groups.set(b,[]);groups.get(b).push(r.y)}
+  out.rows=Array.from(groups,([x,values])=>({x,y:spec.summary==='typical'?(analyticsPrefs.typical==='median'?analyticsMedian(values):values.reduce((a,b)=>a+b,0)/values.length):values.reduce((a,b)=>a+b,0),n:values.length,label:analyticsDateString(x,analyticsPrefs.grain)})).sort((a,b)=>a.x-b.x);out.xUnit='date';
+  if(spec.summary==='sum'&&out.rows.length>1){const first=out.rows[0].x,last=out.rows[out.rows.length-1].x,map=new Map(out.rows.map(r=>[r.x,r])),complete=[];let d=new Date(first*86400000);for(let i=0;i<750&&Math.floor(d.getTime()/86400000)<=last;i++){const day=Math.floor(d.getTime()/86400000);complete.push(map.get(day)||{x:day,y:0,n:0,label:analyticsDateString(day,analyticsPrefs.grain)});if(analyticsPrefs.grain==='year')d.setUTCFullYear(d.getUTCFullYear()+1);else if(analyticsPrefs.grain==='month')d.setUTCMonth(d.getUTCMonth()+1);else d.setUTCDate(d.getUTCDate()+7)}if(complete.length&&complete[complete.length-1].x===last)out.rows=complete;}
+ }else if(spec.kind==='histogram'){const vals=raw.map(r=>r.y),lo=Math.min(...vals),hi=Math.max(...vals);let step,start,nBins,tail=false;if(spec.unit==='distance'){const sorted=vals.slice().sort((a,b)=>a-b),p95=sorted[Math.floor((sorted.length-1)*.95)];step=analyticsNiceStep(Math.max(p95/10,.05));start=0;if(analyticsPrefs.distanceRange==='full')step=Math.max(step,analyticsNiceStep(Math.max(hi/24,.05)));const limit=analyticsPrefs.distanceRange==='full'?hi:p95;nBins=Math.min(24,Math.max(1,Math.ceil(limit/step)));tail=analyticsPrefs.distanceRange!=='full'&&hi>=nBins*step+1e-8}else{const bucketCount=Math.min(16,Math.max(6,Math.ceil(Math.sqrt(vals.length))));step=analyticsNiceStep((hi-lo||Math.max(hi,1))/bucketCount);start=Math.floor(lo/step)*step;nBins=Math.min(35,Math.max(1,Math.floor((hi-start)/step)+1))}const counts=Array(nBins+(tail?1:0)).fill(0);for(const v of vals){let i=Math.floor((v-start)/step);counts[Math.max(0,Math.min(counts.length-1,i))]++}let cumulative=0;out.binStep=step;out.rows=counts.map((n,i)=>{cumulative+=n;const left=start+i*step,right=left+step,isTail=tail&&i===nBins;return {x:left+step/2,left,right,isTail,y:style==='cumulative'?100*cumulative/vals.length:n,n,label:isTail?analyticsValue(left,spec.unit)+' and above':analyticsValue(left,spec.unit)+' – '+analyticsValue(right,spec.unit)}});out.xUnit=spec.unit;out.yUnit=style==='cumulative'?'percent':'count';
+ }else if(style==='trend'){const sorted=raw.slice().sort((a,b)=>a.x-b.x),bins=Math.min(20,Math.max(4,Math.ceil(Math.sqrt(sorted.length)/2)));out.rows=[];for(let i=0;i<bins;i++){const block=sorted.slice(Math.floor(i*sorted.length/bins),Math.floor((i+1)*sorted.length/bins));if(!block.length)continue;out.rows.push({x:block.reduce((s,r)=>s+r.x,0)/block.length,y:analyticsPrefs.typical==='median'?analyticsMedian(block.map(r=>r.y)):block.reduce((s,r)=>s+r.y,0)/block.length,n:block.length,label: 'Group '+(i+1)})}
+  out.xUnit='minutes';
+ }else{out.rows=raw.map(r=>({x:r.x,y:r.y,n:1,id:r.id,label:analyticsValue(r.x/60,'hours')})).sort((a,b)=>a.x-b.x);out.xUnit='minutes'}return out}
+function analyticsSVG(tag,attrs={},parent){const ns='http://www.w3.org/2000/svg',e=document.createElementNS(ns,tag);for(const [k,v] of Object.entries(attrs))e.setAttribute(k,String(v));if(parent)parent.append(e);return e}
+function analyticsMakePlot(container,series,spec,style){container.replaceChildren();if(!series.rows.length){const e=document.createElement('div');e.className='analytics-empty';e.textContent='No matching activities with the data needed for this chart. Adjust your filters or choose a different period.';container.append(e);return}
+ const W=Math.max(320,Math.min(1050,Math.round(container.clientWidth||720))),H=W<540?292:314,L=W<450?68:82,R=20,T=29,B=52,PW=W-L-R,PH=H-T-B;const svg=analyticsSVG('svg',{viewBox:`0 0 ${W} ${H}`,role:'img','aria-label':container.closest('.analytics-card').querySelector('h5').textContent+' chart'}),tip=document.createElement('div');tip.className='analytics-tooltip';tip.hidden=true;
+ const rows=series.rows,ys=rows.map(r=>r.y),xs=rows.map(r=>r.x),xlo=Math.min(...xs),xhi=Math.max(...xs);let ymin=0,ymax=Math.max(1,...ys),xmin=xlo,xmax=xhi;if(spec.kind==='histogram'&&Number.isFinite(series.binStep)){xmin=xlo-series.binStep/2;xmax=xhi+series.binStep/2}else if(xmax<=xmin){xmin-=1;xmax+=1}const focus=analyticsPrefs.scale==='focus'&&style!=='bar'&&style!=='density'&&spec.kind!=='histogram';if(focus){const lo=Math.min(...ys),hi=Math.max(...ys),margin=Math.max((hi-lo)*.16,hi*.025,.05);ymin=Math.max(0,lo-margin);ymax=hi+margin}const step=analyticsNiceStep((ymax-ymin)/4);if(focus)ymin=Math.floor(ymin/step)*step;ymax=Math.ceil(ymax/step)*step||1;if(ymax<=ymin)ymax=ymin+1;const X=n=>L+(n-xmin)/(xmax-xmin)*PW,Y=n=>T+PH-(n-ymin)/(ymax-ymin)*PH;
+ const t=(x,y,text,align='start',cls='plot-tick')=>{const n=analyticsSVG('text',{x,y,'text-anchor':align,class:cls},svg);n.textContent=text;return n};
+ const yName=series.yUnit==='percent'?'Cumulative rides (%)':series.yUnit==='count'?'Activities':series.yUnit==='speed'?'Speed ('+analyticsUnits().speed+')':series.yUnit==='distance'?'Distance ('+analyticsUnits().distance+')':'Moving time (h)';
+ t(L,T-10,yName,'start','plot-label');
+ for(let i=0;i<=4;i++){const val=ymin+(ymax-ymin)*i/4,y=Y(val);analyticsSVG('line',{x1:L,y1:y,x2:W-R,y2:y,class:'plot-grid'},svg);t(L-10,y+4,analyticsValue(val,series.yUnit,true),'end')}
+ analyticsSVG('line',{x1:L,y1:T+PH,x2:W-R,y2:T+PH,class:'plot-axis'},svg);
+ const fmtX=v=>series.xUnit==='date'?analyticsDateString(v,analyticsPrefs.grain):series.xUnit==='minutes'?v<60?Math.round(v)+'m':(v/60).toFixed(v>=600?0:1)+'h':analyticsValue(v,series.xUnit,true);
+ if(spec.kind==='histogram'){const maxLabels=Math.max(2,Math.floor(PW/83)),gap=Math.max(1,Math.ceil((rows.length-1)/(maxLabels-1))),indices=[];for(let i=0;i<rows.length;i+=gap)indices.push(i);while(indices.length>1&&X(rows[rows.length-1].x)-X(rows[indices[indices.length-1]].x)<92)indices.pop();if(indices[indices.length-1]!==rows.length-1)indices.push(rows.length-1);for(const i of indices){const r=rows[i],tick=analyticsValue(r.left,series.xUnit,true)+(r.isTail?'+':'–'+analyticsValue(r.right,series.xUnit,true));t(X(r.x),H-23,tick,i===0?'start':i===rows.length-1?'end':'middle')}}else{for(let i=0;i<=(W<500?3:5);i++){const n=W<500?3:5,v=xmin+(xmax-xmin)*i/n;t(X(v),H-23,fmtX(v),i===0?'start':i===n?'end':'middle')}}
+ t(L+PW/2,H-4,series.xUnit==='date'?'Activity date':series.xUnit==='minutes'?'Moving duration':series.xUnit==='speed'?'Average speed ('+analyticsUnits().speed+')':'Distance ('+analyticsUnits().distance+')','middle','plot-label');
+ const showTip=(event,row,label)=>{const rect=container.getBoundingClientRect(),sx=event?.clientX??rect.left+X(row.x),sy=event?.clientY??rect.top+Y(row.y);tip.textContent=label||((row.label||fmtX(row.x))+' · '+analyticsValue(row.y,series.yUnit)+' · '+row.n+' '+(row.n===1?'ride':'rides'));tip.hidden=false;const px=Math.max(5,Math.min((sx-rect.left)+13,W-215));tip.style.left=px+'px';tip.style.top=Math.max(4,Math.min(sy-rect.top-47,H-54))+'px'};
+ function interactive(node,row,label){node.classList.add('plot-hit');const title=analyticsSVG('title',{},node);title.textContent=label||((row.label||fmtX(row.x))+': '+analyticsValue(row.y,series.yUnit));node.addEventListener('pointerenter',e=>showTip(e,row,label));node.addEventListener('pointermove',e=>showTip(e,row,label));node.addEventListener('pointerleave',()=>tip.hidden=true);if(rows.length<=65){node.setAttribute('tabindex','0');node.addEventListener('focus',()=>showTip(null,row,label));node.addEventListener('blur',()=>tip.hidden=true)}if(row.id){node.addEventListener('click',()=>openRidePreview(row.id));node.style.cursor='pointer'}}
+ if(spec.kind==='relationship'&&style==='density'){
+  const nx=Math.min(28,Math.max(10,Math.round(PW/20))),ny=14,cells=new Map();for(const r of rows){const ix=Math.max(0,Math.min(nx-1,Math.floor((r.x-xmin)/(xmax-xmin)*nx))),iy=Math.max(0,Math.min(ny-1,Math.floor((r.y-ymin)/(ymax-ymin)*ny))),k=ix+','+iy;cells.set(k,(cells.get(k)||0)+1)}const highest=Math.max(...cells.values());for(const [key,n] of cells){const [ix,iy]=key.split(',').map(Number),width=PW/nx,height=PH/ny,rect=analyticsSVG('rect',{x:L+ix*width+.5,y:T+PH-(iy+1)*height+.5,width:Math.max(2,width-1),height:Math.max(2,height-1),rx:Math.min(width/3,3),fill:'#ed96c7',opacity:(.22+.76*Math.sqrt(n/highest)).toFixed(3)},svg);const center={x:xmin+(ix+.5)/nx*(xmax-xmin),y:ymin+(iy+.5)/ny*(ymax-ymin),n};interactive(rect,center,n+' '+(n===1?'ride':'rides')+' in this chart region')}
+ }else if(style==='scatter'&&spec.kind==='relationship'){
+  const drawRows=rows.length>1600?rows.filter((r,i)=>i%Math.ceil(rows.length/1600)===0):rows;for(const r of drawRows){const dot=analyticsSVG('circle',{cx:X(r.x),cy:Y(r.y),r:3,fill:'#eaa0ca',opacity:.63,stroke:'#201a2d','stroke-width':.5},svg);interactive(dot,r)}
+ }else{
+  const lineStyle=style==='line'||style==='area'||style==='trend';const baseY=Y(ymin);if(lineStyle&&rows.length>1){const shape=rows.map((r,i)=>(i?'L':'M')+X(r.x).toFixed(2)+','+Y(r.y).toFixed(2)).join(' ');if(style==='area'){analyticsSVG('path',{d:shape+` L${X(rows[rows.length-1].x)},${baseY} L${X(rows[0].x)},${baseY} Z`,class:'plot-area-new'},svg)}analyticsSVG('path',{d:shape,class:'plot-line-new'},svg)}
+  if(style==='bar'){let width;if(rows.length>1)width=Math.min(42,Math.max(3,PW/(rows.length+(spec.kind==='histogram'?0:1))*.76));else width=Math.min(90,PW/3);for(const r of rows){const x=X(r.x),y=Y(r.y);const bar=analyticsSVG('rect',{x:x-width/2,y,width,height:Math.max(1,baseY-y),rx:3,fill:'#bc83e3',opacity:.88},svg);interactive(bar,r)}}
+  else{const stride=rows.length>380?Math.ceil(rows.length/380):1;for(let i=0;i<rows.length;i+=stride){const r=rows[i];const dot=analyticsSVG('circle',{cx:X(r.x),cy:Y(r.y),r:rows.length>80?2.3:3.7,class:'plot-dot-new',opacity:rows.length>140?.72:1},svg);interactive(dot,r)}}
+ }
+ container.append(svg,tip);
+}
+function analyticsDownloadCsv(key){const series=analyticsSeries[key],spec=ANALYTICS_SPECS[key];if(!series||!spec)return;const esc=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const lines=[[spec.kind==='histogram'?'Value range':series.xUnit==='date'?'Recorded period':series.xUnit==='minutes'?'Moving time (minutes)':'X',series.yUnit==='speed'?'Speed ('+analyticsUnits().speed+')':series.yUnit==='distance'?'Distance ('+analyticsUnits().distance+')':series.yUnit==='hours'?'Moving time (hours)':series.yUnit==='percent'?'Cumulative (%)':'Number of activities','Activities represented'].map(esc).join(',')];for(const row of series.rows){const x=series.xUnit==='date'?analyticsDateString(row.x,analyticsPrefs.grain):series.xUnit==='minutes'?row.x:series.raw.length&&spec.kind==='histogram'?row.label:row.x;lines.push([x,row.y,row.n].map(esc).join(','))}const blob=new Blob(['\uFEFF'+lines.join('\\r\\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='LibreHeatmaps-'+key.replace('Chart','')+'.csv';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1500)}
+function analyticsBuildTable(card,series){const specForTable=ANALYTICS_SPECS[card.dataset.analyticsId];const details=card.querySelector('.analytics-table');if(!details)return;const body=details.querySelector('tbody');body.replaceChildren();for(const r of series.rows.slice(-80)){const tr=document.createElement('tr');for(const value of [specForTable.kind==='histogram'?r.label:series.xUnit==='date'?analyticsDateString(r.x,analyticsPrefs.grain):series.xUnit==='minutes'?analyticsValue(r.x/60,'hours'):analyticsValue(r.x,series.xUnit),analyticsValue(r.y,series.yUnit),String(r.n)]){const td=document.createElement('td');td.textContent=value;tr.append(td)}body.append(tr)}details.querySelector('.analytics-table-note').textContent=series.rows.length>80?'Showing the last 80 of '+series.rows.length.toLocaleString()+' plotted values. Export CSV for the full chart.':'The table reflects the current chart settings and filters.';details.querySelectorAll('th')[0].textContent=specForTable.kind==='histogram'?'Value range':series.xUnit==='date'?'Date':series.xUnit==='minutes'?'Moving time':'Range';details.querySelectorAll('th')[1].textContent='Value'}
+function analyticsSetupCard(card,spec){if(card.dataset.analyticsControlsReady)return;card.dataset.analyticsControlsReady='1';const key=card.dataset.analyticsId,head=card.querySelector('.analytics-card-head'),tools=document.createElement('div');tools.className='analytics-card-tools';const label=document.createElement('label');label.textContent='Chart style';const select=document.createElement('select');select.className='analytics-style';select.setAttribute('aria-label','Chart style for '+card.querySelector('h5').textContent);for(const m of spec.styles){const option=document.createElement('option');option.value=m;option.textContent={line:'Line',area:'Filled area',bar:'Bars',scatter:'Individual dots',density:'Density map',trend:'Binned trend',cumulative:'Cumulative %'}[m];select.append(option)}label.append(select);const buttons=document.createElement('div');buttons.className='analytics-card-buttons';const expand=document.createElement('button');expand.type='button';expand.className='analytics-expand';expand.textContent='Expand';expand.setAttribute('aria-pressed','false');expand.onclick=()=>{card.classList.toggle('expanded');const active=card.classList.contains('expanded');expand.setAttribute('aria-pressed',String(active));expand.textContent=active?'Reduce':'Expand';requestAnimationFrame(()=>renderAnalytics(currentInsights?.analytics))};const csv=document.createElement('button');csv.type='button';csv.textContent='Export CSV';csv.onclick=()=>analyticsDownloadCsv(key);buttons.append(expand,csv);if(key==='distanceDistributionChart'){const rangeLabel=document.createElement('label');rangeLabel.textContent='Distance range';const rangeSelect=document.createElement('select');rangeSelect.className='analytics-distance-range';rangeSelect.setAttribute('aria-label','Distance distribution range');for(const [value,caption] of [['typical','Typical rides'],['full','Full range']]){const option=document.createElement('option');option.value=value;option.textContent=caption;rangeSelect.append(option)}rangeSelect.value=analyticsPrefs.distanceRange;rangeSelect.onchange=()=>{analyticsPrefs.distanceRange=rangeSelect.value;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)};rangeLabel.append(rangeSelect);tools.append(label,rangeLabel,buttons)}else tools.append(label,buttons);head.after(tools);const summary=document.createElement('div');summary.className='analytics-card-summary';card.querySelector('.analytics-plot').after(summary);const details=document.createElement('details');details.className='analytics-table';details.innerHTML='<summary>View chart data</summary><table><thead><tr><th scope="col">Date</th><th scope="col">Value</th><th scope="col">Activities</th></tr></thead><tbody></tbody></table><p class="analytics-table-note"></p>';summary.after(details);select.onchange=()=>{analyticsPrefs.styles[key]=select.value;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)}}
+function renderAnalytics(a){if(!a)return;for(const id of ['Period','Grain','Typical','Scale','Layout']){$('analytics'+id).value=analyticsPrefs[id.toLowerCase()]}$('analyticsGrid').classList.toggle('layout-double',analyticsPrefs.layout==='double');for(const b of document.querySelectorAll('[data-analytics-category]'))b.setAttribute('aria-pressed',String(b.dataset.analyticsCategory===analyticsPrefs.category));const count=(a.activity_distances||[]).length;$('analyticsCount').textContent=count.toLocaleString()+' dated activities available'+(currentInsights?.analytics_limited?' · most recent 20,000 shown':'');
+ for(const [key,spec] of Object.entries(ANALYTICS_SPECS)){const card=document.querySelector('[data-analytics-id="'+key+'"]');if(!card)continue;analyticsSetupCard(card,spec);card.hidden=analyticsPrefs.category!=='all'&&analyticsPrefs.category!==spec.family;if(card.hidden)continue;const select=card.querySelector('.analytics-style');const style=spec.styles.includes(analyticsPrefs.styles[key])?analyticsPrefs.styles[key]:spec.defaultStyle;select.value=style;if(key==='distanceDistributionChart')card.querySelector('.analytics-distance-range').value=analyticsPrefs.distanceRange;const series=analyticsChartRows(a,spec,style);analyticsSeries[key]=series;const plot=$(key);analyticsMakePlot(plot,series,spec,style);const summary=card.querySelector('.analytics-card-summary');summary.replaceChildren();const left=document.createElement('span');left.textContent=series.raw.length.toLocaleString()+' activities · '+series.rows.length.toLocaleString()+' '+(spec.kind==='timeline'?'periods':spec.kind==='histogram'?'ranges':style==='density'?'positions':style==='trend'?'groups':'points');const right=document.createElement('strong');right.textContent=spec.kind==='timeline'?((spec.summary==='typical'?'Typical speed':'Total across selected periods')+' · '+(analyticsPrefs.grain==='month'?'monthly':analyticsPrefs.grain==='week'?'weekly':'yearly')):spec.kind==='histogram'?'Ride counts by value range':style==='density'?'Brighter = more rides':style==='scatter'?(series.rows.length>1600?'Dots sampled for clarity · full data in CSV':'Each dot = one ride'):'Average by duration group';if(analyticsPrefs.scale==='focus'&&style!=='bar'&&style!=='density'&&spec.kind!=='histogram')right.textContent+=' · Focused axis';summary.append(left,right);analyticsBuildTable(card,series)}
+}
+for(const id of ['Period','Grain','Typical','Scale','Layout'])$('analytics'+id).addEventListener('change',()=>{analyticsPrefs[id.toLowerCase()]=$('analytics'+id).value;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)});
+for(const b of document.querySelectorAll('[data-analytics-category]'))b.addEventListener('click',()=>{analyticsPrefs.category=b.dataset.analyticsCategory;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)});
+$('analyticsReset').onclick=()=>{analyticsPrefs={...ANALYTICS_DEFAULTS,styles:{}};analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)};
+let analyticsResizeTimer=null;window.addEventListener('resize',()=>{if(currentInsights&&$('statsDialog').open&&!$('statsAnalytics').hidden){clearTimeout(analyticsResizeTimer);analyticsResizeTimer=setTimeout(()=>renderAnalytics(currentInsights.analytics),160)}});
+
 function fillStats(s){
-currentInsights=s;const grid=$('metricGrid');grid.replaceChildren();
+currentInsights=s;advancedDataEnabled=!!s.advanced_enabled;$('tabAdvanced').hidden=!advancedDataEnabled;if(!advancedDataEnabled&&$('tabAdvanced').getAttribute('aria-selected')==='true')selectStatsTab('overview');dataMakeColumns();if(advancedDataEnabled&&!$('statsAdvanced').hidden)renderAdvanced(s.advanced);renderAnalytics(s.analytics);const grid=$('metricGrid');grid.replaceChildren();
 const speedUnit=$('units').value==='mi'?' mph':' km/h';
 const peakSpeed=s.peak_speed_mps===null?'Not recorded':nice(s.peak_speed_mps*($('units').value==='mi'?2.236936:3.6),1)+speedUnit;
 const metricGroups=[
@@ -2262,18 +3165,101 @@ bars('yearChart',s.years,'distance_m');bars('monthChart',s.months.slice(-12),'co
 const weekdays=$('weekdayChart');weekdays.replaceChildren();
 const highest=Math.max(1,...s.weekdays.map(v=>v.count));
 for(const day of s.weekdays){const row=document.createElement('div');row.className='weekday-row';const lbl=document.createElement('span');lbl.textContent=day.name;const track=document.createElement('div');track.className='chart-track';const fill=document.createElement('div');fill.className='chart-bar';fill.style.width=(day.count/highest*100)+'%';track.append(fill);const number=document.createElement('strong');number.textContent=nice(day.count);row.append(lbl,track,number);weekdays.append(row)}
-$('statAccuracy').textContent=`GPS coverage: ${s.mapped_gps_count}/${s.count} mapped routes. Strava-supplied distance: ${s.strava_distance_count}/${s.count}. Moving time: ${s.moving_count}/${s.count} (${s.moving_estimated_count} GPS estimates). Elevation: ${s.elevation_count}/${s.count} (${s.elevation_estimated_count} GPS estimates). Peak speed: ${s.peak_speed_count}/${s.count} with recorded Max Speed; this is a single reported maximum, so GPS spikes may affect it. Other distances are derived from sampled GPS tracks. Import your complete Strava export ZIP (including activities.csv and bikes.csv where available), or import activities.csv separately, to fill missing official totals and bike assignments.`;
+updateSpeedReviewTab(s);$('statAccuracy').textContent=`${(s.filter_speed_anomalies||s.filter_speed_smart)?'Speed values excluded from calculations by enabled data-quality filters: '+s.excluded_speed_activities+'. Review flagged rides under Review anomalies, or inspect their original values in Data explorer. ':''}GPS coverage: ${s.mapped_gps_count}/${s.count} mapped routes. Source-reported distance: ${s.strava_distance_count}/${s.count}. Moving time: ${s.moving_count}/${s.count} (${s.moving_estimated_count} GPS estimates). Elevation: ${s.elevation_count}/${s.count} (${s.elevation_estimated_count} GPS estimates). Peak speed: ${s.peak_speed_count}/${s.count} with recorded Max Speed; this is a single reported maximum, so GPS spikes may affect it. Other distances are derived from sampled GPS tracks. Import a complete Strava or Garmin account ZIP to add available recorded totals and activity details; Strava activities.csv and bike files can also provide gear assignments.`;
+}
+function renderAdvanced(data){
+ const root=$('advancedCards'),charts=$('advancedGraphs');root.replaceChildren();charts.replaceChildren();
+ if(!data){root.textContent='Enable advanced activity insights in Settings to explore recorded sensor and weather data.';return}
+ const c=data.coverage||{},rides=data.rides||[];
+ for(const [name,key] of [['Calories','calories_kcal'],['Device temperature','avg_temp_c'],['Weather temperature','weather_temp_c'],['Wind speed','wind_speed_mps'],['Average cadence','avg_cadence'],['Power','avg_power']]){
+  const card=document.createElement('div');card.className='advanced-summary';const value=document.createElement('strong');value.textContent=(c[key]||0).toLocaleString()+' rides';const label=document.createElement('span');label.textContent=name+' recorded';card.append(value,label);root.append(card)
+ }
+ const metric=$('units').value==='mi',temperature=v=>metric?v*9/5+32:v,wind=v=>metric?v*2.236936:v*3.6;
+ const specs=[['Calories by month','calories','kcal','sum',v=>v],['Device temperature by month','temp_c',metric?'°F':'°C','mean',temperature],['Weather temperature by month','weather_temp_c',metric?'°F':'°C','mean',temperature],['Wind speed by month','wind_mps',metric?'mph':'km/h','mean',wind],['Average power by month','power','W','mean',v=>v],['Cadence by month','cadence','rpm','mean',v=>v]];
+ for(const [title,key,unit,aggregation,convert] of specs){
+  const card=document.createElement('article');card.className='advanced-graph';const heading=document.createElement('h5');heading.textContent=title;card.append(heading);
+  const byMonth=new Map();for(const ride of rides){const v=ride[key];if(v===null||v===undefined||!Number.isFinite(Number(v))||!ride.day)continue;const month=ride.day.slice(0,7),a=byMonth.get(month)||[0,0];a[0]+=Number(v);a[1]+=1;byMonth.set(month,a)}
+  const series=Array.from(byMonth.entries()).sort(([a],[b])=>a.localeCompare(b)).map(([month,values])=>[month,convert(aggregation==='sum'?values[0]:values[0]/values[1]),values[1]]);
+  if(!series.length){const empty=document.createElement('p');empty.className='muted';empty.textContent='Not recorded in the selected activities.';card.append(empty);charts.append(card);continue}
+  const recent=series.slice(-24),viewW=560,viewH=212,left=59,right=18,top=16,bottom=37,plotW=viewW-left-right,plotH=viewH-top-bottom;
+  let lo=Math.min(0,...recent.map(r=>r[1])),hi=Math.max(0,...recent.map(r=>r[1]));if(lo===hi)hi=lo+1;
+  const range=hi-lo;hi+=range*.07;if(lo<0)lo-=range*.07;
+  const pointY=v=>top+(hi-v)/(hi-lo)*plotH,baseY=pointY(0),svg=analyticsSVG('svg',{viewBox:`0 0 ${viewW} ${viewH}`,width:'100%',height:'auto',role:'img','aria-label':title+', '+recent.length+' months of recorded data'});
+  for(let i=0;i<=4;i++){
+   const val=lo+(hi-lo)*i,y=pointY(val);analyticsSVG('line',{x1:left,y1:y,x2:viewW-right,y2:y,stroke:'#6a5575','stroke-opacity':'.48','stroke-dasharray':'3 5'},svg);
+   const text=analyticsSVG('text',{x:left-9,y:y+4,'text-anchor':'end','font-size':11,fill:'#cdbcd8'},svg);text.textContent=Number(val.toFixed(Math.abs(val)<10?1:0)).toLocaleString();
+  }
+  analyticsSVG('line',{x1:left,y1:baseY,x2:viewW-right,y2:baseY,stroke:'#b397c6','stroke-opacity':'.9'},svg);
+  const step=plotW/recent.length,barWidth=Math.max(3,Math.min(23,step*.66));
+  for(let i=0;i<recent.length;i++){
+   const [month,value,count]=recent[i],x=left+(i+.5)*step,y=pointY(value),height=Math.max(1.5,Math.abs(y-baseY)),rect=analyticsSVG('rect',{x:x-barWidth/2,y:Math.min(y,baseY),width:barWidth,height,rx:Math.min(3,barWidth/3),fill:value<0?'#e48fba':'#b688d2'},svg),tip=analyticsSVG('title',{},rect);
+   tip.textContent=month+' · '+value.toLocaleString(undefined,{maximumFractionDigits:1})+' '+unit+' · '+count+' activities';
+  }
+  const count=Math.min(5,recent.length);for(let k=0;k<count;k++){
+   const i=count===1?0:Math.round(k*(recent.length-1)/(count-1)),month=recent[i][0],tick=analyticsSVG('text',{x:left+(i+.5)*step,y:viewH-14,'font-size':11,'text-anchor':'middle',fill:'#cdbcd8'},svg);tick.textContent=month.slice(2,4)+'/'+month.slice(5,7);
+  }
+  const chart=document.createElement('div');chart.className='advanced-chart';chart.append(svg);
+  const info=document.createElement('p');info.className='muted';info.textContent=recent[0][0]+' – '+recent.at(-1)[0]+' · '+recent.length+' recorded months · '+unit;
+  const details=document.createElement('details');details.className='advanced-table';const sum=document.createElement('summary');sum.textContent='▸ View monthly values';const table=document.createElement('table'),thead=document.createElement('thead'),tr=document.createElement('tr');
+  for(const name of ['Month','Value ('+unit+')','Activities']){const th=document.createElement('th');th.textContent=name;tr.append(th)}thead.append(tr);table.append(thead);
+  const body=document.createElement('tbody');for(const [month,value,count] of recent){const row=document.createElement('tr');for(const val of [month,value.toLocaleString(undefined,{maximumFractionDigits:1}),count.toLocaleString()]){const cell=document.createElement('td');cell.textContent=String(val);row.append(cell)}body.append(row)}table.append(body);details.append(sum,table);
+  card.append(chart,info,details);charts.append(card)
+ }
 }
 function renderRideList(target,rides){
 const root=$(target);root.replaceChildren();if(!rides||!rides.length){root.textContent='No activities in this selection.';return}
 for(const ride of rides){const button=document.createElement('button');button.type='button';button.className='ride-list-item';button.title='Open route preview';const name=document.createElement('strong');name.textContent=ride.name||'Untitled activity';const meta=document.createElement('span');meta.textContent=[ride.day,ride.sport,distanceLabel(ride.distance_m)].filter(Boolean).join(' · ');button.append(name,meta);button.onclick=()=>openRidePreview(ride.id);root.append(button)}
 }
 let previewRide=null;
+function updateSpeedReviewTab(info){
+ const active=!!(info.filter_speed_anomalies||info.filter_speed_smart),tab=$('tabReview');tab.hidden=!active;
+ $('reviewNavCount').textContent=info.excluded_speed_activities+' excluded in selection';
+ if(!active&&tab.getAttribute('aria-selected')==='true')selectStatsTab('overview');
+}
+async function loadSpeedReview(){
+ if(!$('statsDialog').open||$('statsReview').hidden)return;
+ const status=$('reviewSummary');status.textContent='Checking your enabled speed filters…';
+ try{
+  const data=await getJson('/api/speed-review?'+statsParams());
+  status.textContent=data.active?(data.excluded_count+' excluded · '+data.allowed_count+' approved exception'+(data.allowed_count===1?'':'s')):'Enable a speed filter in Settings to review flagged rides.';
+  $('reviewExcludedCount').textContent=data.excluded_count+' '+(data.excluded_count===1?'ride':'rides');$('reviewAllowedCount').textContent=data.allowed_count+' '+(data.allowed_count===1?'ride':'rides');
+  for(const [id,rides,empty] of [['reviewExcluded',data.excluded,'No activities are currently excluded in this selection.'],['reviewAllowed',data.allowed,'No approved exceptions in this selection.']]){
+   const root=$(id);root.replaceChildren();if(!rides.length){const p=document.createElement('p');p.className='muted';p.textContent=empty;root.append(p);continue}
+   for(const ride of rides){const b=document.createElement('button');b.type='button';b.className='review-item';const info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small'),reason=document.createElement('span');
+    name.textContent=ride.name||'Untitled activity';meta.textContent=[ride.day,ride.sport,distanceLabel(ride.distance_m)].filter(Boolean).join(' · ');reason.className='review-reasons';reason.textContent=ride.reasons.length?ride.reasons.join(' · '):'Approved by you';
+    info.append(name,meta,reason);const action=document.createElement('span');action.className='review-open';action.textContent='Preview ride';b.append(info,action);b.onclick=()=>openRidePreview(ride.id);root.append(b)}
+  }
+ }catch(e){status.textContent='Unable to review anomalies: '+e.message}
+}
+function showRideSpeedReview(data){
+ const panel=$('rideReviewPanel'),review=data.speed_review||{},active=!!review.active,approved=!!review.approved,flagged=(review.reasons||[]).length>0;
+ panel.hidden=!active||(!flagged&&!approved);
+ if(panel.hidden)return;
+ const label=$('rideReviewHeading'),detail=$('rideReviewText'),button=$('rideReviewAction');
+ label.textContent=approved?'Approved speed exception':'Speed excluded from analysis';
+ detail.textContent=approved?'You approved this ride. Its speed values are included in Statistics and Analytics while filters are enabled. '+(flagged?'Originally flagged by: '+review.reasons.join('; ')+'.':'It is not currently flagged by the active filters.'):
+  'Automatically flagged by: '+review.reasons.join('; ')+'. Inspect the recording and include it only if the values are credible. Other activity totals and the GPS route are not excluded.';
+ button.hidden=!approved&&!review.excluded;button.textContent=approved?'Return to automatic filtering':'Include this ride’s speed';
+ button.onclick=async()=>{const included=!approved;button.disabled=true;try{
+  const response=await fetch('/api/speed-exception',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({activity_id:data.id,included}),cache:'no-store'});
+  const result=await response.json();if(!response.ok)throw Error(result.error||'Could not save exception');
+  const confirmed=await getJson('/api/activity?id='+encodeURIComponent(data.id));if(confirmed.speed_review.approved!==included)throw Error('Exception was not confirmed by the database');
+  previewRide=confirmed;showRideSpeedReview(confirmed);$('ridePreviewStatus').textContent=included?'Exception saved and verified. This ride’s speed is now included in analysis.':'Exception cleared and verified. Automatic speed filtering now applies.';
+  if($('statsDialog').open){await refreshInsights();if(!$('statsReview').hidden)await loadSpeedReview();if(!$('statsData').hidden)await loadDataTable()}
+ }catch(e){$('ridePreviewStatus').textContent='Could not save speed review: '+e.message}finally{button.disabled=false}}
+}
 async function openRidePreview(id){
-const dialog=$('ridePreviewDialog');previewRide=null;$('showRideMap').disabled=true;$('ridePreviewTitle').textContent='Loading activity…';$('ridePreviewSubtitle').textContent='Private, local GPS preview';$('ridePreviewDetails').replaceChildren();$('ridePreviewStatus').textContent='Reading the route from your local database…';if(!dialog.open)dialog.showModal();
+const dialog=$('ridePreviewDialog');previewRide=null;$('showRideMap').disabled=true;$('ridePreviewTitle').textContent='Loading activity…';$('ridePreviewSubtitle').textContent='Private, local GPS preview';$('ridePreviewDetails').replaceChildren();$('ridePreviewStatus').textContent='Reading the route from your local database…';if(!dialog.open)dialog.showModal();$('rideReviewPanel').hidden=true;
 try{const data=await getJson('/api/activity?id='+encodeURIComponent(id));if(!dialog.open)return;previewRide=data;$('ridePreviewTitle').textContent=data.name||'Untitled activity';$('ridePreviewSubtitle').textContent=[data.day,data.sport].filter(Boolean).join(' · ');$('ridePreviewStatus').textContent=state.online?'Route remains local. Dark map tiles come from OpenStreetMap and reveal the displayed map area and your IP to the provider.':'Online map tiles are disabled. Enable them in Map view to see the dark basemap behind this route.';$('showRideMap').disabled=false;
-const facts=[['Distance',distanceLabel(data.distance_m)],['Moving time',timeLabel(data.moving_seconds)],['Elapsed time',timeLabel(data.elapsed_seconds)],['Elevation gain',data.elevation_m===null?'Not recorded':nice(data.elevation_m*($('units').value==='mi'?3.28084:1),0)+($('units').value==='mi'?' ft':' m')],['Gear',data.bike||'Not recorded'],['Average speed',data.avg_speed===null?'Not recorded':nice(data.avg_speed*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h')],['Heart rate',data.avg_heart_rate===null?'Not recorded':nice(data.avg_heart_rate)+' bpm'],['Maximum speed',data.max_speed===null?'Not recorded':nice(data.max_speed*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h')]];
-for(const [label,value] of facts){const box=document.createElement('div');box.className='ride-preview-detail';const k=document.createElement('span');k.textContent=label;const v=document.createElement('strong');v.textContent=value;box.append(k,v);$('ridePreviewDetails').append(box)}requestAnimationFrame(()=>drawRidePreview(data));
+const speedUnit=$('units').value==='mi'?' mph':' km/h',speedFactor=$('units').value==='mi'?2.236936:3.6;
+const recorded=n=>n===null||n===undefined||!Number.isFinite(Number(n))?null:Number(n);
+const facts=[['Distance',distanceLabel(data.distance_m)],['Moving time',timeLabel(data.moving_seconds)],['Elapsed time',timeLabel(data.elapsed_seconds)],['Elevation gain',recorded(data.elevation_m)===null?'Not recorded':nice(data.elevation_m*($('units').value==='mi'?3.28084:1),0)+($('units').value==='mi'?' ft':' m')],['Average speed',recorded(data.avg_speed)===null?'Not recorded':nice(data.avg_speed*speedFactor,1)+speedUnit],['Maximum speed',recorded(data.max_speed)===null?'Not recorded':nice(data.max_speed*speedFactor,1)+speedUnit],['Average power',recorded(data.avg_power)===null?'Not recorded':nice(data.avg_power,0)+' W'],['Average heart rate',recorded(data.avg_heart_rate)===null?'Not recorded':nice(data.avg_heart_rate,0)+' bpm'],['Gear',data.bike||'Not recorded'],['GPS samples',nice(data.point_count,0)],['GPS track distance',recorded(data.gps_distance_m)===null?'Not recorded':distanceLabel(data.gps_distance_m)],['Source distance',recorded(data.reported_distance_m)===null?'Not recorded':distanceLabel(data.reported_distance_m)]];
+if(advancedDataEnabled){
+ const more=[['Calories','calories_kcal',v=>nice(v,0)+' kcal'],['Device temperature','avg_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Weather temperature','weather_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Wind speed','wind_speed_mps',v=>nice(v*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h')],['Average cadence','avg_cadence',v=>nice(v,0)+' rpm'],['Max power','max_power',v=>nice(v,0)+' W'],['Weather condition','weather_condition',v=>String(v)]];
+ for(const [label,key,format] of more){const v=data[key];if(v!==null&&v!==undefined&&v!=='')facts.push([label,format(v)])}
+}
+for(const [label,value] of facts){const box=document.createElement('div');box.className='ride-preview-detail';const k=document.createElement('span');k.textContent=label;const v=document.createElement('strong');v.textContent=value;box.append(k,v);$('ridePreviewDetails').append(box)}
+const sources=[];if(data.filename)sources.push('File: '+data.filename);if(data.moving_source)sources.push('Moving time: '+(data.moving_source==='gps'?'GPS estimate':data.moving_source));if(data.elevation_source)sources.push('Elevation: '+(data.elevation_source==='gps'?'GPS estimate':data.elevation_source));$('ridePreviewSource').textContent=sources.join(' · ');showRideSpeedReview(data);requestAnimationFrame(()=>drawRidePreview(data));
 }catch(e){$('ridePreviewTitle').textContent='Could not load this activity';$('ridePreviewStatus').textContent=e.message}
 }
 function drawRidePreview(data){
@@ -2299,11 +3285,11 @@ $('closeRidePreview').onclick=()=>$('ridePreviewDialog').close();$('backToStats'
 $('showRideMap').onclick=()=>{if(!previewRide)return;const ride=previewRide;state.activeRideId=ride.id;$('clearRide').hidden=false;$('mapCaption').querySelector('.map-caption-title').textContent=ride.name||'Selected GPS activity';$('ridePreviewDialog').close();if($('statsDialog').open)$('statsDialog').close();loadedKey='';fitBounds(ride.bounds,false)};
 $('clearRide').onclick=()=>{state.activeRideId=null;$('clearRide').hidden=true;$('mapCaption').querySelector('.map-caption-title').textContent='Your GPS heatmap';loadedKey='';fitBounds(state.focusBounds||state.bounds)};
 window.addEventListener('resize',()=>{if($('ridePreviewDialog').open&&previewRide)drawRidePreview(previewRide)});
-async function refreshInsights(){try{const info=await getJson('/api/insights?'+statsParams());fillStats(info)}catch(e){$('statAccuracy').textContent='Unable to load statistics: '+e.message}}
+async function refreshInsights(){if($('statsDialog').open&&!$('statsData').hidden)loadDataTable();try{const info=await getJson('/api/insights?'+statsParams());fillStats(info);if($('statsDialog').open&&!$('statsReview').hidden)await loadSpeedReview()}catch(e){$('statAccuracy').textContent='Unable to load statistics: '+e.message}}
 async function refreshStatsFilters(){const s=await getJson('/api/stats');const oldSport=$('statsSport').value,oldYear=$('statsYear').value,oldBike=$('statsBike').value;$('statsSport').replaceChildren();let o=document.createElement('option');o.value='';o.textContent='All types';$('statsSport').append(o);for(const [name] of s.types){let e=document.createElement('option');e.value=name;e.textContent=name;$('statsSport').append(e)}$('statsSport').value=oldSport;$('statsBike').replaceChildren();let allBikes=document.createElement('option');allBikes.value='';allBikes.textContent='All bikes';$('statsBike').append(allBikes);for(const name of s.bikes||[]){const e=document.createElement('option');e.value=name;e.textContent=name;$('statsBike').append(e)}$('statsBike').value=oldBike;const overview=await getJson('/api/insights');$('statsYear').replaceChildren();o=document.createElement('option');o.value='';o.textContent='All years';$('statsYear').append(o);for(const y of overview.years){const e=document.createElement('option');e.value=y.year;e.textContent=y.year;$('statsYear').append(e)}$('statsYear').value=oldYear;statsYears=overview.months;updateStatsMonths()}
 function updateStatsMonths(){const old=$('statsMonth').value,year=$('statsYear').value;$('statsMonth').replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent='All months';$('statsMonth').append(blank);for(const m of statsYears.filter(m=>!year||m.month.startsWith(year))){const e=document.createElement('option');e.value=m.month;e.textContent=m.month;$('statsMonth').append(e)}$('statsMonth').value=old;if($('statsMonth').value!==old)$('statsMonth').value=''}
 $('statsTop').onclick=()=>{$('statsButton').click()};$('statsButton').onclick=async()=>{selectStatsTab('overview');$('statsDialog').showModal();try{await refreshStatsFilters()}catch(e){$('statAccuracy').textContent=e.message}refreshInsights()};
-$('closeStats').onclick=()=>$('statsDialog').close();$('units').onchange=()=>{if(currentInsights)fillStats(currentInsights)};
+$('closeStats').onclick=()=>$('statsDialog').close();$('openSpeedReview').onclick=async()=>{if(settingsDirty){showSettingsStatus('Save your speed-filter settings before reviewing anomalies.',true);return}if(!(savedSettings&& (savedSettings.filter_speed_anomalies||savedSettings.filter_speed_smart))){showSettingsStatus('Enable and save a speed filter to review flagged activities.',true);return}closeSettings();$('statsDialog').showModal();selectStatsTab('review');try{await refreshStatsFilters()}catch(e){}await refreshInsights()};$('units').onchange=()=>{if(currentInsights)fillStats(currentInsights);loadDataTable()};
 $('statsSport').onchange=refreshInsights;$('statsBike').onchange=refreshInsights;$('statsMonth').onchange=refreshInsights;$('statsYear').onchange=()=>{updateStatsMonths();refreshInsights()};
 let sliderTimer=0;
 for(const id of ['radius','intensity','opacity','definition']){$(id).addEventListener('input',()=>{$(id+'Value').textContent=$(id).value+(id==='radius'?' px':'%');clearTimeout(sliderTimer);sliderTimer=setTimeout(queueRender,85);savePreferences()})}
@@ -2317,23 +3303,139 @@ interactive.addEventListener('pointerdown',e=>{if(e.button!==0)return;pointer={x
 interactive.addEventListener('pointermove',e=>{if(!pointer)return;const [x,y]=px(pointer.lat,pointer.lon);const dx=e.clientX-pointer.x,dy=e.clientY-pointer.y;const [lat,lon]=geo(x-dx,y-dy);state.lat=lat;state.lon=lon;queueTiles();canvas.style.transform=`translate3d(${dx}px,${dy}px,0)`});
 function finishPan(){if(!pointer)return;pointer=null;updateMap()}
 interactive.addEventListener('pointerup',finishPan);interactive.addEventListener('pointercancel',finishPan);
-let wheelTimer=0,wheelBase=null;interactive.addEventListener('wheel',e=>{e.preventDefault();if(wheelBase===null)wheelBase=state.z;const next=clamp(state.z+(e.deltaY<0?1:-1),1,18);if(next===state.z)return;state.z=next;prepareZoom();queueTiles();clearTimeout(wheelTimer);wheelTimer=setTimeout(()=>{wheelBase=null;updateMap(true)},95)},{passive:false});
-interactive.addEventListener('dblclick',e=>{const old=state.z;state.z=clamp(old+1,1,18);if(state.z!==old)updateMap(true)});
+function anchoredCenter(lat,lon,oldZ,newZ,w,h,x,y){const [cx,cy]=px(lat,lon,oldZ),pos=geo(cx+x-w/2,cy+y-h/2,oldZ),[nx,ny]=px(pos[0],pos[1],newZ);return geo(nx-(x-w/2),ny-(y-h/2),newZ)}
+function zoomAtPointer(target,localX,localY){const old=state.z,next=clamp(target,1,18);if(next===old)return false;const [w,h]=dimensions();const center=anchoredCenter(state.lat,state.lon,old,next,w,h,localX,localY);state.lat=center[0];state.lon=clamp(center[1],-180,180);state.z=next;prepareZoom();queueTiles();return true}
+let wheelTimer=0;interactive.addEventListener('wheel',e=>{e.preventDefault();const rect=interactive.getBoundingClientRect();if(!zoomAtPointer(state.z+(e.deltaY<0?1:-1),e.clientX-rect.left,e.clientY-rect.top))return;clearTimeout(wheelTimer);wheelTimer=setTimeout(()=>updateMap(true),110)},{passive:false});
+interactive.addEventListener('dblclick',e=>{const rect=interactive.getBoundingClientRect();if(zoomAtPointer(state.z+1,e.clientX-rect.left,e.clientY-rect.top))updateMap(true)});
 function zoomButton(delta){const old=state.z;state.z=clamp(old+delta,1,18);if(state.z!==old)updateMap(true)}
 $('plus').onclick=()=>zoomButton(1);$('minus').onclick=()=>zoomButton(-1);$('fit').onclick=e=>fitBounds(e.shiftKey?state.bounds:state.focusBounds||state.bounds,!e.shiftKey);
 let restoringDetails=false;$('import').onclick=()=>{restoringDetails=false;$('file').click()};$('repairDetails').onclick=()=>{restoringDetails=true;if($('statsDialog').open)$('statsDialog').close();$('file').click()};$('file').addEventListener('change',()=>{if($('file').files.length)upload($('file').files[0])});
-function upload(file){$('import').disabled=true;const status=$('importStatus');status.classList.remove('error');status.textContent='Uploading '+file.name+' to the local importer…';const xhr=new XMLHttpRequest();xhr.open('POST','/api/import');xhr.setRequestHeader('X-LibreHeatmaps-Token',TOKEN);xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));xhr.upload.onprogress=e=>{if(e.lengthComputable)status.textContent='Copying ZIP locally: '+Math.floor(e.loaded/e.total*100)+'%'};xhr.onload=()=>{if(xhr.status===202){pollImport()}else{status.classList.add('error');status.textContent='Import could not start: '+xhr.responseText;$('import').disabled=false}};xhr.onerror=()=>{status.classList.add('error');status.textContent='Could not transfer activity to local app.';$('import').disabled=false};xhr.send(file)}
+function setImportMapStatus(message){$('mapCaption').querySelector('.map-caption-title').textContent='Importing GPS activities';$('mapDetail').textContent=message;}
+function restoreImportMapStatus(){if(state.activeRideId)return;const title=$('mapCaption').querySelector('.map-caption-title');title.textContent='Your GPS heatmap';$('mapDetail').textContent='Updating your local heatmap…';}
+function upload(file){$('import').disabled=true;setImportMapStatus('Preparing '+file.name+' · 0%');const status=$('importStatus');status.classList.remove('error');status.textContent='Uploading '+file.name+' to the local importer…';const xhr=new XMLHttpRequest();xhr.open('POST','/api/import');xhr.setRequestHeader('X-LibreHeatmaps-Token',TOKEN);xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));xhr.upload.onprogress=e=>{if(e.lengthComputable){const progress=Math.floor(e.loaded/e.total*100);status.textContent='Copying ZIP locally: '+progress+'%';setImportMapStatus('Transferring '+progress+'% · '+file.name)}};xhr.onload=()=>{if(xhr.status===202){pollImport()}else{status.classList.add('error');status.textContent='Import could not start: '+xhr.responseText;$('import').disabled=false;restoreImportMapStatus()}};xhr.onerror=()=>{status.classList.add('error');status.textContent='Could not transfer activity to local app.';$('import').disabled=false;restoreImportMapStatus()};xhr.send(file)}
 async function pollImport(){try{const job=await getJson('/api/job');$('importStatus').textContent=job.status==='running'?`Processing ${job.processed} / ${job.total}: ${job.message}
 Added ${job.added} · Already imported ${job.skipped} · No GPS ${job.no_gps||0} · Metadata updated ${job.updated||0} · Failed ${job.failed}`:`${job.message}
-Added ${job.added} · Already imported ${job.skipped} · No GPS ${job.no_gps||0} · Metadata updated ${job.updated||0} · Failed ${job.failed}`;if(job.status==='running'){setTimeout(pollImport,800);return}$('import').disabled=false;$('file').value='';if(job.status==='error')$('importStatus').classList.add('error');await refreshStats(true);if(restoringDetails&&job.status==='done'){restoringDetails=false;$('statsButton').click()}else if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}}catch(e){$('importStatus').textContent=e.message;$('import').disabled=false}}
-$('gpx').onclick=()=>{if(!state.known)return alert('Import activities first.');window.location.href='/api/export.gpx?'+filterParams()};$('png').onclick=()=>{if(!state.known)return alert('Import activities first.');if(zoomWaiting){alert('Map is still updating. Try again when the heatmap has finished rendering.');return;}if(canvas.style.transform)render();const x=document.createElement('canvas'),w=canvas.width,h=canvas.height;x.width=w;x.height=h;const c=x.getContext('2d');c.fillStyle=state.mode==='light'?'#e7e9eb':'#100b1c';c.fillRect(0,0,w,h);c.drawImage(canvas,0,0);x.toBlob(blob=>{if(!blob)return;const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='LibreHeatmaps.png';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)},'image/png')};
+Added ${job.added} · Already imported ${job.skipped} · No GPS ${job.no_gps||0} · Metadata updated ${job.updated||0} · Failed ${job.failed}`;if(job.status==='running'){setImportMapStatus(`${Number(job.processed||0).toLocaleString()} / ${Number(job.total||0).toLocaleString()} processed · ${Number(job.added||0).toLocaleString()} added`);setTimeout(pollImport,800);return}setImportMapStatus(`${Number(job.processed||0).toLocaleString()} / ${Number(job.total||0).toLocaleString()} processed · ${job.status==='done'?'Complete':'Import issue'}`);$('import').disabled=false;$('file').value='';if(job.status==='error')$('importStatus').classList.add('error');await refreshStats(true);restoreImportMapStatus();if(restoringDetails&&job.status==='done'){restoringDetails=false;$('statsButton').click()}else if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}}catch(e){$('importStatus').textContent=e.message;$('import').disabled=false;restoreImportMapStatus()}}
+$('gpx').onclick=()=>{if(!state.known)return alert('Import activities first.');window.location.href='/api/export.gpx?'+filterParams()};$('png').onclick=()=>{if(!state.known)return alert('Import activities first.');openCaptureEditor()};
 
-const CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);
+const captureStage=$('captureStage'),captureCanvas=$('captureCanvas'),captureContext=captureCanvas.getContext('2d',{alpha:true});
+const captureView={lat:state.lat,lon:state.lon,z:state.z,data:null,geometry:null,key:'',controller:null,generation:0,timer:0,drag:null,fitMode:false,session:Math.random().toString(36).slice(2)+Date.now().toString(36),serial:0};
+function captureSize(){return [captureStage.clientWidth,captureStage.clientHeight]}
+function captureShape(){const [a,b]=$('captureShape').value.split(':').map(Number);return a/b}
+function captureStatus(message,error=false){$('captureStatus').textContent=message;$('captureStatus').style.color=error?'#ffb5b5':'#d6c1e4'}
+const captureTileNodes=new Map();
+function captureTileMap(){
+ const root=$('captureTiles'),credit=$('captureMapCredit'),bg=$('captureBackground').value;
+ captureStage.classList.toggle('transparent-preview',bg==='transparent');
+ captureStage.classList.toggle('light-preview',bg==='light');
+ captureStage.classList.toggle('dark-preview',bg==='dark');
+ if(!state.online||bg==='transparent'){root.replaceChildren();captureTileNodes.clear();credit.hidden=true;return}
+ const [w,h]=captureSize();if(w<10||h<10)return;
+ const tileZoom=Math.floor(captureView.z),scale=2**(captureView.z-tileZoom),t=256*scale,count=2**tileZoom;
+ const [cx,cy]=px(captureView.lat,captureView.lon,captureView.z),left=cx-w/2,top=cy-h/2,used=new Set();
+ root.className='capture-tiles'+(bg==='dark'?' dark':'');credit.hidden=false;
+ credit.textContent='© OpenStreetMap contributors · preview only';
+ for(let y=Math.floor(top/t);y<=Math.floor((top+h)/t);y++){
+  if(y<0||y>=count)continue;
+  for(let x=Math.floor(left/t);x<=Math.floor((left+w)/t);x++){
+   const wrap=((x%count)+count)%count,key=[tileZoom,wrap,y,x].join('-');used.add(key);
+   let img=captureTileNodes.get(key);
+   if(!img){img=document.createElement('img');img.alt='';img.decoding='async';img.loading='lazy';img.referrerPolicy='strict-origin-when-cross-origin';img.onerror=()=>{img.style.visibility='hidden'};img.onload=()=>{img.style.visibility='visible'};img.src=`https://tile.openstreetmap.org/${tileZoom}/${wrap}/${y}.png`;root.append(img);captureTileNodes.set(key,img)}
+   img.style.width=t+'px';img.style.height=t+'px';img.style.transform=`translate3d(${x*t-left}px,${y*t-top}px,0)`;
+  }
+ }
+ for(const [key,img] of captureTileNodes){if(!used.has(key)){img.remove();captureTileNodes.delete(key)}}
+}
+function capturePaint(output=null){
+ const [w,h]=captureSize();if(w<30||h<30)return;
+ const multiplier=output?Number($('captureWidth').value)/w:Math.min(2,Math.max(1,window.devicePixelRatio||1));
+ const target=output||captureCanvas,context=output?output.getContext('2d',{alpha:true}):captureContext;
+ const rw=Math.round(w*multiplier),rh=Math.round(h*multiplier);
+ if(target.width!==rw||target.height!==rh){target.width=rw;target.height=rh}
+ context.setTransform(multiplier,0,0,multiplier,0,0);context.clearRect(0,0,w,h);
+ if(!output)captureTileMap();
+ const bg=$('captureBackground').value;
+ if(bg!=='transparent'&&(output||!state.online)){context.fillStyle=bg==='light'?'#e7e9eb':'#100b1c';context.fillRect(0,0,w,h)}
+ if(!captureView.data)return;
+ if(!captureView.geometry||captureView.geometry.data!==captureView.data)captureView.geometry=createGeometry(captureView.data);
+ const g=captureView.geometry,mid=px(captureView.lat,captureView.lon,captureView.z),factor=2**(captureView.z-g.zoom);
+ context.save();context.translate(g.originX*factor-mid[0]+w/2,g.originY*factor-mid[1]+h/2);context.scale(factor,factor);drawHeatLayers(context,g,factor);context.restore();
+}
+function captureQuery(){
+ const [w,h]=captureSize(),c=px(captureView.lat,captureView.lon,captureView.z),t=256;
+ const x0=Math.floor((c[0]-w/2-256)/t)*t,x1=Math.ceil((c[0]+w/2+256)/t)*t;
+ const y0=Math.floor((c[1]-h/2-256)/t)*t,y1=Math.ceil((c[1]+h/2+256)/t)*t;
+ const nw=geo(x0,y0,captureView.z),se=geo(x1,y1,captureView.z),p=filterParams();
+ p.set('west',clamp(nw[1],-180,180).toString());p.set('east',clamp(se[1],-180,180).toString());
+ p.set('north',clamp(nw[0],-85,85).toString());p.set('south',clamp(se[0],-85,85).toString());p.set('z',Math.min(18,Math.ceil(captureView.z)));
+ return p.toString();
+}
+function captureRequest(delay=100){
+ clearTimeout(captureView.timer);if(captureView.controller)captureView.controller.abort();
+ ++captureView.generation;$('captureSave').disabled=true;$('captureProgress').hidden=false;$('captureProgress').textContent='Refining selected area…';
+ capturePaint();captureView.timer=setTimeout(captureLoad,delay);
+}
+async function captureLoad(){
+ if(!$('captureDialog').open)return;
+ const key=captureQuery(),id=captureView.generation;
+ if(key===captureView.key&&captureView.data){$('captureProgress').hidden=true;$('captureSave').disabled=false;capturePaint();return}
+ const controller=new AbortController();captureView.controller=controller;
+ try{
+  const res=await fetch('/api/view?'+key,{signal:controller.signal,cache:'no-store',headers:{'X-LibreHeatmaps-View-Session':captureView.session,'X-LibreHeatmaps-View-Serial':String(++captureView.serial)}});
+  if(!res.ok)throw Error('Map request failed: '+res.status);
+  const data=await res.json();if(id!==captureView.generation)return;
+  captureView.data=data;captureView.geometry=null;captureView.key=key;capturePaint();$('captureProgress').hidden=true;$('captureSave').disabled=false;
+  captureStatus(data.activities.toLocaleString()+' matching activities · '+$('captureWidth').value+' px wide PNG');
+ }catch(e){if(e.name!=='AbortError'&&id===captureView.generation){captureStatus('Could not prepare this capture: '+e.message,true);$('captureProgress').textContent='Capture unavailable';}}
+ finally{if(captureView.controller===controller)captureView.controller=null}
+}
+function syncCaptureZoom(){const z=captureView.z;$('captureZoomSlider').value=z;$('captureZoomValue').value=z.toFixed(2)}
+function captureZoomTo(target,x=null,y=null){const next=clamp(Math.round(Number(target)*4)/4,1,18);if(next===captureView.z)return;const [w,h]=captureSize(),center=anchoredCenter(captureView.lat,captureView.lon,captureView.z,next,w,h,x??w/2,y??h/2);captureView.lat=center[0];captureView.lon=clamp(center[1],-180,180);captureView.z=next;captureView.fitMode=false;syncCaptureZoom();captureRequest(155)}
+function captureZoom(delta,x=null,y=null){captureZoomTo(captureView.z+delta,x,y)}
+function openCaptureEditor(){captureView.lat=state.lat;captureView.lon=state.lon;captureView.z=state.z;captureView.fitMode=false;captureView.data=null;captureView.geometry=null;captureView.key='';captureStatus('Drag to position, scroll to zoom.');$('captureBackground').value=state.mode==='light'?'light':'dark';$('captureDialog').showModal();captureStage.style.setProperty('--capture-ratio',String(captureShape()));syncCaptureZoom();requestAnimationFrame(()=>captureRequest(0))}
+$('captureClose').onclick=()=>{$('captureDialog').close()};
+$('captureDialog').addEventListener('close',()=>{clearTimeout(captureView.timer);++captureView.generation;if(captureView.controller)captureView.controller.abort();captureView.drag=null;$('captureTiles').replaceChildren();captureTileNodes.clear()});
+$('captureShape').onchange=()=>{captureStage.style.setProperty('--capture-ratio',String(captureShape()));requestAnimationFrame(()=>{if(captureView.fitMode)captureFitRoutes();else captureRequest(60)})};
+$('captureWidth').onchange=()=>{captureStatus('Output width: '+$('captureWidth').value+' px.');capturePaint()};
+$('captureBackground').onchange=()=>capturePaint();
+$('captureZoomSlider').oninput=()=>captureZoomTo($('captureZoomSlider').value);
+$('captureReset').onclick=()=>{captureView.lat=state.lat;captureView.lon=state.lon;captureView.z=state.z;captureView.fitMode=false;syncCaptureZoom();captureRequest(0)};
+async function captureFitRoutes(){try{const b=state.activeRideId?(await getJson('/api/activity?id='+encodeURIComponent(state.activeRideId))).bounds:state.focusBounds||state.bounds;if(!b||b.some(x=>x===null||!Number.isFinite(x)))throw Error('No route bounds available');const [w,h]=captureSize(),a=px(b[1],b[0],0),c=px(b[3],b[2],0),dx=Math.max(1e-7,Math.abs(c[0]-a[0])),dy=Math.max(1e-7,Math.abs(a[1]-c[1]));const exactZoom=Math.log2(Math.min(w*.84/dx,h*.84/dy));captureView.z=clamp(Math.floor(exactZoom*4)/4,1,18);const center=geo((a[0]+c[0])/2,(a[1]+c[1])/2,0);captureView.lat=center[0];captureView.lon=center[1];captureView.fitMode=true;syncCaptureZoom();captureStatus('Fitted the recorded routes with balanced space around their edges.');captureRequest(0)}catch(e){captureStatus('Could not fit these routes: '+e.message,true)}}
+$('captureFit').onclick=captureFitRoutes;
+$('capturePlus').onclick=()=>captureZoom(.5);$('captureMinus').onclick=()=>captureZoom(-.5);
+captureStage.addEventListener('wheel',e=>{e.preventDefault();const rect=captureStage.getBoundingClientRect();captureZoom(e.deltaY<0?.25:-.25,e.clientX-rect.left,e.clientY-rect.top)},{passive:false});
+captureStage.addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.capture-controls'))return;captureView.fitMode=false;captureView.drag={x:e.clientX,y:e.clientY,lat:captureView.lat,lon:captureView.lon};captureStage.setPointerCapture(e.pointerId)});
+captureStage.addEventListener('pointermove',e=>{if(!captureView.drag)return;const d=captureView.drag,p=px(d.lat,d.lon,captureView.z),center=geo(p[0]-(e.clientX-d.x),p[1]-(e.clientY-d.y),captureView.z);captureView.lat=center[0];captureView.lon=clamp(center[1],-180,180);capturePaint()});
+function captureEndDrag(){if(!captureView.drag)return;captureView.drag=null;captureRequest(75)}
+captureStage.addEventListener('pointerup',captureEndDrag);captureStage.addEventListener('pointercancel',captureEndDrag);
+$('captureSave').onclick=()=>{if(!captureView.data||$('captureSave').disabled)return;const c=document.createElement('canvas');capturePaint(c);$('captureSave').disabled=true;captureStatus('Preparing full-resolution PNG…');c.toBlob(blob=>{if(!blob){$('captureSave').disabled=false;captureStatus('PNG creation failed.',true);return}const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='LibreHeatmaps-'+captureView.z+'-heatmap.png';a.click();setTimeout(()=>URL.revokeObjectURL(url),5000);$('captureSave').disabled=false;captureStatus('PNG prepared: '+c.width+' × '+c.height+' pixels.')},'image/png')};
+window.addEventListener('resize',()=>{if($('captureDialog').open)captureRequest(110)});
+
+let CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);
+let clientHeartbeat=null;
 function ping(){fetch('/api/ping',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,cache:'no-store'}).catch(()=>{})}
-ping();setInterval(ping,12000);
-window.addEventListener('pagehide',()=>fetch('/api/leave',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,keepalive:true}).catch(()=>{}));
-$('shutdown').onclick=async()=>{if(!confirm('Close the local LibreHeatmaps application?'))return;try{await fetch('/api/shutdown',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN}})}catch(e){}document.body.replaceChildren();const d=document.createElement('div');d.style.cssText='font:16px system-ui;color:#ddd;background:#160d27;min-height:100vh;display:grid;place-items:center';d.textContent='LibreHeatmaps has stopped. You can close this tab.';document.body.append(d)};
-let savedSettings=null,settingsDirty=false,settingsSaving=false,settingsSaveError=null,prefTimer=null,prefSequence=Promise.resolve(),appearanceApplying=false;
+function startClientHeartbeat(){clearInterval(clientHeartbeat);ping();clientHeartbeat=setInterval(ping,12000)}
+function leaveClient(){clearInterval(clientHeartbeat);clientHeartbeat=null;const body=TOKEN+'\\n'+CLIENT_ID;if(navigator.sendBeacon&&navigator.sendBeacon('/api/leave',new Blob([body],{type:'text/plain'})))return;fetch('/api/leave',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,keepalive:true}).catch(()=>{})}
+startClientHeartbeat();
+window.addEventListener('pagehide',leaveClient);
+window.addEventListener('pageshow',e=>{if(e.persisted){CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);startClientHeartbeat()}});
+$('shutdown').onclick=async()=>{if(!confirm('Close the local LibreHeatmaps application?'))return;try{const res=await fetch('/api/shutdown',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN}});if(!res.ok){const info=await res.json();alert(info.error||'Unable to exit right now');return}}catch(e){alert('Unable to contact the local application.');return}clearInterval(clientHeartbeat);document.body.replaceChildren();const d=document.createElement('div');d.style.cssText='font:16px system-ui;color:#ddd;background:#160d27;min-height:100vh;display:grid;place-items:center';d.textContent='LibreHeatmaps has stopped. You can close this tab.';document.body.append(d)};
+let savedSettings=null,settingsDirty=false,settingsSaving=false,settingsSaveError=null,settingsVerifiedJustNow=false,prefTimer=null,prefSequence=Promise.resolve(),appearanceApplying=false,anomalySummaryRequest=0;
+async function updateAnomalySummary(){
+ const request=++anomalySummaryRequest,el=$('anomalyReviewCount'),button=$('openSpeedReview');
+ if(settingsDirty){el.textContent='Save settings to update the exclusion count.';button.textContent='Review anomalies';return}
+ if(!savedSettings||( !savedSettings.filter_speed_anomalies&&!savedSettings.filter_speed_smart)){
+  el.textContent='No speed filters enabled · 0 activities excluded';button.textContent='Review anomalies';return
+ }
+ el.textContent='Counting excluded activities…';
+ try{
+  const summary=await getJson('/api/speed-review-summary');
+  if(request!==anomalySummaryRequest||settingsDirty)return;
+  const count=summary.excluded_count;
+  el.textContent=count.toLocaleString()+' '+(count===1?'activity currently excluded':'activities currently excluded')+' from speed statistics · Entire library';
+  button.textContent='Review anomalies ('+count.toLocaleString()+')';
+ }catch(e){if(request!==anomalySummaryRequest)return;el.textContent='Exclusion count unavailable: '+e.message;button.textContent='Review anomalies'}
+}
 function captureAppearance(){return {mode:state.mode,online:state.online,palette:$('palette').value,routes:$('routes').checked,heat:$('heat').checked,radius:Number($('radius').value),definition:Number($('definition').value),intensity:Number($('intensity').value),opacity:Number($('opacity').value)}}
 function paintPalette(){$('legendPalette').value=$('palette').value;const p=PALETTES[$('palette').value];$('legendBar').style.background='linear-gradient(90deg,'+p.colors.join(',')+')';$('palettePreview').style.background=$('legendBar').style.background;$('legendLabel').textContent=p.name;queueRender()}
 function applyAppearance(p){if(!p)return;appearanceApplying=true;try{if(PALETTES[p.palette])$('palette').value=p.palette;state.mode=['dark','light','satellite'].includes(p.mode)?p.mode:'dark';if(typeof p.online==='boolean')state.online=p.online;for(const id of ['routes','heat'])if(typeof p[id]==='boolean')$(id).checked=p[id];for(const id of ['radius','definition','intensity','opacity'])if(p[id]!==undefined&&Number.isFinite(Number(p[id]))){const e=$(id);e.value=clamp(Number(p[id]),Number(e.min),Number(e.max));$(id+'Value').textContent=e.value+(id==='radius'?' px':'%')}$('onlineTiles').checked=state.online;$('defaultMap').value=state.mode;document.querySelectorAll('[data-map]').forEach(b=>b.classList.toggle('primary',b.dataset.map===state.mode));state.tileNodes.clear();tiles.replaceChildren();updatePrivacy();tileMap();paintPalette()}finally{appearanceApplying=false}}
@@ -2341,16 +3443,30 @@ async function writeAppearance(p){const response=await fetch('/api/preferences',
 function enqueueAppearance(p){prefSequence=prefSequence.catch(()=>{}).then(()=>writeAppearance(p));return prefSequence}
 function savePreferences(){if(appearanceApplying||$('settingsDialog').open)return;clearTimeout(prefTimer);prefTimer=setTimeout(()=>{enqueueAppearance(captureAppearance()).catch(e=>console.warn('Local preference save failed:',e.message))},220)}
 async function loadPreferences(){let p=null;try{p=(await getJson('/api/preferences')).appearance}catch(e){console.warn('Local preferences unavailable:',e.message)}applyAppearance(p||{mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84})}
-function updateSaveState(){const indicator=$('settingsSaveState'),button=$('saveSettings');indicator.classList.toggle('dirty',settingsDirty);indicator.classList.toggle('error',!!settingsSaveError);indicator.textContent=settingsSaving?'Saving…':settingsSaveError|| (settingsDirty?'Unsaved changes':'All changes saved');button.disabled=!settingsDirty||settingsSaving}
-function markSettingsDirty(){if(!$('settingsDialog').open||appearanceApplying)return;settingsSaveError=null;settingsDirty=JSON.stringify(captureAppearance())!==JSON.stringify(savedSettings);updateSaveState()}
-function closeSettings(){if(settingsSaving)return;if(settingsDirty){if(!confirm('Discard unsaved appearance changes?'))return;applyAppearance(savedSettings);settingsDirty=false;updateSaveState()}$('settingsDialog').close()}
-$('openSettings').onclick=async()=>{if(prefTimer){clearTimeout(prefTimer);prefTimer=null;try{await enqueueAppearance(captureAppearance())}catch(e){console.warn('Preference save failed:',e.message)}}try{await prefSequence}catch(e){}savedSettings=captureAppearance();settingsDirty=false;settingsSaving=false;settingsSaveError=null;updateSaveState();$('settingsDialog').showModal();try{const d=await getJson('/api/system');$('dataFolder').textContent=d.data_directory;$('dataFile').textContent=d.database;$('installedVersion').textContent=d.version}catch(e){showSettingsStatus('Could not read local storage path: '+e.message,true)}};
+function captureSettings(){return {appearance:captureAppearance(),filter_speed_anomalies:$('filterSpeedAnomalies').checked,filter_speed_smart:$('filterSpeedSmart').checked,advanced_data:$('advancedData').checked}}
+function updateSaveState(){const indicator=$('settingsSaveState'),button=$('saveSettings');indicator.classList.toggle('dirty',settingsDirty);indicator.classList.toggle('error',!!settingsSaveError);indicator.classList.toggle('saved',!settingsDirty&&!settingsSaveError);indicator.textContent=settingsSaving?'Saving and verifying…':settingsSaveError||(settingsDirty?'Changes not saved yet':settingsVerifiedJustNow?'✓ Saved and applied on this computer':'Settings saved on this computer');button.disabled=settingsSaving;button.textContent=settingsSaving?'Saving…':'Save settings'}
+function markSettingsDirty(){if(!$('settingsDialog').open||appearanceApplying)return;settingsSaveError=null;settingsVerifiedJustNow=false;settingsDirty=JSON.stringify(captureSettings())!==JSON.stringify(savedSettings);updateSaveState();$('anomalyStatus').textContent=settingsDirty?'Changes are being previewed. Select Save settings to apply them to Statistics.':'Original recordings are never changed by either speed filter.';updateAnomalySummary()}
+function closeSettings(){if(settingsSaving)return;if(settingsDirty){if(!confirm('Discard unsaved settings changes?'))return;applyAppearance(savedSettings.appearance);$('filterSpeedAnomalies').checked=savedSettings.filter_speed_anomalies;$('filterSpeedSmart').checked=savedSettings.filter_speed_smart;$('advancedData').checked=savedSettings.advanced_data;settingsDirty=false;updateSaveState()}$('settingsDialog').close()}
+for(const name of ['filterSpeedAnomalies','filterSpeedSmart','advancedData'])$(name).addEventListener('change',markSettingsDirty);
+$('openSettings').onclick=async()=>{
+ if(prefTimer){clearTimeout(prefTimer);prefTimer=null;try{await enqueueAppearance(captureAppearance())}catch(e){console.warn('Preference save failed:',e.message)}}
+ try{await prefSequence}catch(e){}
+ try{const stored=await getJson('/api/settings');$('filterSpeedAnomalies').checked=stored.filter_speed_anomalies;$('filterSpeedSmart').checked=stored.filter_speed_smart;$('advancedData').checked=stored.advanced_data;savedSettings=stored;applyAppearance(stored.appearance)}
+ catch(e){savedSettings=captureSettings();showSettingsStatus('Could not verify saved preferences: '+e.message,true)}
+ settingsDirty=false;settingsSaving=false;settingsSaveError=null;settingsVerifiedJustNow=false;updateSaveState();$('settingsDialog').showModal();updateAnomalySummary();
+ try{const d=await getJson('/api/system');$('dataFolder').textContent=d.data_directory;$('dataFile').textContent=d.database;$('installedVersion').textContent=d.version}catch(e){showSettingsStatus('Could not read local storage path: '+e.message,true)}
+};
 $('closeSettings').onclick=closeSettings;
 $('settingsDialog').addEventListener('cancel',e=>{e.preventDefault();closeSettings()});
 $('defaultMap').onchange=()=>{chooseMap($('defaultMap').value);markSettingsDirty()};
 $('palette').addEventListener('change',markSettingsDirty);
-$('saveSettings').onclick=async()=>{if(!settingsDirty||settingsSaving)return;settingsSaveError=null;settingsSaving=true;updateSaveState();try{clearTimeout(prefTimer);const p=captureAppearance();savedSettings=await enqueueAppearance(p);settingsDirty=false;showSettingsStatus('Appearance preferences saved locally.')}catch(e){settingsSaveError='Save failed. Retry to save changes.';showSettingsStatus('Could not save appearance: '+e.message,true)}finally{settingsSaving=false;updateSaveState()}};
-$('resetAppearance').onclick=()=>{applyAppearance({mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84});markSettingsDirty();showSettingsStatus('Defaults previewed. Select Save changes to keep them.')};
+$('saveSettings').onclick=async()=>{if(settingsSaving)return;settingsSaveError=null;settingsSaving=true;updateSaveState();try{
+ clearTimeout(prefTimer);const payload=captureSettings();const response=await fetch('/api/settings',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(payload),cache:'no-store'});
+ const result=await response.json();if(!response.ok)throw Error(result.error||'Could not save settings');
+ const verified=await getJson('/api/settings');if(JSON.stringify(verified)!==JSON.stringify(payload))throw Error('Saved settings could not be verified; please retry');
+ savedSettings=verified;settingsDirty=false;settingsVerifiedJustNow=true;applyAppearance(verified.appearance);showSettingsStatus('Settings saved, verified, and applied on this computer.');$('anomalyStatus').textContent='Saved speed filters are active in Statistics and Analytics. Original activity records remain unchanged.';await updateAnomalySummary();if($('statsDialog').open)await refreshInsights();
+ }catch(e){settingsSaveError='Save could not be confirmed. Please retry.';settingsDirty=true;showSettingsStatus('Settings verification failed: '+e.message,true)}finally{settingsSaving=false;updateSaveState()}};
+$('resetAppearance').onclick=()=>{applyAppearance({mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84});markSettingsDirty();showSettingsStatus('Defaults previewed. Select Save settings to keep them.')};
 async function protectedAction(endpoint){const response=await fetch(endpoint,{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN},cache:'no-store'});let data={};try{data=await response.json()}catch(e){}if(!response.ok)throw Error(data.error||('Request failed: '+response.status));return data}
 function showSettingsStatus(message,error=false){$('settingsStatus').textContent=message;$('settingsStatus').classList.toggle('error',error)}
 $('clearViewCache').onclick=async()=>{const button=$('clearViewCache');button.disabled=true;try{await protectedAction('/api/cache/clear-view');loadedKey='';previousGeometry=null;++state.generation;showSettingsStatus('Temporary map calculations cleared. Reloading the view.');scheduleData()}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
@@ -2358,8 +3474,7 @@ $('clearActivities').onclick=async()=>{if(!state.known){showSettingsStatus('Ther
 $('openDataFolder').onclick=async()=>{try{await protectedAction('/api/system/open-folder');showSettingsStatus('Opened your local data folder.')}catch(e){showSettingsStatus(e.message,true)}};
 $('checkUpdate').onclick=async()=>{const b=$('checkUpdate');b.disabled=true;$('installUpdate').disabled=true;$('releaseLink').hidden=true;$('updateStatus').textContent='Checking GitHub releases…';try{const d=await protectedAction('/api/update/check');$('updateStatus').textContent='Installed '+d.installed+' · Latest '+d.latest+'. '+d.message;$('installUpdate').disabled=!d.installable;$('releaseLink').href=d.release_url;$('releaseLink').hidden=false}catch(e){$('updateStatus').textContent='Update check unavailable: '+e.message}finally{b.disabled=false}};
 $('installUpdate').onclick=async()=>{if(!confirm('Install the verified LibreHeatmaps release? This backs up the existing application files and preserves imported data. Close and relaunch the app after installation.'))return;const b=$('installUpdate');b.disabled=true;$('updateStatus').textContent='Downloading and verifying release…';try{const d=await protectedAction('/api/update/install');$('updateStatus').textContent=d.message}catch(e){$('updateStatus').textContent='Update not installed: '+e.message}};
-window.addEventListener('resize',()=>updateMap());loadPreferences().then(()=>refreshStats(true)).then(()=>tileMap()).catch(e=>{$('mapDetail').textContent=e.message});updatePrivacy();
-// Contextual help for all parts of the local viewer. Help buttons never invoke the underlying action.
+window.addEventListener('resize',()=>updateMap());loadPreferences().then(async()=>{const saved=await getJson('/api/settings');advancedDataEnabled=!!saved.advanced_data;await refreshStats(true)}).then(()=>tileMap()).catch(e=>{$('mapDetail').textContent=e.message});updatePrivacy();
 const LH_HELP={
  'LibreHeatmaps':'LibreHeatmaps is a local-first GPS heatmap viewer. Import activities from a Strava ZIP, FIT, GPX, or TCX file to explore routes and trends without uploading your activity database. Optional online map tiles contact the selected provider.',
  'Import activities':'Choose a complete Strava account export ZIP without extracting it, or a CSV, FIT, GPX, or TCX file. Imports are processed locally. Reimporting matching activities updates available details rather than adding duplicate routes.',
@@ -2383,7 +3498,7 @@ const LH_HELP={
  'Start date':'Show only map activities on or after this recorded date. Leave blank for no start-date restriction.',
  'End date':'Show only map activities on or before this recorded date. Leave blank for no end-date restriction.',
  'Activity insights':'Open the local activity dashboard to explore totals, performance highlights, time trends, and individual GPS routes.',
- 'Export':'Save the selected GPS data to your computer. GPX exports track coordinates; PNG exports rendered route overlays without the third-party background tiles.',
+ 'Export':'Export filtered GPS tracks or create a framed, high-resolution heatmap PNG. The PNG editor saves your selected geographic area without third-party background tiles.',
  'Your GPS heatmap':'The map combines imported routes and color-coded visit intensity. The number of matching activities depends on the current map area and filters; zooming changes the viewed area, not your stored routes.',
  'Heatmap legend':'The color scale goes from lower to higher relative visit frequency in the currently selected view. White or the lightest color indicates the most frequented segments for that view, not a fixed number of visits.',
  'Heat colors':'Choose the color palette used to represent less- and more-traveled GPS routes. This affects presentation only, not recorded visits or distance.',
@@ -2454,11 +3569,19 @@ const LH_HELP={
  'Delete all imported activities':'Permanently clear all imported activities and associated statistics from the LibreHeatmaps local database. Your original export files remain wherever you saved them; reimport to restore the data.',
  'Local data location':'The computer folders containing your local SQLite database and related application files. These paths are shown so you can back up your own data.',
  'Open local data folder':'Open the app’s storage folder in the operating system file manager. This exposes your local database and log without sending them online.',
+ 'Average speed over time':'A chronological comparison of average speed for entire activities. Each point represents one ride, not second-by-second GPS speed.',
+ 'Monthly speed trends':'Arithmetic average of eligible activity-average speeds for each month. The chart compares rides rather than combining their distances into one weighted speed.',
+ 'Speed vs. moving time':'Compare each activity’s overall average speed with its recorded moving duration. Each dot represents one activity and does not show acceleration within a ride.',
+ 'Distance over time':'Distance traveled in each imported activity plotted by recording date, using Strava distance when available and sampled GPS distance otherwise.',
+ 'Distance vs. moving time':'Compares whole-activity distances with moving durations; useful for seeing longer or shorter trips at different effort levels.',
+ 'Monthly time on the move':'Total recorded moving time per calendar month. Activities without moving-time information do not contribute to the total.',
+ 'Statistics & data quality':'Choose between the optional 50 mph cycling threshold and a separate experimental comparison with your own riding history. Filters affect speed calculations and charts, not the recorded GPS routes or other totals. Both start turned off.',
+ 'Speed & activity patterns':'These charts compare the average speed of whole activities with calendar dates and moving duration. They are not instantaneous speed traces. Activities without reliable distance or moving time are omitted.',
  'Software update':'Updates are checked manually against the project’s published GitHub releases and verified with SHA-256 before installation. Your activity database is kept separately.',
  'Check for updates':'Contact the GitHub release endpoint to see whether a newer version exists. No GPS activity files or database records are uploaded.',
  'Install a verified release':'Install a downloaded release only after its SHA-256 matches the published digest. App files are backed up, and your local activity database is preserved.',
  'Save changes':'Save the previewed appearance preferences locally so they persist after restarting LibreHeatmaps.',
- 'Explore everywhere you’ve been':'The map is empty until an activity with GPS coordinates is imported. A complete Strava export ZIP can be selected directly; no manual extraction is needed.',
+ 'Explore everywhere you’ve been':'The map is empty until an activity with GPS coordinates is imported. A complete Strava or Garmin account ZIP can be selected directly; no manual extraction is needed.',
  'Welcome to LibreHeatmaps':'First-launch guide to importing your GPS history. You can import a complete Strava ZIP or individual FIT, GPX, or TCX files; everything is processed on your computer.',
  'Have a Strava account?':'Strava can export a ZIP of your account history. Download it from your Strava account settings and select the whole ZIP without unzipping it.',
  'Export GPX':'Download the currently filtered activity tracks as a GPX file. This is an on-device export; it does not include the third-party basemap.',
@@ -2469,10 +3592,72 @@ const LH_HELP={
  'Import my GPS data':'Open a local file chooser to import a Strava account ZIP or individual activity tracks. Your files are processed locally.',
  'Loading map data':'Calculating the currently visible heatmap. The existing route overlay remains geographically aligned while updated visit-density colors are prepared.'
 };
+const ADVANCED_DATA_FIELDS={calories_kcal:'Calories',avg_temp_c:'Device temperature',max_temp_c:'Max device temperature',weather_temp_c:'Weather temperature',wind_speed_mps:'Wind speed',wind_gust_mps:'Wind gust',humidity_pct:'Humidity',avg_cadence:'Average cadence',max_power:'Max power',weather_condition:'Weather conditions'};
+let advancedDataEnabled=false;
+const DATA_FIELDS={
+ day:'Date',name:'Activity',sport:'Type',distance_m:'Distance',moving_seconds:'Moving time',
+ elapsed_seconds:'Elapsed time',avg_speed:'Average speed',max_speed:'Peak speed',
+ avg_heart_rate:'Heart rate',avg_power:'Average power',elevation_m:'Elevation gain',
+ bike:'Gear',filename:'Source file',point_count:'GPS points',id:'Local ID',...ADVANCED_DATA_FIELDS
+};
+const DATA_DEFAULT=['day','name','sport','distance_m','moving_seconds','elapsed_seconds','avg_speed','max_speed','avg_heart_rate','avg_power','elevation_m','bike'];
+let dataCols=[...DATA_DEFAULT];
+try{const stored=JSON.parse(localStorage.getItem('lh-data-columns-v1')||'null');if(Array.isArray(stored)&&stored.length&&new Set(stored).size===stored.length&&stored.every(c=>DATA_FIELDS[c]))dataCols=stored}catch(e){}
+let dataPage=1,dataTotal=0,dataSort='day',dataDirection='desc',dataRequest=0,dataPending=null,dataTimer=0;
+function tableSaveColumns(){try{localStorage.setItem('lh-data-columns-v1',JSON.stringify(dataCols))}catch(e){}}
+function dataMakeColumns(){const root=$('dataColumns');root.replaceChildren();for(const [key,label] of Object.entries(DATA_FIELDS).filter(([key])=>advancedDataEnabled||!(key in ADVANCED_DATA_FIELDS))){
+ const row=document.createElement('label'),input=document.createElement('input'),text=document.createElement('span');input.type='checkbox';input.value=key;input.checked=dataCols.includes(key);text.textContent=label;input.onchange=()=>{
+  if(!input.checked&&dataCols.length===1){input.checked=true;return}
+  dataCols=input.checked?[...dataCols,key]:dataCols.filter(c=>c!==key);tableSaveColumns();loadDataTable()};row.append(input,text);root.append(row)
+}}
+function dataVisibleColumns(){return dataCols.filter(key=>advancedDataEnabled||!(key in ADVANCED_DATA_FIELDS))}
+function dataTableQuery(){const p=statsParams();for(const [key,id] of [['q','dataSearch'],['from','dataFrom'],['to','dataTo']]){const value=$(id).value.trim();if(value)p.set(key,value)}p.set('page',String(dataPage));p.set('limit',$('dataPageSize').value);p.set('sort',dataSort);p.set('direction',dataDirection);return p}
+function dataFormat(key,val){if(val===null||val===undefined||val==='')return '—';switch(key){
+ case 'distance_m':return distanceLabel(val);
+ case 'moving_seconds':case 'elapsed_seconds':return timeLabel(val);
+ case 'avg_speed':case 'max_speed':return nice(val*($('units').value==='mi'?2.2369362921:3.6),1)+($('units').value==='mi'?' mph':' km/h');
+ case 'elevation_m':return nice(val*($('units').value==='mi'?3.280839895:1),0)+($('units').value==='mi'?' ft':' m');
+ case 'avg_heart_rate':return nice(val,0)+' bpm';
+ case 'avg_power':case 'max_power':return nice(val,0)+' W';
+ case 'calories_kcal':return nice(val,0)+' kcal';
+ case 'avg_temp_c':case 'max_temp_c':case 'weather_temp_c':return nice($('units').value==='mi'?val*9/5+32:val,1)+($('units').value==='mi'?' °F':' °C');
+ case 'wind_speed_mps':case 'wind_gust_mps':return nice(val*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h');
+ case 'humidity_pct':return nice(val,0)+'%';
+ case 'avg_cadence':return nice(val,0)+' rpm';
+ case 'point_count':return nice(val);
+ default:return String(val)
+}}
+async function loadDataTable(){if(!$('statsDialog').open||$('statsData').hidden)return;
+ const id=++dataRequest,p=dataTableQuery();if(dataPending)dataPending.abort();dataPending=new AbortController();
+ $('dataSummary').textContent='Reading saved activity records…';try{
+ const response=await fetch('/api/activity-table?'+p,{signal:dataPending.signal,cache:'no-store'});
+ if(!response.ok)throw Error((await response.text()).slice(0,180));const data=await response.json();if(id!==dataRequest)return;
+ dataTotal=data.total;
+ const head=$('dataHead'),body=$('dataBody');head.replaceChildren();body.replaceChildren();
+ for(const key of dataVisibleColumns()){const th=document.createElement('th'),sort=document.createElement('button');sort.type='button';sort.textContent=DATA_FIELDS[key]+(dataSort===key?(dataDirection==='asc'?' ↑':' ↓'):'');sort.setAttribute('aria-label','Sort by '+DATA_FIELDS[key]);sort.onclick=()=>{dataDirection=dataSort===key&&dataDirection==='asc'?'desc':'asc';dataSort=key;dataPage=1;loadDataTable()};th.append(sort);head.append(th)}
+ if(!data.rows.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=dataVisibleColumns().length;cell.textContent='No activities match these filters.';row.append(cell);body.append(row)}
+ for(const record of data.rows){const tr=document.createElement('tr');for(const key of dataVisibleColumns()){const td=document.createElement('td'),value=dataFormat(key,record[key]);td.title=value;if(key==='name'){
+  td.className='data-name';const preview=document.createElement('button');preview.type='button';preview.textContent=value;preview.title='Preview '+(record.name||'activity');preview.onclick=()=>openRidePreview(record.id);td.append(preview)
+ }else{td.textContent=value;if(record.speed_excluded&&(key==='max_speed'||key==='avg_speed')){const flag=document.createElement('span');flag.className='data-excluded';flag.textContent='†';flag.title='Excluded from speed statistics by the enabled anomaly filter; raw value is preserved';td.append(flag)}}tr.append(td)}body.append(tr)}
+ const size=Number($('dataPageSize').value),pages=Math.max(1,Math.ceil(dataTotal/size));
+ $('dataSummary').textContent=dataTotal.toLocaleString()+' matching activities · '+dataVisibleColumns().length+' visible columns · missing values shown as —';
+ $('dataPageStatus').textContent='Page '+dataPage.toLocaleString()+' of '+pages.toLocaleString();$('dataPrev').disabled=dataPage<=1;$('dataNext').disabled=dataPage>=pages;
+ }catch(e){if(e.name!=='AbortError'&&id===dataRequest)$('dataSummary').textContent='Unable to load records: '+e.message}
+}
+function scheduleDataTable(){clearTimeout(dataTimer);dataPage=1;dataTimer=setTimeout(loadDataTable,220)}
+for(const id of ['dataSearch','dataFrom','dataTo'])$(id).addEventListener('input',scheduleDataTable);
+$('dataPageSize').onchange=scheduleDataTable;
+$('dataClear').onclick=()=>{for(const id of ['dataSearch','dataFrom','dataTo'])$(id).value='';scheduleDataTable()};
+$('dataResetColumns').onclick=()=>{dataCols=[...DATA_DEFAULT];tableSaveColumns();dataMakeColumns();loadDataTable()};
+$('dataPrev').onclick=()=>{dataPage=Math.max(1,dataPage-1);loadDataTable()};
+$('dataNext').onclick=()=>{dataPage+=1;loadDataTable()};
+$('dataExport').onclick=()=>{const p=dataTableQuery();p.set('columns',dataVisibleColumns().join(','));p.delete('page');p.delete('limit');const link=document.createElement('a');link.href='/api/activity-table.csv?'+p;link.download='LibreHeatmaps-activity-data.csv';document.body.append(link);link.click();link.remove()};
+dataMakeColumns();
+
 const LH_HELP_ALIASES={
- 'Import Strava ZIP, activity, or CSV':'Import activities',
+ 'Import GPS files or account ZIP':'Import activities',
  'Open activity statistics':'Activity insights','Activity statistics':'Activity insights',
- 'Download filtered GPX':'Export GPX','Download routes-only PNG':'Export PNG',
+ 'Download filtered GPX':'Export GPX','Create heatmap PNG':'Export PNG',
  'Clear filters':'Filter activities','Show all activities':'Your GPS heatmap',
  'Close preview':'Activity preview','Close':'Activity insights','Close settings':'Settings',
  'Show all activities':'Your GPS heatmap',
@@ -2508,34 +3693,25 @@ function lhAddCardHelp(target,label,description){if(!target||target.dataset.lhHe
  target.dataset.lhHelpAdded='1';const b=lhHelpButton(label,text);
  if(target.tagName==='BUTTON') {const wrapper=document.createElement('div');wrapper.className='lh-help-cardwrap';target.replaceWith(wrapper);wrapper.append(target,b);target.classList.add('lh-help-card-content')}else {target.classList.add('lh-help-card');target.append(b)}
 }
-function lhAddHeadingHelp(h,label,description){if(!h||h.dataset.lhHelpAdded)return;const t=label||h.textContent.trim(),d=description||lhHelpDescription(t);if(!d)return;h.dataset.lhHelpAdded='1';h.classList.add('lh-help-heading');h.append(lhHelpButton(t,d))}
-function lhAddFieldHelp(field,label,description){if(!field||field.dataset.lhHelpAdded)return;const d=description||lhHelpDescription(label);if(!d)return;field.dataset.lhHelpAdded='1';field.classList.add('lh-help-field');field.append(lhHelpButton(label,d))}
-function lhAddActionHelp(button,label,description){if(!button||button.classList.contains('lh-help-trigger')||button.dataset.lhHelpAdded||button.closest('.lh-help-cardwrap'))return;const text=description||lhHelpDescription(label);if(!text)return;button.dataset.lhHelpAdded='1';
- if(button.matches('[data-stats-tab]')){button.classList.add('lh-help-tab');const mark=document.createElement('span');mark.className='lh-tab-question';mark.textContent='?';mark.setAttribute('aria-hidden','true');button.append(mark);button.addEventListener('pointerenter',()=>lhShowHelp({dataset:{helpLabel:label,helpText:text},getBoundingClientRect:()=>button.getBoundingClientRect(),setAttribute:()=>{},removeAttribute:()=>{}}));button.addEventListener('pointerleave',()=>lhHideHelp());return}
- const wrapper=document.createElement('span');wrapper.className='lh-help-action-wrap';if(button.classList.contains('full')||button.classList.contains('ride-list-item'))wrapper.classList.add('lh-help-action-full');button.replaceWith(wrapper);wrapper.append(button,lhHelpButton(label,text));
-}
-function lhInlineLabelHelp(label,title){if(!label||label.dataset.lhHelpAdded)return;const d=lhHelpDescription(title);if(!d)return;label.dataset.lhHelpAdded='1';const p=label.parentElement;
- if(p&&p.classList.contains('field')){lhAddFieldHelp(p,title,d);return}
- const wrapper=document.createElement('div');wrapper.className=label.classList.contains('toggle')?'lh-help-toggle-wrap':'lh-help-label-wrap';label.replaceWith(wrapper);wrapper.append(label,lhHelpButton(title,d));
-}
-function lhLabelForInput(input){const label=input.closest('label');if(label){const text=label.cloneNode(true);text.querySelectorAll('input,select,output').forEach(n=>n.remove());return text.textContent.trim()||input.getAttribute('aria-label')||''}return document.querySelector('label[for="'+input.id+'"]')?.textContent.trim()||input.getAttribute('aria-label')||''}
 function lhInstallHelp(){
- // Contextual help is deliberately scoped to informative Stats cards and Settings sections.
- // The map, header, navigation, headings, action buttons, and activity previews remain clean.
  document.querySelectorAll('#metricGrid .metric,#facts .record-metric,#milestones .record-metric').forEach(el=>{
   const title=el.querySelector('span')?.textContent.trim()||'';
   lhAddCardHelp(el,title);
  });
- // Explanations belong to the relevant chart/card, not to its title or each row.
  for(const [selector,title] of [
   ['#yearChart','Distance by year'],['#monthChart','Monthly activity'],
   ['#weekdayChart','Activity by weekday'],['#sportSummary','Types & gear'],
+  ['#speedHistoryChart','Typical riding speed'],['#speedDistributionChart','Speed distribution'],
+  ['#speedDurationChart','Speed versus ride duration'],['#distanceHistoryChart','Distance by period'],
+  ['#distanceDistributionChart','Ride distance distribution'],['#distanceDurationChart','Distance versus moving time'],
+  ['#movingHistoryChart','Hours on the move'],['#activityFrequencyChart','How often you ride'],
   ['#recentRoutes','Recently recorded'],['#topRoutes','Longest routes']]){
   const chart=document.querySelector(selector);
   const card=chart?.closest('.insights-content-card');
-  if(card)lhAddCardHelp(card,title);
+  if(card)lhAddCardHelp(card,title,ANALYTICS_SPECS[chart?.id]?.help);
  }
- // These are informational sections in their own right.
+ const explorer=document.querySelector('#statsData .data-columns');
+ if(explorer)lhAddCardHelp(explorer,'Choose visible columns','Select which activity measurements appear in the table. This changes only your personal view; it does not change recorded values. You can sort headings, filter dates or activity names, and export the selected columns. Missing power and heart-rate values are shown as unavailable.');
  const details=document.querySelector('#statsDialog .details-repair');
  if(details)lhAddCardHelp(details,'Add activity details');
  const filter=document.querySelector('#statsDialog .insights-filter-drawer');
@@ -2668,6 +3844,11 @@ def open_local_data_folder():
     return {"status":"opened"}
 
 
+class LocalServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
+
 class Handler(BaseHTTPRequestHandler):
     def valid_local_request(self):
         host = self.headers.get("Host", "")
@@ -2712,6 +3893,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({"version":VERSION,"data_directory":str(DB_PATH.parent),"database":str(DB_PATH),"log":str(DB_PATH.parent/"application.log"),"script":str(Path(__file__).resolve())})
             elif parsed.path == "/api/stats":
                 self.respond(statistics())
+            elif parsed.path == "/api/stat-settings":
+                self.respond(statistics_preferences())
+            elif parsed.path == "/api/settings":
+                self.respond({"appearance":load_appearance() or dict(DEFAULT_APPEARANCE),**statistics_preferences()})
+            elif parsed.path == "/api/activity-table":
+                self.respond(activity_table(params))
+            elif parsed.path == "/api/speed-review":
+                self.respond(speed_review(params))
+            elif parsed.path == "/api/speed-review-summary":
+                self.respond(speed_review_summary())
+            elif parsed.path == "/api/activity-table.csv":
+                self.send_bytes(activity_table(params,True), "text/csv; charset=utf-8")
             elif parsed.path == "/api/insights":
                 self.respond(insights(params))
             elif parsed.path == "/api/activity":
@@ -2720,7 +3913,17 @@ class Handler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     self.respond(dict(JOB))
             elif parsed.path == "/api/view":
-                self.send_bytes(create_view(params))
+                session=self.headers.get("X-LibreHeatmaps-View-Session", "")
+                serial=self.headers.get("X-LibreHeatmaps-View-Serial", "")
+                if session and len(session)<=64 and session.isascii() and session.isalnum() and serial.isdecimal() and 1<=len(serial)<=12:
+                    cancelled=current_view_cancelled(session,int(serial))
+                else:
+                    cancelled=lambda:False
+                try:
+                    self.send_bytes(create_view(params,cancelled))
+                except ViewCancelled:
+                    self.send_response(204)
+                    self.end_headers()
             elif parsed.path == "/api/export.gpx":
                 export_gpx(self, params)
             elif parsed.path in ("/logo.png", "/favicon.ico"):
@@ -2750,6 +3953,50 @@ class Handler(BaseHTTPRequestHandler):
             with db_connect() as con:
                 con.execute("INSERT OR REPLACE INTO app_settings (key,value) VALUES (?,?)", ("welcome_dismissed", "1"))
             self.respond({"ok":True})
+            return
+        if endpoint == "/api/speed-exception":
+            origin = self.headers.get("Origin", "")
+            if self.headers.get("X-LibreHeatmaps-Token") != TOKEN or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
+                self.respond({"error":"Forbidden"},403)
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 2 <= size <= 256:
+                    raise ValueError('Invalid exception request size')
+                payload = json.loads(self.rfile.read(size).decode('utf-8'))
+                if not isinstance(payload, dict) or set(payload) != {'activity_id', 'included'}:
+                    raise ValueError('Invalid speed exception fields')
+                self.respond(set_speed_exception(payload['activity_id'], payload['included']))
+            except (ValueError, UnicodeDecodeError, sqlite3.Error) as exc:
+                self.respond({'error':str(exc)[:200]},400)
+            return
+        if endpoint == "/api/settings":
+            origin = self.headers.get("Origin", "")
+            if self.headers.get("X-LibreHeatmaps-Token") != TOKEN or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
+                self.respond({"error":"Forbidden"},403)
+                return
+            try:
+                size=int(self.headers.get("Content-Length","0"))
+                if not 2<=size<=4096:raise ValueError('Invalid settings size')
+                data=json.loads(self.rfile.read(size).decode('utf-8'))
+                self.respond(store_all_settings(data))
+            except (ValueError,UnicodeDecodeError,sqlite3.Error) as exc:
+                self.respond({"error":str(exc)[:200]},400)
+            return
+        if endpoint == "/api/stat-settings":
+            origin = self.headers.get("Origin", "")
+            if self.headers.get("X-LibreHeatmaps-Token") != TOKEN or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
+                self.respond({"error":"Forbidden"},403)
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 2 <= size <= 512: raise ValueError("Invalid statistics settings request")
+                data = json.loads(self.rfile.read(size).decode('utf-8'))
+                if not isinstance(data,dict) or type(data.get('filter_speed_anomalies')) is not bool:
+                    raise ValueError('Expected a true or false value')
+                self.respond({"filter_speed_anomalies":set_anomaly_filter(data['filter_speed_anomalies'])})
+            except (ValueError,UnicodeDecodeError,sqlite3.Error) as exc:
+                self.respond({"error":str(exc)[:200]},400)
             return
         if endpoint == "/api/preferences":
             origin = self.headers.get("Origin", "")
@@ -2798,6 +4045,7 @@ class Handler(BaseHTTPRequestHandler):
                     with connection:
                         removed = connection.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
                         connection.execute("DELETE FROM activities")
+                        connection.execute("DELETE FROM speed_filter_exceptions")
                 except sqlite3.Error:
                     self.respond({"error": "Unable to clear local activities"}, 500)
                     return
@@ -2811,24 +4059,55 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({"status": "cleared", "deleted": removed})
             return
         if endpoint in ("/api/ping", "/api/leave", "/api/shutdown"):
+            global CLIENT_SEEN, CLIENT_EMPTY_SINCE
             origin = self.headers.get("Origin", "")
-            if self.headers.get("X-LibreHeatmaps-Token") != TOKEN or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
+            if origin and origin != "http://127.0.0.1:{}".format(self.server.server_port):
                 self.respond({"error": "Forbidden"}, 403)
                 return
             if endpoint == "/api/shutdown":
+                if self.headers.get("X-LibreHeatmaps-Token") != TOKEN:
+                    self.respond({"error": "Forbidden"}, 403)
+                    return
+                with STATE_LOCK:
+                    if JOB["status"] == "running":
+                        self.respond({"error": "Finish importing activities before exiting"}, 409)
+                        return
                 self.respond({"status": "closing"})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            length = min(128, max(0, int(self.headers.get("Content-Length", "0"))))
-            client_id = self.rfile.read(length).decode("ascii", errors="ignore")
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.respond({"error": "Invalid client request"}, 400)
+                return
+            if not 4 <= length <= 160:
+                self.respond({"error": "Invalid client request"}, 400)
+                return
+            data = self.rfile.read(length).decode("ascii", errors="ignore")
+            if endpoint == "/api/leave" and "\n" in data:
+                submitted_token, client_id = data.split("\n", 1)
+                authenticated = hmac.compare_digest(submitted_token, TOKEN)
+            else:
+                client_id = data
+                authenticated = self.headers.get("X-LibreHeatmaps-Token") == TOKEN
+            if not authenticated:
+                self.respond({"error": "Forbidden"}, 403)
+                return
             if len(client_id) < 4 or len(client_id) > 80 or not client_id.isalnum():
                 self.respond({"error": "Invalid client ID"}, 400)
                 return
             with CLIENT_LOCK:
+                now = time.monotonic()
                 if endpoint == "/api/ping":
-                    ACTIVE_CLIENTS[client_id] = time.monotonic()
+                    if client_id not in DEPARTED_CLIENTS:
+                        ACTIVE_CLIENTS[client_id] = now
+                        CLIENT_SEEN = True
+                        CLIENT_EMPTY_SINCE = None
                 else:
+                    DEPARTED_CLIENTS[client_id] = now
                     ACTIVE_CLIENTS.pop(client_id, None)
+                    if CLIENT_SEEN and not ACTIVE_CLIENTS and CLIENT_EMPTY_SINCE is None:
+                        CLIENT_EMPTY_SINCE = now
             self.respond({"ok": True})
             return
         if endpoint != "/api/import":
@@ -2849,7 +4128,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid file size")
             filename = unquote(self.headers.get("X-File-Name", "")).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             if not filename.lower().endswith((".zip", ".csv") + FORMATS):
-                raise ValueError("Select a Strava ZIP, activities.csv, FIT, GPX or TCX file")
+                raise ValueError("Select a Strava or Garmin account ZIP, activities.csv, FIT, GPX or TCX file")
             fd, temporary = tempfile.mkstemp(prefix="libreheatmaps-import-", suffix=".tmp", dir=str(DB_PATH.parent))
             with os.fdopen(fd, "wb") as output:
                 remaining = length
@@ -2874,19 +4153,47 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def idle_watcher(server):
+    global CLIENT_EMPTY_SINCE
     while True:
-        time.sleep(10)
+        time.sleep(1)
+        now = time.monotonic()
         with CLIENT_LOCK:
-            now = time.monotonic()
-            expired = [key for key, stamp in ACTIVE_CLIENTS.items() if now - stamp > 42]
-            for key in expired:
-                ACTIVE_CLIENTS.pop(key, None)
+            for key, stamp in list(ACTIVE_CLIENTS.items()):
+                if now - stamp > 28:
+                    ACTIVE_CLIENTS.pop(key, None)
+            for key, stamp in list(DEPARTED_CLIENTS.items()):
+                if now - stamp > 120:
+                    DEPARTED_CLIENTS.pop(key, None)
             active = bool(ACTIVE_CLIENTS)
-        with STATE_LOCK:
-            busy = JOB["status"] == "running"
-        if not active and not busy and now - SERVER_STARTED > 90:
-            server.shutdown()
-            return
+            if not active and CLIENT_SEEN and CLIENT_EMPTY_SINCE is None:
+                CLIENT_EMPTY_SINCE = now
+            idle_for = now - CLIENT_EMPTY_SINCE if CLIENT_EMPTY_SINCE is not None else 0
+            should_close = (CLIENT_SEEN and not active and idle_for >= 5) or (not CLIENT_SEEN and now - SERVER_STARTED >= 90)
+        if should_close:
+            with STATE_LOCK:
+                busy = JOB["status"] == "running"
+            if not busy:
+                server.shutdown()
+                return
+
+
+def shutdown_heat_workers():
+    global HEAT_WORKERS
+    with HEAT_WORKERS_LOCK:
+        executor = HEAT_WORKERS
+        HEAT_WORKERS = None
+    if executor is None:
+        return
+    processes = list((getattr(executor, "_processes", None) or {}).values())
+    executor.shutdown(wait=False, cancel_futures=True)
+    for process in processes:
+        process.join(timeout=0.25)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.75)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=0.5)
 
 
 def main():
@@ -2913,8 +4220,9 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     DB_PATH = data_dir / "activities.sqlite3"
     init_db()
+    start_heat_warmup()
     SERVER_STARTED = time.monotonic()
-    with ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as server:
+    with LocalServer(("127.0.0.1", args.port), Handler) as server:
         url = "http://127.0.0.1:{}".format(server.server_port)
         print("\nLibreHeatmaps {}".format(VERSION), flush=True)
         print("Open {} in your browser".format(url), flush=True)
@@ -2927,6 +4235,8 @@ def main():
             server.serve_forever(poll_interval=.25)
         except KeyboardInterrupt:
             print("\nClosing LibreHeatmaps.")
+        finally:
+            shutdown_heat_workers()
 
 
 LOGO_PNG = base64.b64decode(
