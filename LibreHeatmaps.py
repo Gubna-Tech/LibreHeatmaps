@@ -60,6 +60,7 @@ UPDATE_READY = None
 UPDATE_LOCK = threading.Lock()
 RELEASE_REPO = "Gubna-Tech/LibreHeatmaps"
 ACTIVE_CLIENTS = {}
+LIVE_CONNECTIONS = {}
 DEPARTED_CLIENTS = {}
 CLIENT_LOCK = threading.RLock()
 CLIENT_SEEN = False
@@ -3412,12 +3413,13 @@ $('captureSave').onclick=()=>{if(!captureView.data||$('captureSave').disabled)re
 window.addEventListener('resize',()=>{if($('captureDialog').open)captureRequest(110)});
 
 let CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);
-let clientHeartbeat=null;
-function ping(){fetch('/api/ping',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,cache:'no-store'}).catch(()=>{})}
-function startClientHeartbeat(){clearInterval(clientHeartbeat);ping();clientHeartbeat=setInterval(ping,12000)}
-function leaveClient(){clearInterval(clientHeartbeat);clientHeartbeat=null;const body=TOKEN+'\\n'+CLIENT_ID;if(navigator.sendBeacon&&navigator.sendBeacon('/api/leave',new Blob([body],{type:'text/plain'})))return;fetch('/api/leave',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,keepalive:true}).catch(()=>{})}
+let clientHeartbeat=null,clientStream=null,clientLeaving=false;
+function ping(){if(!clientLeaving)fetch('/api/ping',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,cache:'no-store'}).catch(()=>{})}
+function startClientHeartbeat(){clientLeaving=false;clearInterval(clientHeartbeat);if(clientStream)clientStream.close();ping();clientHeartbeat=setInterval(ping,6000);if(typeof EventSource!=='undefined')clientStream=new EventSource('/api/live?id='+encodeURIComponent(CLIENT_ID)+'&auth='+encodeURIComponent(TOKEN))}
+function leaveClient(){if(clientLeaving)return;clientLeaving=true;clearInterval(clientHeartbeat);clientHeartbeat=null;if(clientStream){clientStream.close();clientStream=null}const body=TOKEN+'\\n'+CLIENT_ID;if(navigator.sendBeacon&&navigator.sendBeacon('/api/leave',new Blob([body],{type:'text/plain'})))return;fetch('/api/leave',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,keepalive:true}).catch(()=>{})}
 startClientHeartbeat();
 window.addEventListener('pagehide',leaveClient);
+window.addEventListener('beforeunload',leaveClient);
 window.addEventListener('pageshow',e=>{if(e.persisted){CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);startClientHeartbeat()}});
 $('shutdown').onclick=async()=>{if(!confirm('Close the local LibreHeatmaps application?'))return;try{const res=await fetch('/api/shutdown',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN}});if(!res.ok){const info=await res.json();alert(info.error||'Unable to exit right now');return}}catch(e){alert('Unable to contact the local application.');return}clearInterval(clientHeartbeat);document.body.replaceChildren();const d=document.createElement('div');d.style.cssText='font:16px system-ui;color:#ddd;background:#160d27;min-height:100vh;display:grid;place-items:center';d.textContent='LibreHeatmaps has stopped. You can close this tab.';document.body.append(d)};
 let savedSettings=null,settingsDirty=false,settingsSaving=false,settingsSaveError=null,settingsVerifiedJustNow=false,prefTimer=null,prefSequence=Promise.resolve(),appearanceApplying=false,anomalySummaryRequest=0;
@@ -3879,11 +3881,60 @@ class Handler(BaseHTTPRequestHandler):
     def respond(self, payload, code=200):
         self.send_bytes(json.dumps(payload, separators=(",", ":")).encode(), code=code)
 
+    def serve_client_stream(self, params):
+        global CLIENT_SEEN, CLIENT_EMPTY_SINCE
+        client_id = params.get("id", [""])[0]
+        supplied = params.get("auth", [""])[0]
+        origin = self.headers.get("Origin", "")
+        if not hmac.compare_digest(supplied, TOKEN) or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
+            self.respond({"error": "Forbidden"}, 403)
+            return
+        if not 4 <= len(client_id) <= 80 or not client_id.isalnum():
+            self.respond({"error": "Invalid client ID"}, 400)
+            return
+        stream_id = object()
+        with CLIENT_LOCK:
+            if client_id in DEPARTED_CLIENTS:
+                self.respond({"error": "Closed session"}, 409)
+                return
+            LIVE_CONNECTIONS[client_id] = stream_id
+            ACTIVE_CLIENTS[client_id] = time.monotonic()
+            CLIENT_SEEN = True
+            CLIENT_EMPTY_SINCE = None
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"retry: 1000\n\n")
+            while True:
+                self.wfile.write(b": active\n\n")
+                self.wfile.flush()
+                with CLIENT_LOCK:
+                    if client_id in DEPARTED_CLIENTS or LIVE_CONNECTIONS.get(client_id) is not stream_id:
+                        break
+                    ACTIVE_CLIENTS[client_id] = time.monotonic()
+                time.sleep(1)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            with CLIENT_LOCK:
+                if LIVE_CONNECTIONS.get(client_id) is stream_id:
+                    LIVE_CONNECTIONS.pop(client_id, None)
+                    ACTIVE_CLIENTS.pop(client_id, None)
+                    if CLIENT_SEEN and not ACTIVE_CLIENTS and CLIENT_EMPTY_SINCE is None:
+                        CLIENT_EMPTY_SINCE = time.monotonic()
+
     def do_GET(self):
         if not self.valid_local_request():
             return
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+        if parsed.path == "/api/live":
+            self.serve_client_stream(params)
+            return
         try:
             if parsed.path == "/":
                 self.send_bytes(PAGE.replace('__APP_TOKEN__', TOKEN).encode(), "text/html; charset=utf-8")
@@ -4159,7 +4210,7 @@ def idle_watcher(server):
         now = time.monotonic()
         with CLIENT_LOCK:
             for key, stamp in list(ACTIVE_CLIENTS.items()):
-                if now - stamp > 28:
+                if now - stamp > 18:
                     ACTIVE_CLIENTS.pop(key, None)
             for key, stamp in list(DEPARTED_CLIENTS.items()):
                 if now - stamp > 120:
@@ -4168,7 +4219,7 @@ def idle_watcher(server):
             if not active and CLIENT_SEEN and CLIENT_EMPTY_SINCE is None:
                 CLIENT_EMPTY_SINCE = now
             idle_for = now - CLIENT_EMPTY_SINCE if CLIENT_EMPTY_SINCE is not None else 0
-            should_close = (CLIENT_SEEN and not active and idle_for >= 5) or (not CLIENT_SEEN and now - SERVER_STARTED >= 90)
+            should_close = (CLIENT_SEEN and not active and idle_for >= 3) or (not CLIENT_SEEN and now - SERVER_STARTED >= 24)
         if should_close:
             with STATE_LOCK:
                 busy = JOB["status"] == "running"
@@ -4230,7 +4281,9 @@ def main():
         if args.background:
             threading.Thread(target=idle_watcher, args=(server,), daemon=True).start()
         if not args.no_browser:
-            threading.Timer(0.65, lambda: webbrowser.open(url)).start()
+            browser_launch = threading.Timer(0.65, lambda: webbrowser.open(url))
+            browser_launch.daemon = True
+            browser_launch.start()
         try:
             server.serve_forever(poll_interval=.25)
         except KeyboardInterrupt:
