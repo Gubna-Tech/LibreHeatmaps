@@ -15,12 +15,15 @@ import os
 from pathlib import Path
 import secrets
 import subprocess
+import shutil
+import socket
 import sys
 import time
 import sqlite3
 import struct
 import tempfile
 import threading
+import traceback
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import ExitStack
 import multiprocessing
@@ -34,7 +37,7 @@ import webbrowser
 import zipfile
 import zlib
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 FORMATS = (".fit", ".fit.gz", ".gpx", ".gpx.gz", ".tcx", ".tcx.gz")
 MAX_MEMBER = 512 * 1024 * 1024
 MAX_UPLOAD = 8 * 1024 * 1024 * 1024
@@ -136,6 +139,7 @@ def keep_telemetry_sample(summary, sample):
 
 
 def store_telemetry(con, activity_id, info):
+    if con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone():return
     samples=info.get('_telemetry')
     if not samples:return
     payload=zlib.compress(json.dumps(samples,separators=(',',':'),allow_nan=False).encode(),6)
@@ -202,7 +206,11 @@ def points_fit(stream, summary=None):
                 at = 0
                 for number, size, base in fields:
                     fmt = {1: "b", 2: "B", 4: "H", 6: "I", 5: "i"}.get(base & 31)
-                    session_fields = {7: ("elapsed_seconds", 1000), 8: ("moving_seconds", 1000), 9: ("recorded_distance_m", 100), 11: ("calories_kcal", 1), 14: ("avg_speed", 1000), 15: ("max_speed", 1000), 16: ("avg_heart_rate", 1), 18: ("avg_cadence", 1), 20: ("avg_power", 1), 21: ("max_power", 1), 22: ("elevation_m", 1), 57: ("avg_temp_c", 1), 58: ("max_temp_c", 1)}
+                    session_fields = {7: ("elapsed_seconds", 1000), 8: ("moving_seconds", 1000), 9: ("recorded_distance_m", 100), 11: ("calories_kcal", 1), 14: ("avg_speed", 1000), 15: ("max_speed", 1000), 16: ("avg_heart_rate", 1), 18: ("avg_cadence", 1), 19: ("max_cadence", 1), 10: ("total_cycles", 1), 17: ("max_heart_rate", 1), 20: ("avg_power", 1), 21: ("max_power", 1), 22: ("elevation_m", 1), 34: ("normalized_power", 1), 35: ("training_stress_score", 10), 36: ("intensity_factor", 1000), 57: ("avg_temp_c", 1), 58: ("max_temp_c", 1)}
+                    if number == 5 and size == 1 and (base & 31) == 0:
+                        sport_name = {1:"Run",2:"Ride",5:"Swim",11:"Walk"}.get(record[at])
+                        if sport_name and not summary.get('sport'):
+                            summary['sport'] = sport_name
                     if number in session_fields and fmt and size == struct.calcsize(fmt):
                         raw = struct.unpack(endian + fmt, record[at:at + size])[0]
                         invalid = -(1 << (8*size-1)) if fmt.islower() else (1 << (8*size))-1
@@ -832,7 +840,7 @@ def strava_activity_id(filename):
     return match.group(1) if match else None
 
 
-ADV_NUM_FIELDS=("calories_kcal","avg_temp_c","max_temp_c","weather_temp_c","wind_speed_mps","wind_gust_mps","humidity_pct","avg_cadence","max_power")
+ADV_NUM_FIELDS=("calories_kcal","avg_temp_c","max_temp_c","weather_temp_c","wind_speed_mps","wind_gust_mps","humidity_pct","avg_cadence","max_power","max_cadence","total_cycles","normalized_power","training_stress_score","intensity_factor","max_heart_rate")
 
 
 def db_connect():
@@ -880,28 +888,38 @@ def init_db():
         con.execute("CREATE INDEX IF NOT EXISTS activity_day_idx ON activities(day)")
         con.execute("CREATE INDEX IF NOT EXISTS activity_day_distance_idx ON activities(day,distance_m)")
         con.execute("CREATE TABLE IF NOT EXISTS archived_duplicates (archive_id INTEGER PRIMARY KEY AUTOINCREMENT, original_id INTEGER NOT NULL, kept_id INTEGER NOT NULL, archived_at TEXT NOT NULL, metadata TEXT NOT NULL, coordinates BLOB NOT NULL, telemetry BLOB, telemetry_samples INTEGER, speed_exception INTEGER)")
+        con.execute("CREATE TABLE IF NOT EXISTS activity_overrides (activity_id INTEGER PRIMARY KEY, originals TEXT NOT NULL, values_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS activity_edit_log (id INTEGER PRIMARY KEY, activity_id INTEGER NOT NULL, changed_at TEXT NOT NULL, previous TEXT NOT NULL, updated TEXT NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS activity_route_repairs (activity_id INTEGER PRIMARY KEY, original_coordinates BLOB NOT NULL, original_point_count INTEGER NOT NULL, original_distance_m REAL NOT NULL, original_bbox TEXT NOT NULL, original_telemetry BLOB, original_telemetry_count INTEGER, edits TEXT NOT NULL, applied_at TEXT NOT NULL)")
         con.execute("CREATE TABLE IF NOT EXISTS heatmap_track_cache (activity_id INTEGER PRIMARY KEY, source_digest TEXT NOT NULL, payload BLOB NOT NULL)")
         con.execute("CREATE TABLE IF NOT EXISTS heatmap_view_cache (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, digest TEXT NOT NULL, payload BLOB NOT NULL, used INTEGER NOT NULL DEFAULT 0)")
 
 
 
-DEFAULT_APPEARANCE = {"mode":"dark","online":True,"palette":"classic","routes":True,"heat":True,"radius":5,"definition":78,"intensity":120,"opacity":84}
+DEFAULT_APPEARANCE = {"mode":"dark","online":True,"palette":"classic","routes":True,"heat":True,"radius":5,"definition":78,"intensity":120,"opacity":84,"bike_routes":False,"bike_tint_color":"#54dc96"}
 
 
 def normalize_appearance(value):
-    if not isinstance(value, dict) or set(value) - set(DEFAULT_APPEARANCE):
+    retired = {"bike_source", "bike_paths", "bike_lanes", "bike_trails", "bike_path_color", "bike_lane_color", "bike_trail_color", "bike_path_width", "bike_lane_width", "bike_trail_width", "bike_opacity"}
+    if not isinstance(value, dict) or set(value) - set(DEFAULT_APPEARANCE) - retired:
         raise ValueError("Invalid appearance settings")
     result = dict(DEFAULT_APPEARANCE)
     for key, item in value.items():
+        if key in retired:
+            continue
         if key == "mode":
             if item not in ("dark", "light", "satellite"):
                 raise ValueError("Invalid map background")
         elif key == "palette":
             if item not in ("classic", "ember", "violet", "ocean", "forest"):
                 raise ValueError("Invalid heat palette")
-        elif key in ("online", "routes", "heat"):
+        elif key in ("online", "routes", "heat", "bike_routes"):
             if not isinstance(item, bool):
                 raise ValueError("Invalid toggle setting")
+        elif key == "bike_tint_color":
+            if not isinstance(item, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", item):
+                raise ValueError("Invalid cycling line color")
+            item = item.lower()
         elif key in ("radius", "definition", "intensity", "opacity"):
             if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item):
                 raise ValueError("Invalid display slider")
@@ -918,7 +936,16 @@ def load_appearance():
     with db_connect() as con:
         result = con.execute("SELECT value FROM app_settings WHERE key='appearance'").fetchone()
     try:
-        return normalize_appearance(json.loads(result[0])) if result else None
+        if not result:
+            return None
+        saved = json.loads(result[0])
+        # Existing v1.2.2 users may have configured a dedicated path color.
+        # Carry that color into the replacement whole-overlay tint on first load.
+        if isinstance(saved, dict) and 'bike_tint_color' not in saved:
+            legacy_color = saved.get('bike_path_color')
+            if isinstance(legacy_color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', legacy_color):
+                saved['bike_tint_color'] = legacy_color
+        return normalize_appearance(saved)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -1087,6 +1114,7 @@ def enrich_matching_recording(con, row_id, info, activity_id):
         except (TypeError,ValueError,zlib.error):stored=[]
         richness=lambda data:sum(any(len(sample)>i and sample[i] is not None for sample in data) for i in range(3,9))
         if not stored or richness(fresh)>richness(stored):store_telemetry(con,row_id,info)
+    reapply_activity_override(con,row_id)
     con.commit()
 
 
@@ -1122,6 +1150,7 @@ def insert_activity(con, source, source_key, stream, info, garmin_index=None):
             con.execute("UPDATE activities SET "+", ".join(field+"=COALESCE(?,"+field+")" for field in ADV_NUM_FIELDS+("weather_condition",))+" WHERE id=?",values)
             if filename.lower().endswith((".fit", ".fit.gz")):
                 con.execute("UPDATE activities SET fit_extended_checked=1 WHERE id=?",(existing[0],))
+            reapply_activity_override(con,existing[0])
             con.commit()
             clear_render_caches()
         return "skipped"
@@ -1152,6 +1181,8 @@ def insert_activity(con, source, source_key, stream, info, garmin_index=None):
 def set_job(**changes):
     with STATE_LOCK:
         JOB.update(changes)
+        if changes.get('status') in ('done','error'):
+            JOB['serial']=int(JOB.get('serial',0))+1
 
 
 def import_job(path, display_name):
@@ -1250,6 +1281,1208 @@ def import_job(path, display_name):
             pass
 
 
+
+def sniff_gps_name(original, path):
+    if not original.casefold().endswith('.gps'):
+        return original
+    with Path(path).open('rb') as stream:
+        head=stream.read(4096)
+    cleaned=head.lstrip(b'\xef\xbb\xbf \r\n\t').lower()
+    if len(head)>=12 and head[8:12]==b'.FIT':return original+'.fit'
+    if b'<gpx' in cleaned:return original+'.gpx'
+    if b'<trainingcenterdatabase' in cleaned:return original+'.tcx'
+    raise ValueError('Unrecognized .gps encoding; supported file contents are FIT, GPX and TCX')
+
+def garmin_usb_archive_directory():
+    return DB_PATH.parent / "Garmin-FIT-Archive"
+
+
+def garmin_usb_roots(roots=None):
+    if roots is not None:
+        return [Path(root) for root in roots]
+    if os.name != "nt":
+        return []
+    import ctypes
+    mask = ctypes.windll.kernel32.GetLogicalDrives()
+    return [Path("{}:\\".format(chr(65 + index))) for index in range(26) if mask & (1 << index)]
+
+
+def garmin_usb_devices(roots=None):
+    devices = []
+    seen = set()
+    for root in garmin_usb_roots(roots):
+        try:
+            if not root.is_dir():
+                continue
+            activity_dir = None
+            for folder in (root / "Garmin" / "Activity", root / "Garmin" / "Activities", root / "GARMIN" / "ACTIVITY"):
+                if folder.is_dir() and not folder.is_symlink():
+                    activity_dir = folder
+                    break
+            if activity_dir is None:
+                continue
+            files = []
+            for item in activity_dir.iterdir():
+                if item.is_file() and not item.is_symlink() and item.suffix.lower() == ".fit":
+                    size = item.stat().st_size
+                    if 12 <= size <= 128 * 1024 * 1024:
+                        files.append(item)
+                if len(files) > 20000:
+                    raise ValueError("Too many activities on Garmin device")
+            token = hashlib.sha256(str(root.resolve()).casefold().encode("utf-8")).hexdigest()[:20]
+            if token in seen:
+                continue
+            seen.add(token)
+            devices.append({"id": token, "label": str(root), "count": len(files), "files": sorted(files, key=lambda path:path.name.casefold()), "directory": str(activity_dir)})
+        except (OSError, ValueError):
+            continue
+    return devices
+
+
+def garmin_usb_scan(roots=None):
+    devices = garmin_usb_devices(roots)
+    return {"devices": [{"id": device["id"], "label": device["label"], "count": device["count"]} for device in devices], "archive": str(garmin_usb_archive_directory())}
+
+
+def garmin_usb_copy(source, archive):
+    with source.open("rb") as file:
+        header = file.read(12)
+    if len(header) < 12 or header[8:12] != b".FIT":
+        raise ValueError("Not a valid FIT recording")
+    archive.mkdir(parents=True, exist_ok=True)
+    source_hash = hashlib.sha256()
+    fd, temporary = tempfile.mkstemp(prefix=".garmin-copy-", suffix=".part", dir=str(archive))
+    try:
+        with os.fdopen(fd, "wb") as output, source.open("rb") as recording:
+            total = 0
+            while True:
+                chunk = recording.read(262144)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 128 * 1024 * 1024:
+                    raise ValueError("FIT file exceeds the size limit")
+                source_hash.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        digest = source_hash.hexdigest()
+        candidate = archive / source.name
+        if candidate.exists():
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() == digest:
+                return candidate, False, digest
+            candidate = archive / (source.stem + "-" + digest[:12] + ".fit")
+            if candidate.exists():
+                if hashlib.sha256(candidate.read_bytes()).hexdigest() == digest:
+                    return candidate, False, digest
+                raise ValueError("FIT archive filename collision")
+        os.replace(temporary, candidate)
+        return candidate, True, digest
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+
+# Optional watched folder: only scans direct children and never moves or deletes originals.
+WATCH_LOCK = threading.Lock()
+WATCH_PICK_LOCK = threading.Lock()
+WATCH_SEEN = {}
+WATCH_STATUS = {'message':'Automatic import is off until you select a folder.', 'added':0, 'skipped':0, 'failed':0, 'last_scan':None}
+WATCH_SUFFIXES = ('.fit','.fit.gz','.gpx','.gpx.gz','.tcx','.tcx.gz','.gps')
+
+def watch_seen_key(folder_name, source):
+    return 'watch_seen:'+hashlib.sha256((folder_name+'\x00'+str(source)).encode('utf-8')).hexdigest()
+
+
+def load_watch_folder():
+    with db_connect() as con:
+        row=con.execute("SELECT value FROM app_settings WHERE key='watch_folder'").fetchone()
+    return row[0] if row else ''
+
+
+def normalize_watch_folder(value):
+    if type(value) is not str or len(value)>1024 or '\x00' in value:
+        raise ValueError('Invalid watched folder path')
+    value=value.strip()
+    if not value:return ''
+    folder=Path(value).expanduser()
+    if not folder.is_absolute() or not folder.is_dir():
+        raise ValueError('Choose an existing folder using its absolute path')
+    if folder.is_symlink():
+        raise ValueError('Choose a regular directory, not a linked folder')
+    return str(folder.resolve())
+
+
+def pick_watch_folder():
+    if not WATCH_PICK_LOCK.acquire(blocking=False):
+        raise ValueError('A folder selection dialog is already open')
+    try:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError as exc:
+            raise ValueError('Folder chooser is unavailable; paste the full folder path instead') from exc
+        root=None
+        try:
+            root=tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            selected=filedialog.askdirectory(parent=root,title='Select an automatic activity import folder',initialdir=load_watch_folder() or str(Path.home()),mustexist=True)
+        except (tk.TclError, OSError) as exc:
+            raise ValueError('The native folder chooser is unavailable; enter the full folder path instead') from exc
+        finally:
+            if root is not None:root.destroy()
+        return {'folder':normalize_watch_folder(selected) if selected else None}
+    finally:
+        WATCH_PICK_LOCK.release()
+
+
+def watch_folder_status():
+    with WATCH_LOCK:
+        status=dict(WATCH_STATUS)
+    return {'folder':load_watch_folder(),**status}
+
+
+def watch_folder_scan():
+    folder_name=load_watch_folder()
+    if not folder_name:
+        with WATCH_LOCK:WATCH_STATUS.update(message='Automatic import is off; designate a local or shared folder in Settings.')
+        return
+    folder=Path(folder_name)
+    try:
+        if not folder.is_dir():
+            raise OSError('Watched folder is disconnected or unavailable')
+        candidates=[]
+        with db_connect() as seen_con:
+            seen_disk=dict(seen_con.execute("SELECT key,value FROM app_settings WHERE key LIKE 'watch_seen:%'"))
+        for source in folder.iterdir():
+            if not source.is_file() or source.is_symlink() or not source.name.lower().endswith(WATCH_SUFFIXES):continue
+            stat=source.stat()
+            if stat.st_size<12 or stat.st_size>128*1024*1024 or time.time()-stat.st_mtime<5:continue
+            fingerprint=(stat.st_size,stat.st_mtime_ns)
+            with WATCH_LOCK:
+                if WATCH_SEEN.get((folder_name,str(source)))==fingerprint:continue
+            if seen_disk.get(watch_seen_key(folder_name,source))=='{}:{}'.format(*fingerprint):continue
+            candidates.append((source,fingerprint))
+            if len(candidates)>20000:raise ValueError('Too many new activity files in watched folder')
+        if not candidates:
+            with WATCH_LOCK:WATCH_STATUS.update(message='Watching this folder for new activity files',last_scan=dt.datetime.now().isoformat(timespec='seconds'))
+            return
+        with STATE_LOCK:
+            if JOB.get('status')=='running':return
+            JOB.update(status='running',processed=0,total=len(candidates),added=0,skipped=0,failed=0,no_gps=0,updated=0,message='Importing watched activity files')
+        added=skipped=failed=no_gps=0
+        try:
+            with db_connect() as con:
+                for index,(source,fingerprint) in enumerate(candidates,1):
+                    set_job(processed=index-1,message=source.name[:100])
+                    try:
+                        display=source.name
+                        if display.casefold().endswith('.gps'):
+                            with source.open('rb') as inspect:
+                                header=inspect.read(4096)
+                            stripped=header.lstrip(b'\xef\xbb\xbf \r\n\t')
+                            if len(header)>=12 and header[8:12]==b'.FIT':display=source.name+'.fit'
+                            elif b'<gpx' in stripped.lower():display=source.name+'.gpx'
+                            elif b'<trainingcenterdatabase' in stripped.lower():display=source.name+'.tcx'
+                            else:raise ValueError('Unrecognized .gps encoding; supported file contents are FIT, GPX or TCX')
+                        with source.open('rb') as stream:
+                            hasher=hashlib.sha256()
+                            while True:
+                                part=stream.read(256*1024)
+                                if not part:break
+                                hasher.update(part)
+                            digest=hasher.hexdigest()
+                        key=hashlib.sha256(('watched:'+digest).encode('ascii')).hexdigest()
+                        with source.open('rb') as stream:
+                            outcome=insert_activity(con,display,key,stream,{})
+                        if outcome=='added':added+=1
+                        elif outcome=='no-gps':no_gps+=1
+                        else:skipped+=1
+                        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",(watch_seen_key(folder_name,source),'{}:{}'.format(*fingerprint)))
+                    except (ValueError,OSError,EOFError,sqlite3.Error,gzip.BadGzipFile,ET.ParseError) as exc:
+                        failed+=1
+                        print('[LibreHeatmaps] Watched folder import skipped {}: {}'.format(source.name,exc),flush=True)
+                    finally:
+                        with WATCH_LOCK:WATCH_SEEN[(folder_name,str(source))]=fingerprint
+                        set_job(processed=index,added=added,skipped=skipped,no_gps=no_gps,failed=failed)
+                con.execute('INSERT INTO import_history(imported_at,label,added,skipped,no_gps,failed,updated) VALUES(?,?,?,?,?,?,?)',
+                    (dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),'Watched folder',added,skipped,no_gps,failed,0))
+                con.execute('DELETE FROM import_history WHERE id NOT IN (SELECT id FROM import_history ORDER BY id DESC LIMIT 30)')
+            set_job(status='done',message='Watched folder: {} added, {} already imported, {} failed'.format(added,skipped,failed))
+            if added:start_heat_warmup()
+            with WATCH_LOCK:WATCH_STATUS.update(message='Last scan: {} new activities'.format(added),added=added,skipped=skipped,failed=failed,last_scan=dt.datetime.now().isoformat(timespec='seconds'))
+        except Exception:
+            set_job(status='error',message='Watched folder import failed; see application log')
+            raise
+    except (OSError,ValueError,sqlite3.Error) as exc:
+        with WATCH_LOCK:WATCH_STATUS.update(message=str(exc)[:250],last_scan=dt.datetime.now().isoformat(timespec='seconds'))
+        print('[LibreHeatmaps] Watched folder: {}'.format(exc),flush=True)
+
+
+def watch_folder_loop():
+    while True:
+        try:watch_folder_scan()
+        except Exception as exc:print('[LibreHeatmaps] Watched folder scan error: {}'.format(exc),flush=True)
+        time.sleep(15)
+
+
+# Optional Garmin Connect Personal API sync. The key stays in the user's local data
+# directory, never the SQLite database, library backups, ZIPs, or application logs.
+GARMIN_PERSONAL_BASE = 'https://personal.connectapi.garmin.com'
+GARMIN_PERSONAL_KEY_NAME = 'garmin-personal-api.key'
+GARMIN_SYNC_LOCK = threading.Lock()
+GARMIN_STATUS_LOCK = threading.Lock()
+GARMIN_SCHEDULE_LOCK = threading.Lock()
+GARMIN_LAST_ATTEMPT_MONO = 0.0
+GARMIN_TOKEN_LOCK = threading.Lock()
+GARMIN_TOKEN_CACHE = {'key_fingerprint': None, 'bearer': '', 'expires_at': 0}
+GARMIN_HISTORY_PAGE_SIZE = 100
+# No artificial pause between pages: full-history import continues until complete.
+# HTTP 429 and network failures still preserve the cursor and schedule a safe retry.
+GARMIN_HISTORY_RETRY_SECONDS = 900
+GARMIN_HISTORY_RATE_LIMIT_SECONDS = 3600
+GARMIN_HISTORY_REQUEST_DELAY_SECONDS = 1.0
+GARMIN_STATUS = {'running': False, 'message': 'Connect your personal Garmin API key to enable wireless activity sync.', 'last_sync': None, 'added': 0, 'skipped': 0, 'failed': 0, 'checked': 0, 'discovered': 0, 'authenticated': False, 'first_error': '', 'last_attempt': None}
+
+
+class GarminPersonalHTTPError(ValueError):
+    def __init__(self, status_code, message):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def garmin_clear_token():
+    with GARMIN_TOKEN_LOCK:
+        GARMIN_TOKEN_CACHE.update(key_fingerprint=None, bearer='', expires_at=0)
+
+
+
+def garmin_personal_key_path():
+    return DB_PATH.parent / GARMIN_PERSONAL_KEY_NAME
+
+
+def garmin_personal_key():
+    keyfile = garmin_personal_key_path()
+    if not keyfile.is_file() or keyfile.is_symlink():
+        return ''
+    return keyfile.read_text(encoding='ascii').strip()
+
+
+def garmin_history_state():
+    # Only LibreHeatmaps-created progress markers are stored here. Original
+    # recordings and Garmin credentials are never moved or altered.
+    with db_connect() as con:
+        rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key LIKE 'garmin_history_%'"))
+    def nonnegative(key, default=0):
+        try:return max(0,int(rows.get(key,str(default))))
+        except (TypeError,ValueError):return default
+    # Older 1.2.2 candidates scheduled an artificial 10-minute pause after each
+    # 50-recording page. Ignore that obsolete timer, never a real HTTP 429 wait.
+    last_message = rows.get('garmin_history_message', '')
+    resume_at = nonnegative('garmin_history_next_after')
+    if 'Next batch scheduled' in last_message:
+        resume_at = 0
+    return {
+        'active': rows.get('garmin_history_active')=='1',
+        'completed': rows.get('garmin_history_completed')=='1',
+        'cursor': nonnegative('garmin_history_cursor'),
+        'reviewed': nonnegative('garmin_history_reviewed'),
+        'imported': nonnegative('garmin_history_imported'),
+        'map_batch_size': 50,
+        'ready_map_batches': nonnegative('garmin_history_imported') // 50,
+        'next_after': resume_at,
+        'message': last_message if last_message and 'Next batch scheduled' not in last_message else 'Full-history import can continue without batch pauses.',
+    }
+
+
+def garmin_history_write(**values):
+    if not values:return
+    with db_connect() as con:
+        for k,v in values.items():
+            if k not in ('active','completed','cursor','reviewed','imported','next_after','message'):
+                raise ValueError('Invalid Garmin history state field')
+            con.execute('INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)',('garmin_history_'+k,str(int(v) if isinstance(v,bool) else v)[:280]))
+
+
+def garmin_history_start():
+    if not garmin_personal_key():raise ValueError('Connect Garmin first')
+    with STATE_LOCK:
+        if JOB.get('status')=='running':raise ValueError('Wait for the current import to finish')
+    if GARMIN_SYNC_LOCK.locked():raise ValueError('Garmin synchronization is already running')
+    state=garmin_history_state()
+    if state['completed']:
+        garmin_history_write(cursor=0,reviewed=0,imported=0,completed=0)
+    # Never bypass a scheduled retry after Garmin rate-limits the connection.
+    due=state['next_after'] if state['next_after']>time.time() else 0
+    garmin_history_write(active=1,next_after=due,message='Importing full Garmin account history continuously…' if not due else 'Garmin requested a cooldown. Full history will resume after the retry window.')
+    return garmin_history_state()
+
+
+def garmin_history_pause():
+    garmin_history_write(active=0,message='Historical import paused. Select Resume full import to continue; imported rides stay in the library.')
+    return garmin_history_state()
+
+
+def garmin_personal_status():
+    with GARMIN_STATUS_LOCK:
+        state = dict(GARMIN_STATUS)
+    state['connected'] = bool(garmin_personal_key())
+    if state['connected'] and state['message'].startswith('Connect your personal Garmin API key'):
+        state['message'] = 'Saved Garmin key found. Automatic verification will run at startup; Sync now checks immediately.'
+    state['method'] = 'Garmin Connect Personal API (not direct Edge-to-PC Wi-Fi)'
+    state['sync_interval_minutes'] = load_garmin_sync_minutes()
+    state['history'] = garmin_history_state()
+    return state
+
+
+def garmin_personal_store_key(value):
+    if not isinstance(value, str) or not 12 <= len(value) <= 1024 or not value.isascii() or any(c.isspace() or ord(c) < 33 or ord(c) > 126 for c in value):
+        raise ValueError('Enter the personal API key generated in your own Garmin Connect account')
+    target = garmin_personal_key_path()
+    previous_key = garmin_personal_key()
+    fd, temp = tempfile.mkstemp(prefix='.garmin-key-', dir=str(target.parent))
+    try:
+        os.chmod(temp, 0o600)
+        with os.fdopen(fd, 'w', encoding='ascii') as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, target)
+        if os.name != 'nt':
+            os.chmod(target, 0o600)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    garmin_clear_token()
+    # A replacement key may reference a different Garmin account. Never mix
+    # its historical cursor with the old account's progress.
+    if previous_key != value:
+        garmin_history_write(active=0,completed=0,cursor=0,reviewed=0,imported=0,next_after=0,message='Not started for this Garmin connection.')
+    global GARMIN_LAST_ATTEMPT_MONO
+    with GARMIN_SCHEDULE_LOCK:
+        GARMIN_LAST_ATTEMPT_MONO = 0.0  # newly connected: check automatically soon
+    with GARMIN_STATUS_LOCK:
+        GARMIN_STATUS.update(message='Garmin key saved locally but not yet verified. Select Sync now to test access.', last_sync=None, last_attempt=None, authenticated=False, first_error='')
+    return garmin_personal_status()
+
+
+def garmin_personal_disconnect():
+    garmin_history_write(active=0,next_after=0,message='Historical import paused because Garmin was disconnected.')
+    # Stop future API requests even while an earlier request is winding down.
+    # Avoid holding the HTTP handler behind a long-running sync's download lock.
+    garmin_personal_key_path().unlink(missing_ok=True)
+    garmin_clear_token()
+    global GARMIN_LAST_ATTEMPT_MONO
+    with GARMIN_SCHEDULE_LOCK:
+        GARMIN_LAST_ATTEMPT_MONO = 0.0
+    with GARMIN_STATUS_LOCK:
+        GARMIN_STATUS.update(message='Garmin wireless sync is disconnected on this PC.', last_sync=None, last_attempt=None, running=False, authenticated=False, first_error='')
+    return garmin_personal_status()
+
+
+def garmin_personal_http(method, route, token, *, limit=8*1024*1024, accept="*/*"):
+    if not route.startswith('/') or '://' in route or '\\' in route:
+        raise ValueError('Invalid Garmin API route')
+    req = Request(GARMIN_PERSONAL_BASE + route, method=method, headers={'Authorization': token, 'Accept': accept, 'User-Agent': 'LibreHeatmaps/'+VERSION})
+    try:
+        with urlopen(req, timeout=25) as response:
+            declared = response.headers.get('Content-Length')
+            if declared and int(declared) > limit:
+                raise ValueError('Garmin download exceeds the safety limit')
+            body = response.read(limit+1)
+    except HTTPError as exc:
+        if exc.code == 401:
+            raise GarminPersonalHTTPError(401, 'Garmin authentication was rejected (HTTP 401)') from None
+        if exc.code == 403:
+            raise GarminPersonalHTTPError(403, 'Garmin denied access (HTTP 403); check Personal API key permissions or expiration') from None
+        if exc.code == 429:
+            raise GarminPersonalHTTPError(429, 'Garmin rate limit reached (HTTP 429); try again later') from None
+        if exc.code == 406:
+            raise GarminPersonalHTTPError(406, 'Garmin rejected the response format (HTTP 406)') from None
+        raise GarminPersonalHTTPError(exc.code, 'Garmin API returned HTTP {}'.format(exc.code)) from None
+    except (URLError, TimeoutError) as exc:
+        raise ValueError('Could not reach Garmin Connect securely: {}'.format(type(exc).__name__)) from exc
+    if len(body)>limit:
+        raise ValueError('Garmin download exceeds the safety limit')
+    return body
+
+
+def garmin_personal_access_token(api_key, force_refresh=False):
+    # Keep the bearer only in process memory; never store it in the library or logs.
+    fingerprint = hashlib.sha256(api_key.encode('ascii')).hexdigest()
+    with GARMIN_TOKEN_LOCK:
+        if (not force_refresh and GARMIN_TOKEN_CACHE['key_fingerprint'] == fingerprint
+                and GARMIN_TOKEN_CACHE['expires_at'] > time.time() + 3600):
+            return GARMIN_TOKEN_CACHE['bearer']
+    raw = garmin_personal_http('POST','/personalapitoken-service/personal-api/personal-api-key/token',
+                               'ApiKey '+api_key,limit=65536,accept='*/*')
+    try:
+        token = raw.decode('ascii').strip()
+        pieces = token.split('.')
+        if len(pieces) != 3 or not all(pieces) or not 60 <= len(token) <= 20000:
+            raise ValueError('Invalid token format')
+        payload = json.loads(base64.urlsafe_b64decode(pieces[1]+'='*(-len(pieces[1])%4)))
+        if not isinstance(payload,dict) or not isinstance(payload.get('exp'),(int,float)):
+            raise ValueError('Missing token expiry')
+        if payload['exp'] < time.time()+30:
+            raise ValueError('Expired token')
+    except (UnicodeError, ValueError, IndexError, TypeError, base64.binascii.Error):
+        raise ValueError('Garmin did not return a valid bearer token; check your Personal API key') from None
+    bearer='Bearer '+token
+    with GARMIN_TOKEN_LOCK:
+        GARMIN_TOKEN_CACHE.update(key_fingerprint=fingerprint,bearer=bearer,expires_at=float(payload['exp']))
+    return bearer
+
+
+def garmin_personal_activity_ids(bearer, max_items=500):
+    found=[]
+    for start in range(0,max_items,100):
+        route='/activitylist-service/activities/search/activities?start={}&limit=100'.format(start)
+        # Garmin's reference client explicitly requests JSON on data endpoints.
+        data=json.loads(garmin_personal_http('GET',route,bearer,limit=8*1024*1024,accept='application/json'))
+        if not isinstance(data,list):
+            raise ValueError('Unexpected Garmin activity list response')
+        for item in data:
+            if isinstance(item,dict):
+                aid=item.get('activityId') or item.get('activity_id')
+                if isinstance(aid,int) and 0 < aid < 10**18:
+                    found.append(aid)
+        if len(data)<100:
+            break
+    return list(dict.fromkeys(found))
+
+
+
+def garmin_personal_activity_page(bearer, start, limit=GARMIN_HISTORY_PAGE_SIZE):
+    if not isinstance(start,int) or not 0<=start<=1000000 or limit!=GARMIN_HISTORY_PAGE_SIZE:
+        raise ValueError('Invalid Garmin history page')
+    route='/activitylist-service/activities/search/activities?start={}&limit={}'.format(start,limit)
+    data=json.loads(garmin_personal_http('GET',route,bearer,limit=8*1024*1024,accept='application/json'))
+    if not isinstance(data,list):raise ValueError('Unexpected Garmin activity list response')
+    if len(data)>limit:raise ValueError('Garmin returned more activities than requested')
+    ids=[]
+    for item in data:
+        aid=(item.get('activityId') or item.get('activity_id')) if isinstance(item,dict) else None
+        ids.append(aid if isinstance(aid,int) and 0<aid<10**18 else None)
+    return ids
+
+
+def garmin_retry_auth_request(callback, api_key, bearer):
+    # A bearer can be invalidated before its JWT expiry; exchange the API key once.
+    try:
+        return callback(bearer),bearer
+    except GarminPersonalHTTPError as exc:
+        if exc.status_code != 401:
+            raise
+    bearer=garmin_personal_access_token(api_key,force_refresh=True)
+    return callback(bearer),bearer
+
+
+def garmin_personal_save_fit(folder_name, activity_id, source_name, raw):
+    # User-designated watched folder is the optional destination for original FITs.
+    # No Garmin folder is selected or created on the user's behalf.
+    folder=Path(folder_name)
+    if not folder.is_dir() or folder.is_symlink():
+        raise ValueError('The selected activity folder is no longer available')
+    if len(raw)<12 or raw[8:12]!=b'.FIT':
+        raise ValueError('Downloaded Garmin recording is not a FIT file')
+    clean=re.sub(r'[^A-Za-z0-9._-]+','-',Path(source_name).name)[:100].strip('.-_')
+    if not clean.casefold().endswith('.fit'):
+        clean='activity.fit'
+    digest=hashlib.sha256(raw).hexdigest()
+    filename='Garmin-{}-{}'.format(activity_id,clean)
+    target=folder/filename
+    if target.exists():
+        if target.is_symlink():raise ValueError('Cannot overwrite linked activity files')
+        if hashlib.sha256(target.read_bytes()).hexdigest()==digest:
+            return target,False
+        target=folder/('Garmin-{}-{}.fit'.format(activity_id,digest[:16]))
+        if target.exists():
+            if target.is_symlink() or hashlib.sha256(target.read_bytes()).hexdigest()!=digest:
+                raise ValueError('Garmin activity filename collision')
+            return target,False
+    fd,temporary=tempfile.mkstemp(prefix='.garmin-transfer-',suffix='.part',dir=str(folder))
+    try:
+        with os.fdopen(fd,'wb') as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary,target)
+        return target,True
+    finally:
+        if os.path.exists(temporary):os.unlink(temporary)
+
+
+def garmin_personal_import_zip(con, content, activity_id, destination=None):
+    if not zipfile.is_zipfile(io.BytesIO(content)):
+        raise ValueError('Garmin activity download is not a valid ZIP')
+    added=skipped=no_gps=stored=save_failures=0
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        members=[m for m in archive.infolist() if not m.is_dir() and m.filename.lower().endswith(FORMATS)]
+        if not members or len(members)>10 or sum(m.file_size for m in members)>128*1024*1024:
+            raise ValueError('Garmin activity archive contains no supported recordings or is too large')
+        for member in members:
+            if member.file_size>MAX_MEMBER or (member.file_size>1024*1024 and member.file_size>1000*max(1,member.compress_size)):
+                raise ValueError('Unsafe Garmin activity ZIP entry')
+            display='Garmin/{}-{}'.format(activity_id,Path(member.filename).name)
+            source_key=hashlib.sha256(('garmin-personal:{}:{}:{}'.format(activity_id,member.CRC,member.file_size)).encode()).hexdigest()
+            with archive.open(member) as stream:
+                raw=BoundedStream(stream,128*1024*1024).read()
+            result=insert_activity(con,display,source_key,io.BytesIO(raw),{})
+            if result=='added':added+=1
+            elif result=='no-gps':no_gps+=1
+            else:skipped+=1
+            if destination and member.filename.casefold().endswith('.fit'):
+                try:
+                    target,was_new=garmin_personal_save_fit(destination,activity_id,member.filename,raw)
+                    if was_new:stored+=1
+                    fingerprint=target.stat()
+                    seen=(fingerprint.st_size,fingerprint.st_mtime_ns)
+                    con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",(watch_seen_key(destination,target),'{}:{}'.format(*seen)))
+                    with WATCH_LOCK:WATCH_SEEN[(destination,str(target))]=seen
+                except (OSError,ValueError):
+                    # A full/read-only optional folder cannot invalidate a good library import.
+                    save_failures+=1
+    return added,skipped,no_gps,stored,save_failures
+
+
+def garmin_local_activity_ids(con):
+    # An API download marker is not proof that a ride still exists in the library.
+    # Include recordings re-imported from the user's Garmin-named original FIT files.
+    present=set()
+    for (filename,) in con.execute("SELECT filename FROM activities WHERE filename LIKE 'Garmin/%' OR filename LIKE 'Garmin-%'"):
+        match=re.match(r"(?i)^garmin[/\-]([0-9]{1,18})-",filename)
+        if match:
+            present.add(int(match.group(1)))
+    return present
+
+
+def garmin_personal_sync_job():
+    global GARMIN_LAST_ATTEMPT_MONO
+    if not GARMIN_SYNC_LOCK.acquire(blocking=False):
+        return
+    started = False
+    try:
+        key=garmin_personal_key()
+        if not key:
+            return
+        with STATE_LOCK:
+            if JOB.get('status')=='running':
+                return
+            JOB.update(status='running',processed=0,total=0,added=0,skipped=0,failed=0,no_gps=0,updated=0,message='Checking Garmin Connect for wireless rides')
+        started = True
+        with GARMIN_STATUS_LOCK:
+            GARMIN_STATUS.update(running=True,message='Checking Garmin account and recent rides…',first_error='',last_attempt=dt.datetime.now().isoformat(timespec='seconds'))
+        added=skipped=failed=no_gps=checked=saved=save_failures=0
+        discovered=0
+        folder_warning=''
+        stage='authentication'
+        try:
+            folder_name=load_watch_folder()
+            if folder_name and (not Path(folder_name).is_dir() or Path(folder_name).is_symlink()):
+                # The library sync is independent of the optional local original-file destination.
+                folder_warning=' Selected activity folder unavailable; originals were not saved there.'
+                folder_name=''
+            folder_id=hashlib.sha256(folder_name.encode('utf-8')).hexdigest() if folder_name else ''
+            bearer=garmin_personal_access_token(key)
+            stage='activity discovery'
+            ids,bearer=garmin_retry_auth_request(garmin_personal_activity_ids,key,bearer)
+            discovered=len(ids)
+            with GARMIN_STATUS_LOCK:
+                GARMIN_STATUS.update(authenticated=True,discovered=discovered,message='Garmin access verified; comparing {} recent activities…'.format(discovered))
+            with db_connect() as con:
+                # Reconcile against actual imported tracks, not obsolete download history.
+                # Clearing activities intentionally keeps API keys and original FIT files.
+                local_ids=garmin_local_activity_ids(con)
+                stored=dict(con.execute("SELECT key,value FROM app_settings WHERE key LIKE 'garmin_personal_saved:%' OR key LIKE 'garmin_personal_nogps:%'"))
+                pending=[aid for aid in reversed(ids) if
+                    (aid not in local_ids and 'garmin_personal_nogps:'+str(aid) not in stored)
+                    or (folder_name and stored.get('garmin_personal_saved:'+str(aid))!=folder_id)]
+                pending=pending[-60:]
+                set_job(total=len(pending),message='Downloading missing Garmin activity recordings')
+                stage='activity download'
+                first_error=''
+                for index,aid in enumerate(pending,1):
+                    if garmin_personal_key() != key:
+                        raise ValueError('Garmin connection changed or was removed')
+                    checked+=1
+                    set_job(processed=index-1,message='Garmin activity {} ({} of {})'.format(aid,index,len(pending)))
+                    try:
+                        callback=lambda active: garmin_personal_http('GET','/download-service/files/activity/{}'.format(aid),active,limit=128*1024*1024,accept='application/zip, application/x-zip-compressed, application/octet-stream')
+                        content,bearer=garmin_retry_auth_request(callback,key,bearer)
+                        a,s,n,stored_count,save_error_count=garmin_personal_import_zip(con,content,aid,folder_name or None)
+                        added+=a;skipped+=s;no_gps+=n;saved+=stored_count;save_failures+=save_error_count
+                        # This marker is informational; the next sync always verifies the
+                        # local library. No-GPS activities need a separate explicit marker.
+                        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",('garmin_personal_synced:'+str(aid),dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')))
+                        if n and not a and not s:
+                            con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",('garmin_personal_nogps:'+str(aid),'1'))
+                        else:
+                            con.execute("DELETE FROM app_settings WHERE key=?",('garmin_personal_nogps:'+str(aid),))
+                        if folder_name and not save_error_count:
+                            con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",('garmin_personal_saved:'+str(aid),folder_id))
+                        con.commit()
+                    except (ValueError,zipfile.BadZipFile,sqlite3.Error,EOFError,OSError) as exc:
+                        failed+=1
+                        if not first_error:
+                            first_error='Activity {}: {}'.format(aid,str(exc)[:115])
+                        con.rollback()
+                        if isinstance(exc,GarminPersonalHTTPError) and exc.status_code==429:
+                            # Abort further downloads instead of continuing to hammer the endpoint.
+                            break
+                    set_job(processed=index,added=added,skipped=skipped,failed=failed,no_gps=no_gps)
+                if pending:
+                    con.execute('INSERT INTO import_history(imported_at,label,added,skipped,no_gps,failed,updated) VALUES(?,?,?,?,?,?,?)',(dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),'Garmin wireless (Personal API)',added,skipped,no_gps,failed,0))
+                    con.execute('DELETE FROM import_history WHERE id NOT IN (SELECT id FROM import_history ORDER BY id DESC LIMIT 30)')
+                    con.commit()
+            if garmin_personal_key() != key:
+                set_job(status='error',message='Garmin connection removed or changed during sync')
+                return
+            message='Garmin: {} new rides, {} previously imported, {} download failures; {} of {} recent activities downloaded.'.format(added,skipped,failed,checked,discovered)
+            if saved:message+=' {} original FIT files saved.'.format(saved)
+            if save_failures:message+=' {} optional original-file saves failed.'.format(save_failures)
+            if first_error:message+=' '+first_error
+            message+=folder_warning
+            if not checked and not failed:message='Garmin account verified. No missing rides among the {} most recent activities checked. For older recordings, choose Import full history in Settings.'.format(discovered)+folder_warning
+            set_job(status='error' if failed else 'done',message=message)
+            with GARMIN_STATUS_LOCK:
+                GARMIN_STATUS.update(running=False,last_sync=dt.datetime.now().isoformat(timespec='seconds'),message=message,added=added,skipped=skipped,failed=failed,checked=checked,discovered=discovered,stored=saved,first_error=first_error,authenticated=True)
+            if added:start_heat_warmup()
+        except Exception as exc:
+            # Never display the key, bearer, or raw Garmin response body.
+            message='Garmin '+stage+' failed: '+str(exc)[:160]
+            set_job(status='error',message=message)
+            with GARMIN_STATUS_LOCK:
+                auth_rejected=(isinstance(exc,GarminPersonalHTTPError) and exc.status_code in (401,403))
+                GARMIN_STATUS.update(running=False,message=message,failed=failed,first_error=message,authenticated=False if stage=='authentication' or auth_rejected else GARMIN_STATUS.get('authenticated',False))
+    finally:
+        if started:
+            with GARMIN_SCHEDULE_LOCK:
+                GARMIN_LAST_ATTEMPT_MONO = time.monotonic()
+        GARMIN_SYNC_LOCK.release()
+
+
+
+def garmin_personal_history_job():
+    global GARMIN_LAST_ATTEMPT_MONO
+    # Scan every historical page in one operation, rather than stopping at an
+    # arbitrary 50-activity boundary. Progress is durable after each activity.
+    # Stop only at the end, an explicit pause/disconnect, or a real API failure.
+    if not GARMIN_SYNC_LOCK.acquire(blocking=False):
+        return
+    try:
+        key = garmin_personal_key()
+        history = garmin_history_state()
+        if not key or not history['active'] or time.time() < history['next_after']:
+            return
+        with STATE_LOCK:
+            if JOB.get('status') == 'running':
+                return
+            JOB.update(status='running', source='garmin_history', processed=history['reviewed'], total=0,
+                       added=history['imported'], skipped=0, failed=0, no_gps=0,
+                       updated=0, message='Importing full Garmin account history')
+        with GARMIN_STATUS_LOCK:
+            GARMIN_STATUS.update(running=True, first_error='',
+                                 message='Importing Garmin history: {} reviewed, {} new rides'.format(
+                                     history['reviewed'], history['imported']))
+        stage = 'historical activity discovery'
+        added_session = skipped_session = 0
+        try:
+            bearer = garmin_personal_access_token(key)
+            folder = load_watch_folder()
+            if not folder or not Path(folder).is_dir() or Path(folder).is_symlink():
+                folder = ''
+            folder_id = hashlib.sha256(folder.encode('utf-8')).hexdigest() if folder else ''
+            with db_connect() as con:
+                present = garmin_local_activity_ids(con)
+                saved = dict(con.execute("SELECT key,value FROM app_settings WHERE key LIKE 'garmin_personal_saved:%' OR key LIKE 'garmin_personal_nogps:%'"))
+            while True:
+                history = garmin_history_state()
+                if not history['active'] or garmin_personal_key() != key:
+                    message = 'Garmin history paused at {} activities; {} new rides imported.'.format(
+                        history['reviewed'], history['imported'])
+                    garmin_history_write(active=0, message=message)
+                    set_job(status='done', message=message, processed=history['reviewed'], added=history['imported'])
+                    with GARMIN_STATUS_LOCK:
+                        GARMIN_STATUS.update(running=False, message=message)
+                    if added_session:
+                        start_heat_warmup()
+                    return
+                if time.time() < history['next_after']:
+                    return
+                offset = history['cursor']
+                stage = 'historical activity discovery'
+                ids, bearer = garmin_retry_auth_request(
+                    lambda b: garmin_personal_activity_page(b, offset), key, bearer)
+                if not ids:
+                    final = 'Full Garmin history complete: {} activities reviewed; {} new rides imported. Original GPS files preserved.'.format(
+                        history['reviewed'], history['imported'])
+                    garmin_history_write(active=0, completed=1, next_after=0, message=final)
+                    set_job(status='done', message=final, processed=history['reviewed'], added=history['imported'])
+                    with GARMIN_STATUS_LOCK:
+                        GARMIN_STATUS.update(running=False, authenticated=True, message=final,
+                                             added=history['imported'], checked=history['reviewed'])
+                    with GARMIN_SCHEDULE_LOCK:
+                        GARMIN_LAST_ATTEMPT_MONO = time.monotonic()
+                    if added_session:
+                        start_heat_warmup()
+                    return
+                set_job(total=0, message='Scanning Garmin history: {} reviewed'.format(offset))
+                for aid in ids:
+                    history = garmin_history_state()
+                    if not history['active'] or garmin_personal_key() != key:
+                        break
+                    newly_added = 0
+                    needs = (aid is not None and (
+                        (aid not in present and 'garmin_personal_nogps:' + str(aid) not in saved)
+                        or (folder and saved.get('garmin_personal_saved:' + str(aid)) != folder_id)))
+                    if needs:
+                        stage = 'historical FIT download'
+                        try:
+                            callback = lambda b: garmin_personal_http(
+                                'GET', '/download-service/files/activity/{}'.format(aid), b,
+                                limit=128*1024*1024,
+                                accept='application/zip, application/x-zip-compressed, application/octet-stream')
+                            content, bearer = garmin_retry_auth_request(callback, key, bearer)
+                        except (ValueError, OSError, EOFError) as exc:
+                            # Keep cursor ON the failed activity so it is retried.
+                            delay = (GARMIN_HISTORY_RATE_LIMIT_SECONDS if isinstance(exc, GarminPersonalHTTPError)
+                                     and exc.status_code == 429 else GARMIN_HISTORY_RETRY_SECONDS)
+                            unauthorized = isinstance(exc, GarminPersonalHTTPError) and exc.status_code in (401, 403)
+                            reason = 'Garmin activity {} failed: {}. No rides were deleted.'.format(aid, str(exc)[:150])
+                            garmin_history_write(active=not unauthorized,
+                                next_after=0 if unauthorized else int(time.time()+delay),
+                                message=reason + (' Reconnect Garmin to continue.' if unauthorized else ' Automatic retry is scheduled.'))
+                            set_job(status='error', message=reason, failed=1)
+                            with GARMIN_STATUS_LOCK:
+                                GARMIN_STATUS.update(running=False, first_error=reason, message=reason, failed=1)
+                            if added_session:
+                                start_heat_warmup()
+                            return
+                    try:
+                        with db_connect() as con:
+                            if needs:
+                                a, sk, n, stored_count, save_errors = garmin_personal_import_zip(
+                                    con, content, aid, folder or None)
+                                newly_added = a
+                                added_session += a
+                                skipped_session += sk
+                                if a:
+                                    present.add(aid)
+                                if n and not a and not sk:
+                                    con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",
+                                                ('garmin_personal_nogps:'+str(aid), '1'))
+                                    saved['garmin_personal_nogps:'+str(aid)] = '1'
+                                else:
+                                    con.execute("DELETE FROM app_settings WHERE key=?", ('garmin_personal_nogps:'+str(aid),))
+                                    saved.pop('garmin_personal_nogps:'+str(aid), None)
+                                if folder and not save_errors:
+                                    con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",
+                                                ('garmin_personal_saved:'+str(aid), folder_id))
+                                    saved['garmin_personal_saved:'+str(aid)] = folder_id
+                                con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",
+                                            ('garmin_personal_synced:'+str(aid), dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')))
+                            else:
+                                skipped_session += 1
+                            con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('garmin_history_cursor',?)", (str(offset+1),))
+                            con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('garmin_history_reviewed',?)", (str(history['reviewed']+1),))
+                            con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('garmin_history_imported',?)", (str(history['imported']+newly_added),))
+                    except (ValueError, zipfile.BadZipFile, sqlite3.Error, EOFError, OSError) as exc:
+                        reason = 'Garmin activity {} could not be imported: {}'.format(aid, str(exc)[:150])
+                        garmin_history_write(active=True, next_after=int(time.time()+GARMIN_HISTORY_RETRY_SECONDS),
+                                             message=reason+' Automatic retry is scheduled.')
+                        set_job(status='error', message=reason, failed=1)
+                        with GARMIN_STATUS_LOCK:
+                            GARMIN_STATUS.update(running=False, first_error=reason, message=reason, failed=1)
+                        if added_session:
+                            start_heat_warmup()
+                        return
+                    offset += 1
+                    set_job(processed=history['reviewed']+1, added=history['imported']+newly_added,
+                            skipped=skipped_session,
+                            message='Garmin full history: {} reviewed, {} new rides imported'.format(
+                                history['reviewed']+1, history['imported']+newly_added))
+                    with GARMIN_STATUS_LOCK:
+                        GARMIN_STATUS.update(running=True, authenticated=True, checked=history['reviewed']+1,
+                                             added=history['imported']+newly_added,
+                                             message='Full history: {} activities checked; {} imported'.format(
+                                                 history['reviewed']+1, history['imported']+newly_added))
+                    if needs and GARMIN_HISTORY_REQUEST_DELAY_SECONDS:
+                        time.sleep(GARMIN_HISTORY_REQUEST_DELAY_SECONDS)
+                if len(ids) < GARMIN_HISTORY_PAGE_SIZE and garmin_history_state()['active']:
+                    # A short page is the last page. Finish without an additional API call.
+                    final_state = garmin_history_state()
+                    final = 'Full Garmin history complete: {} activities reviewed; {} new rides imported. Original files untouched.'.format(
+                        final_state['reviewed'], final_state['imported'])
+                    garmin_history_write(active=0, completed=1, next_after=0, message=final)
+                    set_job(status='done', message=final, processed=final_state['reviewed'], added=final_state['imported'])
+                    with GARMIN_STATUS_LOCK:
+                        GARMIN_STATUS.update(running=False, authenticated=True, message=final,
+                                             added=final_state['imported'], checked=final_state['reviewed'])
+                    with GARMIN_SCHEDULE_LOCK:
+                        GARMIN_LAST_ATTEMPT_MONO = time.monotonic()
+                    if added_session:
+                        start_heat_warmup()
+                    return
+                # Continue directly to the next page. Never impose a batch cooldown.
+                if GARMIN_HISTORY_REQUEST_DELAY_SECONDS:
+                    time.sleep(GARMIN_HISTORY_REQUEST_DELAY_SECONDS)
+        except Exception as exc:
+            reason = 'Garmin '+stage+' failed: '+str(exc)[:150]
+            delay = (GARMIN_HISTORY_RATE_LIMIT_SECONDS if isinstance(exc, GarminPersonalHTTPError)
+                     and exc.status_code == 429 else GARMIN_HISTORY_RETRY_SECONDS)
+            unauthorized = isinstance(exc, GarminPersonalHTTPError) and exc.status_code in (401,403)
+            garmin_history_write(active=not unauthorized,
+                                 next_after=0 if unauthorized else int(time.time()+delay),
+                                 message=reason+(' Reconnect Garmin to continue.' if unauthorized else ' Automatic retry is scheduled.'))
+            set_job(status='error', message=reason)
+            with GARMIN_STATUS_LOCK:
+                GARMIN_STATUS.update(running=False, first_error=reason, message=reason)
+            if added_session:
+                start_heat_warmup()
+    finally:
+        GARMIN_SYNC_LOCK.release()
+
+
+def garmin_auto_sync_due(now=None):
+    if now is None:
+        now = time.monotonic()
+    with GARMIN_SCHEDULE_LOCK:
+        last_attempt = GARMIN_LAST_ATTEMPT_MONO
+    return last_attempt == 0.0 or now - last_attempt >= load_garmin_sync_minutes() * 60
+
+
+def garmin_personal_loop():
+    # The first check occurs when the app starts with a key. Subsequently,
+    # check only after the user-selected interval since the last actual sync.
+    while True:
+        delay = 15
+        try:
+            if garmin_personal_key():
+                with STATE_LOCK:
+                    occupied = JOB.get('status') == 'running'
+                if not occupied and not GARMIN_SYNC_LOCK.locked():
+                    history=garmin_history_state()
+                    in_cooldown=('rate limit' in history['message'].lower() or 'HTTP 429' in history['message']) and time.time()<history['next_after']
+                    if not in_cooldown:
+                        if history['active'] and time.time()>=history['next_after']:
+                            garmin_personal_history_job()
+                        elif garmin_auto_sync_due():
+                            garmin_personal_sync_job()
+                elif garmin_auto_sync_due():
+                    delay = 12  # local job busy; does not call Garmin
+        except Exception as exc:
+            print('[LibreHeatmaps] Garmin sync loop: {}'.format(type(exc).__name__),flush=True)
+            delay = 60
+        time.sleep(delay)
+
+
+def garmin_usb_import_job(device_id, roots=None):
+    added = skipped = failed = no_gps = copied = 0
+    try:
+        device = next((device for device in garmin_usb_devices(roots) if device["id"] == device_id), None)
+        if device is None:
+            raise ValueError("Garmin not found. Reconnect it by USB and scan again")
+        files = device["files"]
+        archive = garmin_usb_archive_directory()
+        set_job(total=len(files), message="Copying Garmin FIT recordings", copied=0)
+        with db_connect() as con:
+            for index, source in enumerate(files, 1):
+                set_job(processed=index - 1, message=source.name[:110])
+                try:
+                    destination, was_copied, digest = garmin_usb_copy(source, archive)
+                    if was_copied:
+                        copied += 1
+                    key = hashlib.sha256(("garmin-usb:" + digest).encode()).hexdigest()
+                    with destination.open("rb") as stream:
+                        result = insert_activity(con, destination.name, key, stream, {})
+                    if result == "added":
+                        added += 1
+                    elif result == "no-gps":
+                        no_gps += 1
+                    else:
+                        skipped += 1
+                except (OSError, ValueError, EOFError, sqlite3.Error, gzip.BadGzipFile) as exc:
+                    failed += 1
+                    print("[LibreHeatmaps] Garmin USB import unavailable for {}: {}".format(source.name, exc), flush=True)
+                set_job(processed=index, added=added, skipped=skipped, no_gps=no_gps, failed=failed, copied=copied)
+        with db_connect() as con:
+            con.execute("INSERT INTO import_history(imported_at,label,added,skipped,no_gps,failed,updated) VALUES(?,?,?,?,?,?,?)", (dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "Garmin USB", added, skipped, no_gps, failed, 0))
+            con.execute("DELETE FROM import_history WHERE id NOT IN (SELECT id FROM import_history ORDER BY id DESC LIMIT 30)")
+        set_job(status="done", message="Garmin USB complete · {} new FIT files copied to {}".format(copied, archive))
+        start_heat_warmup()
+    except Exception as exc:
+        set_job(status="error", message=str(exc)[:320])
+    
+
+EDITABLE_ACTIVITY_FIELDS = ('name','sport','day','bike','gear_id','recorded_distance_m','moving_seconds','elapsed_seconds','elevation_m','avg_speed','max_speed','avg_heart_rate','avg_power','avg_cadence','calories_kcal','avg_temp_c','max_temp_c','weather_temp_c','wind_speed_mps','wind_gust_mps')
+
+
+def safe_activity_id(params):
+    value=params.get('id',[''])[0]
+    if not isinstance(value,str) or not value.isascii() or not value.isdecimal() or len(value)>12 or int(value)<=0:
+        raise ValueError('Invalid activity ID')
+    return int(value)
+
+
+def edit_activity_details(activity_id, action=None, changes=None):
+    if type(activity_id) is not int or not 0 < activity_id < 10**12:
+        raise ValueError('Select an activity')
+    if action:
+        with STATE_LOCK:
+            if JOB['status']=='running':raise ValueError('Finish importing before editing this activity')
+    with db_connect() as con:
+        row=con.execute('SELECT '+','.join(EDITABLE_ACTIVITY_FIELDS)+' FROM activities WHERE id=?',(activity_id,)).fetchone()
+        if row is None:raise ValueError('Activity not found')
+        current=dict(zip(EDITABLE_ACTIVITY_FIELDS,row))
+        old=con.execute('SELECT originals,values_json,updated_at FROM activity_overrides WHERE activity_id=?',(activity_id,)).fetchone()
+        if action is None:
+            known_gear=con.execute("SELECT TRIM(bike),MAX(COALESCE(gear_id,'')),COUNT(*) FROM activities WHERE bike IS NOT NULL AND TRIM(bike)!='' GROUP BY LOWER(TRIM(bike)) ORDER BY COUNT(*) DESC,TRIM(bike) COLLATE NOCASE LIMIT 100").fetchall()
+            return {'id':activity_id,'values':current,'edited':bool(old),'original':{**current,**json.loads(old[0])} if old else current,'updated_at':old[2] if old else None,'gear_options':[{'name':name,'gear_id':gid,'count':count} for name,gid,count in known_gear]}
+        if action=='restore':
+            if old:
+                originals={**current,**json.loads(old[0])}
+                con.execute('UPDATE activities SET '+','.join(k+'=?' for k in EDITABLE_ACTIVITY_FIELDS)+' WHERE id=?',tuple(originals[k] for k in EDITABLE_ACTIVITY_FIELDS)+(activity_id,))
+                con.execute('DELETE FROM activity_overrides WHERE activity_id=?',(activity_id,))
+                con.execute('INSERT INTO activity_edit_log(activity_id,changed_at,previous,updated) VALUES(?,?,?,?)',(activity_id,dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),json.dumps(current),json.dumps(originals)))
+        elif action=='save':
+            if not isinstance(changes,dict) or set(changes)!=set(EDITABLE_ACTIVITY_FIELDS):raise ValueError('Invalid edit fields')
+            validated={}
+            for key in EDITABLE_ACTIVITY_FIELDS:
+                value=changes[key]
+                if key in ('name','sport','bike','gear_id'):
+                    if value is None and key in ('bike','gear_id'):value=''
+                    if not isinstance(value,str):raise ValueError('Expected text for '+key)
+                    value=value.strip()
+                    if key in ('name','sport') and not value:raise ValueError('Name and activity type are required')
+                    if len(value)>{'name':300,'sport':80,'bike':160,'gear_id':120}[key] or any(ord(c)<32 for c in value):raise ValueError('Invalid '+key)
+                elif key=='day':
+                    if value is not None:
+                        if not isinstance(value,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',value):raise ValueError('Invalid date')
+                        try: d=dt.date.fromisoformat(value)
+                        except ValueError:raise ValueError('Invalid calendar date')
+                        if not 1980<=d.year<=2200:raise ValueError('Activity date must be between 1980 and 2200')
+                else:
+                    limits={'recorded_distance_m':2e7,'moving_seconds':1e8,'elapsed_seconds':1e8,'elevation_m':1e6,'avg_speed':70,'max_speed':100,'avg_heart_rate':270,'avg_power':3000,'avg_cadence':300,'calories_kcal':1e6,'avg_temp_c':100,'max_temp_c':100,'weather_temp_c':100,'wind_speed_mps':80,'wind_gust_mps':100}
+                    if value in ('',None):value=None
+                    elif type(value) not in (int,float) or not math.isfinite(value) or not (-80<=value<limits[key] if key.endswith('temp_c') else 0<=value<limits[key]):
+                        raise ValueError('Invalid '+key+' measurement')
+                validated[key]=value
+            original={**current,**json.loads(old[0])} if old else current
+            now=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+            con.execute('UPDATE activities SET '+','.join(k+'=?' for k in EDITABLE_ACTIVITY_FIELDS)+' WHERE id=?',tuple(validated[k] for k in EDITABLE_ACTIVITY_FIELDS)+(activity_id,))
+            if validated==original:
+                con.execute('DELETE FROM activity_overrides WHERE activity_id=?',(activity_id,))
+            else:
+                con.execute('INSERT INTO activity_overrides(activity_id,originals,values_json,updated_at) VALUES(?,?,?,?) ON CONFLICT(activity_id) DO UPDATE SET values_json=excluded.values_json,updated_at=excluded.updated_at',(activity_id,json.dumps(original),json.dumps(validated),now))
+            con.execute('INSERT INTO activity_edit_log(activity_id,changed_at,previous,updated) VALUES(?,?,?,?)',(activity_id,now,json.dumps(current),json.dumps(validated)))
+        else:raise ValueError('Unknown edit action')
+    clear_render_caches(include_tracks=False)
+    start_heat_warmup()
+    return edit_activity_details(activity_id)
+
+
+def reapply_activity_override(con, activity_id):
+    record=con.execute('SELECT values_json FROM activity_overrides WHERE activity_id=?',(activity_id,)).fetchone()
+    if record:
+        values=json.loads(record[0])
+        con.execute('UPDATE activities SET '+','.join(k+'=?' for k in EDITABLE_ACTIVITY_FIELDS if k in values)+' WHERE id=?',tuple(values[k] for k in EDITABLE_ACTIVITY_FIELDS if k in values)+(activity_id,))
+
+
+
+def estimate_activity_speeds(activity_id):
+    if type(activity_id) is not int or not 0 < activity_id < 10**12:
+        raise ValueError('Invalid activity')
+    with db_connect() as con:
+        row=con.execute('SELECT id,sport,COALESCE(recorded_distance_m,distance_m),moving_seconds,avg_speed,max_speed,west,south,east,north,coordinates FROM activities WHERE id=?',(activity_id,)).fetchone()
+        if row is None:raise ValueError('Activity not found')
+        record=con.execute('SELECT payload FROM activity_telemetry WHERE activity_id=?',(activity_id,)).fetchone()
+        other=con.execute('SELECT id,COALESCE(recorded_distance_m,distance_m),avg_speed,west,south,east,north,coordinates,sport FROM activities WHERE id!=? AND distance_m BETWEEN ? AND ? AND west<? AND east>? AND south<? AND north>? ORDER BY id DESC LIMIT 160',
+            (activity_id,max(1,(row[2] or 0)*.75),(row[2] or 0)*1.25+1,row[8]+.05,row[6]-.05,row[9]+.05,row[7]-.05)).fetchall()
+    samples=[]
+    if record:
+        try:samples=json.loads(zlib.decompress(record[0]))
+        except (TypeError,ValueError,zlib.error):samples=[]
+    validated=[];rejected=0
+    for a,b in zip(samples,samples[1:]):
+        try:
+            ta,la,oa=a[:3];tb,lb,ob=b[:3]
+            if not all(type(v) in (int,float) and math.isfinite(v) for v in (ta,la,oa,tb,lb,ob)):continue
+            dt_s=tb-ta
+            if not 0.5<=dt_s<=45 or abs(la)>85 or abs(lb)>85:continue
+            distance=haversine((la,oa),(lb,ob))
+            if not math.isfinite(distance):continue
+            if len(a)>8 and len(b)>8 and type(a[8]) in (int,float) and type(b[8]) in (int,float):
+                rise=abs(a[8]-b[8])
+                if rise>max(18,distance*.50):rejected+=1;continue
+                distance=math.hypot(distance,rise)
+            gps_speed=distance/dt_s
+            if gps_speed>32 or gps_speed<0:rejected+=1;continue
+            sensor=b[3] if len(b)>3 else None
+            if type(sensor) in (int,float) and math.isfinite(sensor) and 0<=sensor<=32 and abs(sensor-gps_speed)<max(5,0.8*gps_speed):
+                validated.append((gps_speed+sensor)/2)
+            else:validated.append(gps_speed)
+        except (TypeError,ValueError,IndexError):continue
+    moving=sorted(v for v in validated if v>=1.0)
+    sustained=None
+    if len(moving)>=6:
+        groups=sorted(sorted(validated[i:i+3])[1] for i in range(len(validated)-2) if sum(v>=1 for v in validated[i:i+3])>=2)
+        if groups:
+            sustained=round(groups[max(0,int(.98*(len(groups)-1)))],4)
+    same_sport=lambda sp:('ride' in (sp or '').casefold() or 'cycl' in (sp or '').casefold() or 'bik' in (sp or '').casefold())==('ride' in (row[1] or '').casefold() or 'cycl' in (row[1] or '').casefold() or 'bik' in (row[1] or '').casefold())
+    first,last=None,None
+    for pt in iter_coordinates(row[10]):
+        if pt is None:continue
+        if first is None:first=pt
+        last=pt
+    peers=[]
+    if first is not None and last is not None:
+        for item in other:
+            if not same_sport(item[8]) or item[2] is None or not (0<item[2]<30):continue
+            pfirst,plast=None,None
+            for pt in iter_coordinates(item[7]):
+                if pt is None:continue
+                if pfirst is None:pfirst=pt
+                plast=pt
+            if pfirst and plast and min(haversine(first,pfirst)+haversine(last,plast),haversine(first,plast)+haversine(last,pfirst))<=850:
+                peers.append(item[2])
+    peers.sort()
+    median=(peers[(len(peers)-1)//2]+peers[len(peers)//2])/2 if peers else None
+    return {'activity_id':activity_id,'valid_intervals':len(validated),'rejected_intervals':rejected,
+            'sustained_max_mps':sustained,'comparable_count':len(peers),'comparable_median_avg_mps':median,
+            'distance_time_average_mps':row[2]/row[3] if row[2] and row[3] and row[3]>0 else None,
+            'recorded_avg_mps':row[4],'recorded_max_mps':row[5],
+            'advisory':'Experimental estimate only; source speed, elevation and GPS telemetry remain unchanged until you explicitly save an edit.'}
+
+
+def geometry_data(blob):
+    return list(iter_coordinates(blob))
+
+
+def geometry_pack(points):
+    buf=bytearray()
+    for point in points:
+        buf.extend(struct.pack('<ii',2147483647,2147483647) if point is None else struct.pack('<ii',round(point[0]*1e6),round(point[1]*1e6)))
+    return zlib.compress(bytes(buf),6)
+
+
+def geometry_measure(points):
+    previous=None; distance=0.0; box=[90.0,180.0,-90.0,-180.0]; count=0
+    for p in points:
+        if p is None:previous=None;continue
+        count+=1
+        box[0]=min(box[0],p[0]);box[1]=min(box[1],p[1]);box[2]=max(box[2],p[0]);box[3]=max(box[3],p[1])
+        if previous is not None:distance+=haversine(previous,p)
+        previous=p
+    if count<2:raise ValueError('Not enough GPS positions for repair')
+    return count,box,distance
+
+
+def route_spike_candidates(points,samples):
+    spikes=[]
+    if len(samples)>8000 or len(points)>MAX_POINTS:raise ValueError('Route exceeds anomaly-review safety limit')
+    for k in range(1,len(samples)-1):
+        a,b,c=samples[k-1:k+2]
+        if any(len(r)<3 or any(type(v) not in (float,int) or not math.isfinite(v) for v in r[:3]) for r in (a,b,c)):continue
+        d1=b[0]-a[0];d2=c[0]-b[0]
+        if not (0<d1<=25 and 0<d2<=25):continue
+        left=haversine(a[1:3],b[1:3]);right=haversine(b[1:3],c[1:3]);short=haversine(a[1:3],c[1:3])
+        if not (min(left,right)>=140 and left/d1>=35 and right/d2>=35 and short<=65 and left+right-short>330):continue
+        if abs(a[1])>85 or abs(b[1])>85 or abs(c[1])>85:continue
+        before=(a[1],a[2]);after=(c[1],c[2]);bad=(b[1],b[2])
+        center=min(range(len(points)),key=lambda i:haversine(points[i],bad) if points[i] is not None else 1e10)
+        if points[center] is None or haversine(points[center],bad)>65:continue
+        lower=max(0,center-145);upper=min(len(points),center+146)
+        start_candidates=[i for i in range(lower,center) if points[i] is not None and haversine(points[i],before)<=52]
+        end_candidates=[i for i in range(center+1,upper) if points[i] is not None and haversine(points[i],after)<=52]
+        if not start_candidates or not end_candidates:continue
+        start=max(start_candidates);end=min(end_candidates)
+        if end-start<3 or end-start>260 or any(x is None for x in points[start:end+1]):continue
+        removed=sum(haversine(points[i],points[i+1]) for i in range(start,end))
+        new_distance=haversine(points[start],points[end])
+        if removed-new_distance<300:continue
+        if spikes and start<=spikes[-1]['end_index']:continue
+        spikes.append({'sample_index':k,'start_index':start,'end_index':end,
+            'before':[round(v,6) for v in before],'outlier':[round(v,6) for v in bad],
+            'after':[round(v,6) for v in after],'detour_m':round(removed-new_distance),
+            'time_seconds':round(d1+d2,1),'jump_speed_kmh':round(max(left/d1,right/d2)*3.6)})
+        if len(spikes)>=16:break
+    return spikes
+
+
+def route_after_proposals(points, proposals):
+    result=list(points)
+    for item in reversed(proposals):
+        result[item['start_index']+1:item['end_index']]=[]
+    return result
+
+
+def route_review(activity_id, action=None, selection=None):
+    if type(activity_id) is not int or not 0<activity_id<10**12:raise ValueError('Invalid activity ID')
+    if action is not None and action not in ('apply','restore'):raise ValueError('Unknown route action')
+    if action:
+        with STATE_LOCK:
+            if JOB['status']=='running':raise ValueError('Finish importing before editing the stored route')
+    with db_connect() as con:
+        row=con.execute('SELECT coordinates,point_count,distance_m,west,south,east,north FROM activities WHERE id=?',(activity_id,)).fetchone()
+        if row is None:raise ValueError('Activity not found')
+        saved=con.execute('SELECT original_coordinates,original_point_count,original_distance_m,original_bbox,original_telemetry,original_telemetry_count,edits,applied_at FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone()
+        if action=='restore':
+            if saved:
+                bb=json.loads(saved[3])
+                con.execute('UPDATE activities SET coordinates=?,point_count=?,distance_m=?,west=?,south=?,east=?,north=? WHERE id=?',(saved[0],saved[1],saved[2],bb[0],bb[1],bb[2],bb[3],activity_id))
+                if saved[4] is not None:
+                    con.execute('UPDATE activity_telemetry SET payload=?,sample_count=? WHERE activity_id=?',(saved[4],saved[5],activity_id))
+                con.execute('DELETE FROM activity_route_repairs WHERE activity_id=?',(activity_id,))
+        elif action=='apply' and saved:raise ValueError('Restore the original route before reviewing another repair')
+        elif action=='apply':
+            telemetry=con.execute('SELECT payload,sample_count FROM activity_telemetry WHERE activity_id=?',(activity_id,)).fetchone()
+            if not telemetry:raise ValueError('This route has no timestamped GPS evidence for a safe repair')
+            samples=json.loads(zlib.decompress(telemetry[0]))
+            points=geometry_data(row[0]);proposals=route_spike_candidates(points,samples)
+            if not isinstance(selection,list) or not selection or len(selection)>16 or any(type(i) is not int for i in selection) or len(set(selection))!=len(selection):raise ValueError('Select the candidate spikes to repair')
+            chosen=[v for v in proposals if v['sample_index'] in selection]
+            if len(chosen)!=len(selection):raise ValueError('Route changed; refresh the review before applying')
+            fixed=route_after_proposals(points,chosen)
+            count,bbox,distance=geometry_measure(fixed)
+            if distance>=row[2]:raise ValueError('No supported GPS spike reduction')
+            for proposal in chosen:
+                i=proposal['sample_index'];samples[i][1]=(samples[i-1][1]+samples[i+1][1])/2;samples[i][2]=(samples[i-1][2]+samples[i+1][2])/2
+            payload=zlib.compress(json.dumps(samples,allow_nan=False,separators=(',',':')).encode(),6)
+            con.execute('INSERT INTO activity_route_repairs(activity_id,original_coordinates,original_point_count,original_distance_m,original_bbox,original_telemetry,original_telemetry_count,edits,applied_at) VALUES(?,?,?,?,?,?,?,?,?)',(
+                activity_id,row[0],row[1],row[2],json.dumps([row[3],row[4],row[5],row[6]]),telemetry[0],telemetry[1],json.dumps(chosen),dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')))
+            con.execute('UPDATE activities SET coordinates=?,point_count=?,distance_m=?,west=?,south=?,east=?,north=? WHERE id=?',(geometry_pack(fixed),count,round(distance),bbox[1],bbox[0],bbox[3],bbox[2],activity_id))
+            con.execute('UPDATE activity_telemetry SET payload=? WHERE activity_id=?',(payload,activity_id))
+    if action:
+        clear_render_caches(include_tracks=True)
+        start_heat_warmup()
+        return route_review(activity_id)
+    if saved:
+        return {'activity_id':activity_id,'applied':True,'applied_at':saved[7],
+                'changes':json.loads(saved[6]),'original_distance_m':saved[2],'current_distance_m':row[2],
+                'message':'Original GPS track and sensor coordinates are preserved in the local database and can be restored.'}
+    telemetry=con_telemetry=None
+    with db_connect() as con:
+        telemetry=con.execute('SELECT payload FROM activity_telemetry WHERE activity_id=?',(activity_id,)).fetchone()
+    points=geometry_data(row[0]); proposals=[]
+    if telemetry:
+        samples=json.loads(zlib.decompress(telemetry[0]));proposals=route_spike_candidates(points,samples)
+    repaired=route_after_proposals(points,proposals) if proposals else points
+    def preview(values):
+        step=max(1,math.ceil(len(values)/1600));out=[]
+        for i,p in enumerate(values):
+            if p is None:out.append(None)
+            elif i%step==0:out.append([round(p[0],6),round(p[1],6)])
+        if values and values[-1] is not None and (not out or out[-1]!=list(values[-1])):out.append([round(x,6) for x in values[-1]])
+        return out
+    return {'activity_id':activity_id,'applied':False,'proposals':proposals,
+        'original_distance_m':row[2], 'proposed_distance_m':round(geometry_measure(repaired)[2]),
+        'original_points':preview(points),'proposed_points':preview(repaired),
+        'message':'Only isolated, implausibly fast GPS excursions supported by timestamped sensor positions are proposed. Legitimate out-and-back riding and GPS gaps are not automatically changed.'}
+
+
 def statistics():
     with db_connect() as con:
         count, points, west, south, east, north = con.execute("SELECT COUNT(*), COALESCE(SUM(point_count),0), MIN(west), MIN(south), MAX(east), MAX(north) FROM activities").fetchone()
@@ -1273,24 +2506,870 @@ def set_anomaly_filter(enabled):
     return bool(enabled)
 
 
+def load_display_units():
+    with db_connect() as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key='display_units'").fetchone()
+    return row[0] if row and row[0] in ('mi','km') else 'mi'
+
+
+def save_display_units(value):
+    if value not in ('mi','km') or type(value) is not str:
+        raise ValueError('Invalid display units')
+    with db_connect() as con:
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('display_units',?)",(value,))
+    return {'display_units':value}
+
+
+def speed_threshold_mph(rows):
+    try:
+        result = float(rows.get('speed_threshold_mph', '50'))
+        if math.isfinite(result) and 5 <= result <= 200:
+            return result
+    except (TypeError, ValueError):
+        pass
+    return 50.0
+
+
+def garmin_sync_minutes(rows):
+    try:
+        raw = str(rows.get('garmin_sync_minutes', '60'))
+        if raw.isdecimal() and 15 <= int(raw) <= 1440:
+            return int(raw)
+    except (TypeError, ValueError):
+        pass
+    return 60
+
+
+def load_garmin_sync_minutes():
+    with db_connect() as con:
+        row = con.execute("SELECT value FROM app_settings WHERE key='garmin_sync_minutes'").fetchone()
+    return garmin_sync_minutes({'garmin_sync_minutes': row[0]}) if row else 60
+
+
 def statistics_preferences():
     with db_connect() as con:
-        rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key IN ('filter_speed_anomalies','filter_speed_smart','advanced_data')"))
-    return {"filter_speed_anomalies":rows.get('filter_speed_anomalies')=='1',
-            "filter_speed_smart":rows.get('filter_speed_smart')=='1',"advanced_data":rows.get('advanced_data')=='1'}
+        rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key IN ('filter_speed_anomalies','filter_speed_smart','advanced_data','speed_threshold_mph','garmin_sync_minutes','strava_sync_minutes','strava_recent_count')"))
+    return {'filter_speed_anomalies':rows.get('filter_speed_anomalies')=='1',
+            'filter_speed_smart':rows.get('filter_speed_smart')=='1',
+            'advanced_data':rows.get('advanced_data')=='1',
+            'speed_threshold_mph':speed_threshold_mph(rows),
+            'garmin_sync_minutes':garmin_sync_minutes(rows),
+            'strava_sync_minutes':strava_sync_interval(), 'strava_recent_count':strava_recent_count()}
 
 
 def store_all_settings(payload):
-    if not isinstance(payload,dict) or set(payload)!={'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data'}:
+    if not isinstance(payload,dict) or set(payload) not in ({'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data','display_units','watch_folder','speed_threshold_mph','garmin_sync_minutes','strava_sync_minutes','strava_recent_count'}, {'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data','display_units','watch_folder','speed_threshold_mph','garmin_sync_minutes','strava_sync_minutes'}):
         raise ValueError('Invalid settings fields')
     if type(payload['filter_speed_anomalies']) is not bool or type(payload['filter_speed_smart']) is not bool or type(payload['advanced_data']) is not bool:
         raise ValueError('Invalid statistics toggles')
     appearance=normalize_appearance(payload['appearance'])
+    if payload['display_units'] not in ('mi','km') or type(payload['display_units']) is not str:
+        raise ValueError('Invalid display units')
+    threshold = payload['speed_threshold_mph']
+    if type(threshold) not in (int,float) or not math.isfinite(threshold) or not 5 <= threshold <= 200:
+        raise ValueError('Custom speed threshold must be from 5 to 200 mph')
+    threshold = round(float(threshold), 5)
+    interval = payload['garmin_sync_minutes']
+    if type(interval) is not int or not 15 <= interval <= 1440:
+        raise ValueError('Garmin automatic sync interval must be from 15 to 1440 minutes')
+    strava_interval=payload['strava_sync_minutes']
+    if type(strava_interval) is not int or not 15 <= strava_interval <= 1440:
+        raise ValueError('Strava automatic sync interval must be from 15 to 1440 minutes')
+    recent_count=payload.get('strava_recent_count',strava_recent_count())
+    if type(recent_count) is not int or not 1 <= recent_count <= 50:
+        raise ValueError('Strava recent activity count must be from 1 to 50')
+    watch_folder=normalize_watch_folder(payload['watch_folder'])
     with db_connect() as con:
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('appearance',?)", (json.dumps(appearance,separators=(',',':')),))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('display_units',?)",(payload['display_units'],))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('watch_folder',?)",(watch_folder,))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('speed_threshold_mph',?)",(str(threshold),))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('garmin_sync_minutes',?)",(str(interval),))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('strava_sync_minutes',?)",(str(strava_interval),))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('strava_recent_count',?)",(str(recent_count),))
         for name in ('filter_speed_anomalies','filter_speed_smart','advanced_data'):
             con.execute('INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)',(name,'1' if payload[name] else '0'))
-    return {'appearance':appearance,**{k:payload[k] for k in ('filter_speed_anomalies','filter_speed_smart','advanced_data')}}
+    return {'appearance':appearance,**{k:payload[k] for k in ('filter_speed_anomalies','filter_speed_smart','advanced_data')},'speed_threshold_mph':threshold,'garmin_sync_minutes':interval,'strava_sync_minutes':strava_interval,'strava_recent_count':recent_count,'display_units':payload['display_units'],'watch_folder':watch_folder}
+
+
+# Optional Strava desktop GPX connection. This uses the user's own isolated
+# Chromium/Edge profile, not a Strava developer API or the user's normal browser
+# profile. Browser automation is unofficial and may conflict with Strava's terms.
+# Never read or export browser cookies/passwords; disconnect deletes this profile.
+STRAVA_PROFILE_NAME = 'Strava-Browser-Session'
+STRAVA_RECONNECT_KEY = 'strava_browser_reconnect_required'
+
+
+class StravaReauthenticationRequired(ValueError):
+    """Only a confirmed Strava sign-in page triggers this state."""
+
+STRAVA_SYNC_LOCK = threading.Lock()
+STRAVA_STATUS_LOCK = threading.RLock()
+STRAVA_SCHEDULE_LOCK = threading.Lock()
+STRAVA_BROWSER_LOCK = threading.Lock()
+STRAVA_BROWSER_PROCESS = None
+STRAVA_LAST_ATTEMPT_MONO = 0.0
+STRAVA_STOP = threading.Event()
+STRAVA_STATUS = {'running': False, 'connecting': False, 'message': 'Not connected. Optional unofficial browser-based GPX syncing requires your Strava account and permission to use its website.', 'last_sync': None, 'checked': 0, 'added': 0, 'skipped': 0, 'failed': 0}
+STRAVA_TRAINING_URL = 'https://www.strava.com/athlete/training'
+
+
+def strava_profile_path():
+    return DB_PATH.parent / STRAVA_PROFILE_NAME
+
+
+def strava_connection_state():
+    with db_connect() as con:
+        saved = dict(con.execute("SELECT key,value FROM app_settings WHERE key IN ('strava_browser_connected',?)", (STRAVA_RECONNECT_KEY,)))
+    profile = strava_profile_path()
+    has_session = profile.is_dir() and not profile.is_symlink()
+    authorized = saved.get('strava_browser_connected') == '1' and has_session
+    reconnect_required = authorized and saved.get(STRAVA_RECONNECT_KEY) == '1'
+    return {'connected': authorized and not reconnect_required,
+            'session_saved': authorized, 'reconnect_required': reconnect_required,
+            'has_session': profile.is_dir() or profile.is_symlink()}
+
+
+def strava_connected():
+    return strava_connection_state()['connected']
+
+
+def strava_require_reconnect():
+    # Pause subsequent automatic checks across restarts, without deleting cookies,
+    # the local browser profile, imported rides, or the user's consent to reconnect.
+    if STRAVA_STOP.is_set():return
+    with db_connect() as con:
+        still_connected=con.execute("SELECT value FROM app_settings WHERE key='strava_browser_connected'").fetchone()
+        if not still_connected or still_connected[0]!='1':return
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?, '1')", (STRAVA_RECONNECT_KEY,))
+    with STRAVA_STATUS_LOCK:
+        STRAVA_STATUS.update(message='Strava sign-in expired. Automatic GPX checks are paused. Select Reconnect Strava to sign in again; imported rides are safe.')
+
+
+def strava_sync_interval():
+    with db_connect() as con:
+        record = con.execute("SELECT value FROM app_settings WHERE key='strava_sync_minutes'").fetchone()
+    try:
+        minutes = int(record[0]) if record else 60
+        return minutes if 15 <= minutes <= 1440 else 60
+    except (TypeError, ValueError):
+        return 60
+
+
+def strava_recent_count():
+    with db_connect() as con:
+        record = con.execute("SELECT value FROM app_settings WHERE key='strava_recent_count'").fetchone()
+    try:
+        count = int(record[0]) if record else 25
+        return count if 1 <= count <= 50 else 25
+    except (TypeError, ValueError):
+        return 25
+
+
+def strava_status():
+    with STRAVA_STATUS_LOCK:
+        status = dict(STRAVA_STATUS)
+    state = strava_connection_state()
+    status.update(state)
+    if state['reconnect_required'] and not status['connecting']:
+        status['message'] = 'Strava sign-in expired. Automatic GPX checks are paused. Select Reconnect Strava to sign in again; imported rides are safe.'
+    elif not state['session_saved'] and not status['running'] and status['message'].startswith('Strava sign-in expired.'):
+        status['message'] = 'Strava disconnected. A fresh connection needs a new sign-in in the dedicated browser window.'
+    elif state['connected'] and status['message'].startswith('Not connected.'):
+        status['message'] = 'Strava browser session saved on this computer. Login will be checked on the next sync; reconnect only if prompted.'
+    status['sync_interval_minutes'] = strava_sync_interval()
+    status['recent_count'] = strava_recent_count()
+    status['method'] = 'Unofficial Strava website GPX export (no developer API)'
+    return status
+
+
+def strava_browser_executable():
+    # Search standard desktop installation locations without installing software.
+    guesses = []
+    if os.name == 'nt':
+        for base in (os.environ.get('PROGRAMFILES'), os.environ.get('PROGRAMFILES(X86)'), os.environ.get('LOCALAPPDATA')):
+            if base:
+                guesses += [Path(base)/'Microsoft/Edge/Application/msedge.exe', Path(base)/'Google/Chrome/Application/chrome.exe']
+    elif sys.platform == 'darwin':
+        guesses += [Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'), Path('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge')]
+    for exe in guesses:
+        if exe.is_file():
+            return str(exe)
+    for name in ('msedge', 'microsoft-edge', 'google-chrome', 'chromium', 'chromium-browser'):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise ValueError('Install Microsoft Edge or Chrome on your computer to connect Strava in a dedicated browser window')
+
+
+def strava_start_browser(*, visible):
+    global STRAVA_BROWSER_PROCESS
+    profile = strava_profile_path()
+    if profile.exists() and (profile.is_symlink() or not profile.is_dir()):
+        raise ValueError('Strava session folder is not an ordinary directory')
+    profile.mkdir(parents=True, exist_ok=True)
+    if os.name != 'nt':
+        os.chmod(profile, 0o700)
+    marker = profile/'DevToolsActivePort'
+    marker.unlink(missing_ok=True)
+    command = [strava_browser_executable(), '--user-data-dir='+str(profile), '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', '--disable-background-mode', '--disable-extensions']
+    startup = None
+    if not visible:
+        if os.name == 'nt':
+            # Keep the real desktop browser engine that preserves the verified
+            # sign-in session. Hide only LibreHeatmaps' dedicated browser.
+            command += ['--start-minimized', '--window-position=-32000,-32000']
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = 0  # SW_HIDE
+        else:
+            command += ['--headless=new', '--disable-gpu']
+    command.append(STRAVA_TRAINING_URL)
+    kwargs = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+    if startup is not None:
+        kwargs['startupinfo'] = startup
+    proc = subprocess.Popen(command, **kwargs)
+    with STRAVA_BROWSER_LOCK:
+        STRAVA_BROWSER_PROCESS = proc
+    if os.name == 'nt' and not visible:
+        threading.Thread(target=strava_hide_sync_browser, args=(proc,), daemon=True,
+                         name='LibreHeatmaps-Strava-Window-Hider').start()
+    try:
+        port = None
+        deadline = time.monotonic()+22
+        while time.monotonic() < deadline:
+            if STRAVA_STOP.is_set():
+                raise ValueError('Strava connection was disconnected')
+            if marker.is_file():
+                try:
+                    candidate = marker.read_text(encoding='ascii').splitlines()[0].strip()
+                    if candidate.isdecimal() and 1 <= int(candidate) <= 65535:
+                        port = int(candidate)
+                        break
+                except (OSError, UnicodeError, ValueError):
+                    pass
+            if proc.poll() is not None:
+                break
+            time.sleep(.2)
+        if port is None:
+            raise ValueError('Could not start the dedicated Strava browser. Close other LibreHeatmaps Strava windows and try again')
+        return proc, port
+    except Exception:
+        # A browser startup failure must not leave a session/profile lock behind.
+        strava_end_browser(proc)
+        raise
+
+
+
+def strava_hide_sync_browser(proc):
+    # The normal Chrome/Edge rendering engine keeps the working Strava session,
+    # but can ignore --start-minimized on navigation. Only hide HWNDs owned by
+    # our dedicated browser PID; never change the user's usual browser windows.
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, wintypes.LPARAM)
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = ctypes.c_int
+        user32.ShowWindowAsync.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindowAsync.restype = ctypes.c_int
+        def hide_window(hwnd, _):
+            owner = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == proc.pid and user32.IsWindowVisible(hwnd):
+                user32.ShowWindowAsync(hwnd, 0)  # SW_HIDE
+            return 1
+        callback = callback_type(hide_window)
+        while proc.poll() is None:
+            user32.EnumWindows(callback, 0)
+            time.sleep(.12)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # A failure to hide the background window must not break GPS imports.
+        return
+
+def strava_end_browser(proc, *, graceful=False):
+    global STRAVA_BROWSER_PROCESS
+    if proc is not None and proc.poll() is None:
+        # CDP Browser.close requests a normal shutdown, but can return before
+        # Chromium has flushed its cookie database. On Windows, terminate()
+        # kills the process immediately and can lose the new Strava login.
+        if graceful:
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    with STRAVA_BROWSER_LOCK:
+        if STRAVA_BROWSER_PROCESS is proc:
+            STRAVA_BROWSER_PROCESS = None
+
+
+def strava_browser_target(port):
+    # Chrome may publish DevToolsActivePort before it creates the first page.
+    # Wait for the app's page rather than selecting an unrelated new-tab target.
+    expected = urlparse(STRAVA_TRAINING_URL).hostname or ''
+    expected_hosts={expected,'strava.com','www.strava.com'} if expected else set()
+    deadline=time.monotonic()+12
+    fallback=None
+    while time.monotonic()<deadline:
+        try:
+            raw=urlopen(Request('http://127.0.0.1:{}/json'.format(port),headers={'Accept':'application/json'}),timeout=3).read(512*1024)
+            targets=json.loads(raw)
+            strava_target=None
+            for item in targets:
+                url=item.get('webSocketDebuggerUrl','')
+                if item.get('type')!='page' or not url.startswith('ws://127.0.0.1:{}/'.format(port)):
+                    continue
+                if not fallback:fallback=url
+                actual=item.get('url','')
+                parsed=urlparse(actual)
+                if expected and parsed.hostname in expected_hosts:
+                    # Saved profiles can reopen more than one Strava tab. Never
+                    # attach to an older login tab when My Activities is open.
+                    if parsed.path.rstrip('/')==urlparse(STRAVA_TRAINING_URL).path.rstrip('/'):
+                        return url
+                    if not strava_target:strava_target=url
+                elif not expected and actual.startswith(STRAVA_TRAINING_URL):
+                    return url
+            if strava_target:return strava_target
+        except (OSError,ValueError,URLError,json.JSONDecodeError):
+            pass
+        time.sleep(.25)
+    if fallback:return fallback
+    raise ValueError('The Strava browser did not open an activity tab')
+
+
+class StravaDevTools:
+    # Small RFC 6455 WebSocket client for desktop Chromium's local DevTools API.
+    # The application intentionally has no third-party Python dependencies.
+    def __init__(self, ws_url):
+        parsed = urlparse(ws_url)
+        if parsed.scheme != 'ws' or parsed.hostname != '127.0.0.1' or not parsed.port:
+            raise ValueError('Unexpected browser debugging endpoint')
+        self.socket = socket.create_connection(('127.0.0.1', parsed.port), timeout=10)
+        self.socket.settimeout(18)
+        self.next_id = 0
+        key = base64.b64encode(os.urandom(16)).decode('ascii')
+        request = 'GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n'.format(parsed.path, parsed.port, key)
+        self.socket.sendall(request.encode('ascii'))
+        response = b''
+        while b'\r\n\r\n' not in response and len(response) < 8192:
+            response += self.socket.recv(8192)
+        headers, sep, tail = response.partition(b'\r\n\r\n')
+        expected = base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest())
+        if not sep or not headers.startswith(b'HTTP/1.1 101 ') or expected not in headers:
+            self.close()
+            raise ValueError('The browser rejected its local control connection')
+        self.pending = tail
+
+    def close(self):
+        try:self.socket.close()
+        except OSError:pass
+
+    def _send(self, payload, opcode=1):
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytearray([0x80|opcode])
+        if length < 126:header.append(0x80|length)
+        elif length < 65536:header.extend([0x80|126]);header.extend(struct.pack('!H',length))
+        else:header.extend([0x80|127]);header.extend(struct.pack('!Q',length))
+        header.extend(mask)
+        self.socket.sendall(header+bytes(b ^ mask[i%4] for i,b in enumerate(payload)))
+
+    def _receive_bytes(self, count):
+        while len(self.pending) < count:
+            fragment = self.socket.recv(min(262144,max(4096,count-len(self.pending))))
+            if not fragment:raise ConnectionError('Strava browser closed its connection')
+            self.pending += fragment
+        result, self.pending = self.pending[:count], self.pending[count:]
+        return result
+
+    def _receive(self):
+        combined=bytearray()
+        while True:
+            head=self._receive_bytes(2)
+            opcode=head[0]&15
+            length=head[1]&127
+            if length == 126:length=struct.unpack('!H',self._receive_bytes(2))[0]
+            elif length == 127:length=struct.unpack('!Q',self._receive_bytes(8))[0]
+            if length > 16*1024*1024:raise ValueError('Oversized browser response')
+            mask=self._receive_bytes(4) if head[1]&128 else None
+            payload=self._receive_bytes(length)
+            if mask:payload=bytes(b^mask[i%4] for i,b in enumerate(payload))
+            if opcode == 8:raise ConnectionError('Strava browser was closed')
+            if opcode == 9:self._send(payload,10);continue
+            combined.extend(payload)
+            if head[0]&0x80:
+                if opcode in (1,0):return json.loads(combined.decode('utf-8'))
+                combined.clear()
+
+    def call(self, method, params=None):
+        self.next_id += 1
+        ident = self.next_id
+        self._send(json.dumps({'id':ident,'method':method,'params':params or {}},separators=(',',':')).encode('utf-8'))
+        deadline=time.monotonic()+18
+        while time.monotonic()<deadline:
+            result=self._receive()
+            if result.get('id') == ident:
+                if 'error' in result:
+                    raise ValueError('Browser command failed: '+str(result['error'].get('message','unknown'))[:120])
+                return result.get('result',{})
+        raise TimeoutError('Browser control request timed out')
+
+    def evaluate(self, expression):
+        result=self.call('Runtime.evaluate',{'expression':expression,'returnByValue':True,'awaitPromise':False})
+        if result.get('exceptionDetails'):
+            raise ValueError('Could not read the Strava activities page')
+        return result.get('result',{}).get('value')
+
+
+def strava_signin_page(state):
+    href = state.get('href', '')
+    try:
+        parsed = urlparse(href)
+        path = parsed.path.lower().rstrip('/')
+    except (TypeError, ValueError):
+        path = ''
+    return bool(state.get('password') or path in ('/login', '/session/new', '/signin', '/sign-in') or path.startswith('/login/'))
+
+
+
+# The activity list is rendered asynchronously and may be paginated. Do not
+# interpret the first small batch of links as the complete newest-ten window.
+# Read only Strava's visible My Activities table, using its ordinary page UI;
+# never make private list/API requests or traverse another athlete's feed.
+STRAVA_PAGE_SCAN_JS = r'''(function(advance) {
+  const table = [...document.querySelectorAll('table')].find(t =>
+    t.querySelector('a[href*="/activities/"]'));
+  const source = table || document;
+  const ids = [...new Set([...source.querySelectorAll('a[href*="/activities/"]')]
+    .map(a => (a.getAttribute('href') || '').match(/\/activities\/(\d+)/))
+    .filter(Boolean).map(m => m[1]))];
+  const pager = [...document.querySelectorAll('nav, .pagination, [class*="pagination"], [class*="paginator"], [data-testid*="pagination"]')]
+    .filter(el => /paginat|pager/i.test(String(el.getAttribute('aria-label') || '') + ' ' + String(el.className || '') + ' ' + String(el.getAttribute('data-testid') || '')));
+  const nextCandidates = [];
+  for (const root of pager) nextCandidates.push(...root.querySelectorAll('a, button, [role="button"]'));
+  nextCandidates.push(...document.querySelectorAll('a[rel="next"]'));
+  const next = nextCandidates.find(el => {
+    const description = [el.getAttribute('aria-label'), el.getAttribute('title'),
+      el.getAttribute('data-testid'), el.getAttribute('rel'),
+      el.textContent, String(el.className || '')].filter(Boolean).join(' ');
+    const inNextContainer = !!el.closest('li.next, .next-page, .pagination-next, [data-testid*="next"]');
+    if (!(/\bnext\b/i.test(description) || inNextContainer || /[›»→]/.test(el.textContent || ''))) return false;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest('[aria-disabled="true"], .disabled, [disabled]')) return false;
+    if (el.tagName === 'A' && !el.getAttribute('href')) return false;
+    return el.getClientRects().length > 0;
+  });
+  if (advance && next) next.click();
+  return JSON.stringify({href:location.href, ready:document.readyState,
+    ids:ids.slice(0,50), next:!!next, advanced:!!(advance && next)});
+})'''
+
+
+def strava_visible_activity_page(cdp, *, advance=False):
+    script=STRAVA_PAGE_SCAN_JS+'('+('true' if advance else 'false')+')'
+    raw=cdp.evaluate(script)
+    state=json.loads(raw) if isinstance(raw,str) else {}
+    if not isinstance(state,dict):return {'ids':[], 'next':False, 'advanced':False}
+    ids=[]
+    for value in state.get('ids',[]):
+        if isinstance(value,str) and value.isdecimal() and len(value)>=7:
+            ident=int(value)
+            if ident not in ids:ids.append(ident)
+    return {'ids':ids,'next':bool(state.get('next')),'advanced':bool(state.get('advanced')),
+            'href':state.get('href','')}
+
+
+def strava_extend_recent_activity_ids(cdp, initial_ids, *, target=25):
+    # The first four rows can appear while the table is still hydrating. Allow
+    # a brief settling window before asking Strava's own next-page control for
+    # older rows. Bound pagination to the requested recent 1–50 activity window.
+    found=list(dict.fromkeys(initial_ids))[:target]
+    if len(found)>=target:return found
+    last_change=time.monotonic()
+    max_pages = min(50, max(4, target))
+    for page in range(max_pages):
+        if STRAVA_STOP.is_set():raise ValueError('Strava connection was disconnected')
+        state=None
+        while time.monotonic()-last_change < 2.5:
+            state=strava_visible_activity_page(cdp)
+            visible=state['ids']
+            added=False
+            for ident in visible:
+                if ident not in found:
+                    found.append(ident)
+                    added=True
+                    if len(found)>=target:return found[:target]
+            if added:
+                last_change=time.monotonic()
+            time.sleep(.45)
+        if state is None:state=strava_visible_activity_page(cdp)
+        if not state['next'] or len(found)>=target or page>=max_pages-1:return found[:target]
+        previous_page=set(state['ids'])
+        clicked=strava_visible_activity_page(cdp,advance=True)
+        if not clicked['advanced']:return found[:target]
+        deadline=time.monotonic()+12
+        changed=False
+        while time.monotonic()<deadline:
+            if STRAVA_STOP.is_set():raise ValueError('Strava connection was disconnected')
+            time.sleep(.55)
+            state=strava_visible_activity_page(cdp)
+            current=set(state['ids'])
+            if current and current!=previous_page:
+                changed=True
+                last_change=time.monotonic()
+                break
+        if not changed:return found[:target]
+    return found[:target]
+
+
+def strava_recent_activity_ids(cdp, *, sign_in=False, target=None):
+    if target is None:
+        target = 10 if sign_in else strava_recent_count()
+    if type(target) is not int or not 1 <= target <= 50:
+        raise ValueError('Strava recent activity count must be from 1 to 50')
+    # Only activity links visible on the user's own /athlete/training page are
+    # inspected. Do not use private endpoints, bulk crawl or scrape other riders.
+    script = r'''JSON.stringify({href:location.href,ids:[...new Set(Array.from(document.querySelectorAll('a[href*="/activities/"]')).map(a=>{let m=a.href.match(/\/activities\/(\d+)/);return m?m[1]:null}).filter(Boolean))].slice(0,50),ready:document.readyState,password:[...document.querySelectorAll('input[type="password"]')].some(el=>el.getClientRects().length>0 && getComputedStyle(el).visibility!=='hidden')})'''
+    deadline=time.monotonic()+(240 if sign_in else 35)
+    last=None
+    login_since=None
+    returned_to_activities=False
+    on_other_strava_since=None
+    confirmed_account_page_since=None
+    while time.monotonic()<deadline:
+        if STRAVA_STOP.is_set():raise ValueError('Strava connection was disconnected')
+        try:
+            raw=cdp.evaluate(script)
+            state=json.loads(raw) if isinstance(raw,str) else {}
+            last=state
+            url=state.get('href','')
+            if state.get('ids') and '/athlete/training' in url:
+                first=[int(v) for v in state['ids'] if isinstance(v,str) and v.isdecimal() and len(v)>=7][:target]
+                return first if sign_in or len(first)>=target else strava_extend_recent_activity_ids(cdp,first,target=target)
+            # Signing in and finding rides are separate operations. A user may
+            # have zero activities or Strava may render its activity list in a
+            # format the GPX scanner cannot recognize. Neither means the login
+            # failed. Verify that the account-only page stays loaded, then let
+            # the first sync report any activity-discovery problem separately.
+            parsed=urlparse(url) if isinstance(url,str) else urlparse('')
+            on_account_page=(parsed.hostname in ('strava.com','www.strava.com')
+                and parsed.path.rstrip('/')=='/athlete/training'
+                and state.get('ready')=='complete' and not strava_signin_page(state))
+            if sign_in and on_account_page:
+                if confirmed_account_page_since is None:
+                    confirmed_account_page_since=time.monotonic()
+                elif time.monotonic()-confirmed_account_page_since>=5:
+                    return []
+            else:
+                confirmed_account_page_since=None
+            if not sign_in and state.get('ready','complete')=='complete' and strava_signin_page(state):
+                if login_since is None:login_since=time.monotonic()
+                elif time.monotonic()-login_since>=7:
+                    raise StravaReauthenticationRequired('Strava returned a login page even with the saved browser session. Select Reconnect Strava in Settings')
+            else:
+                login_since=None
+            # Strava can finish OAuth/password sign-in on /dashboard instead of
+            # returning to /athlete/training. Follow the requested page once,
+            # only after reaching a non-login page on strava.com. Never loop.
+            if (sign_in and not returned_to_activities and parsed.hostname in ('strava.com','www.strava.com')
+                    and '/athlete/training' not in parsed.path and not strava_signin_page(state)
+                    and state.get('ready')=='complete'):
+                if on_other_strava_since is None:
+                    on_other_strava_since=time.monotonic()
+                elif time.monotonic()-on_other_strava_since>=1.5:
+                    cdp.call('Page.navigate',{'url':STRAVA_TRAINING_URL})
+                    returned_to_activities=True
+            else:
+                on_other_strava_since=None
+            # Account sign-in may succeed with no recognizable activity links.
+            # The sync phase must report this separately and must never claim
+            # that new GPS rides were imported as a result of sign-in alone.
+        except (socket.timeout,TimeoutError):
+            pass
+        time.sleep(1.5)
+    if last and last.get('ready','complete')=='complete' and strava_signin_page(last):
+        if sign_in:raise ValueError('Please finish signing in to Strava in the opened browser window')
+        raise StravaReauthenticationRequired('Strava still shows its login page. Select Reconnect Strava in Settings')
+    raise ValueError('Could not identify recent activities on Strava. The website may have changed or the account may need sign-in')
+
+
+def strava_download_gpx(cdp, activity_id, download_dir):
+    # Use Strava's normal website export. Do not access other athlete pages.
+    try:
+        cdp.call('Browser.setDownloadBehavior',{'behavior':'allow','downloadPath':str(download_dir)})
+    except ValueError:
+        try:
+            cdp.call('Page.setDownloadBehavior',{'behavior':'allow','downloadPath':str(download_dir)})
+        except ValueError:
+            raise ValueError('The browser did not permit activity-file downloads') from None
+    existing={p.name for p in download_dir.iterdir()}
+    try:
+        result=cdp.call('Page.navigate',{'url':'https://www.strava.com/activities/{}/export_gpx'.format(activity_id)})
+        # Chrome may cancel the page navigation because the response is an
+        # attachment. That cancellation is normal when the GPX is downloading.
+        error_text=str(result.get('errorText','')) if isinstance(result,dict) else ''
+        if error_text and error_text!='net::ERR_ABORTED':
+            raise ValueError('Strava GPX navigation failed: '+error_text[:100])
+    except ValueError as exc:
+        if 'ERR_ABORTED' not in str(exc):
+            raise
+    deadline=time.monotonic()+45
+    last_auth_probe=time.monotonic()
+    while time.monotonic()<deadline:
+        if STRAVA_STOP.is_set():raise ValueError('Strava was disconnected during download')
+        # A login redirect can happen between listing activities and exporting.
+        # Check the current page locally; no additional Strava requests are sent.
+        if time.monotonic()-last_auth_probe>=3:
+            last_auth_probe=time.monotonic()
+            try:
+                state=cdp.evaluate("JSON.stringify({href:location.href,password:!!document.querySelector('input[type=\"password\"]')})")
+                if isinstance(state,str) and strava_signin_page(json.loads(state)):
+                    raise StravaReauthenticationRequired('Strava login expired during GPX export. Select Reconnect Strava in Settings')
+            except (OSError,ConnectionError,TimeoutError,ValueError) as exc:
+                if isinstance(exc,StravaReauthenticationRequired):raise
+        candidates=[p for p in download_dir.iterdir() if p.name not in existing and p.is_file() and p.suffix.casefold()=='.gpx']
+        pending=[p for p in download_dir.iterdir() if p.suffix.casefold() in ('.crdownload','.tmp')]
+        if candidates and not pending:
+            file=max(candidates,key=lambda p:p.stat().st_mtime_ns)
+            if file.stat().st_size > 64*1024*1024:raise ValueError('GPX exceeds the 64 MiB safety limit')
+            raw=file.read_bytes()
+            if not re.search(br'<(?:[A-Za-z0-9_]+:)?gpx\b',raw[:2048],re.I):
+                raise ValueError('Strava returned a file that is not GPX')
+            file.unlink()
+            return raw
+        time.sleep(.3)
+    # A redirect to a sign-in page during an export means the saved session
+    # expired mid-check. Do not repeat the other downloads on a timer.
+    try:
+        state = cdp.evaluate("JSON.stringify({href:location.href,password:!!document.querySelector('input[type=\"password\"]')})")
+        if isinstance(state, str) and strava_signin_page(json.loads(state)):
+            raise StravaReauthenticationRequired('Strava login expired during GPX export. Select Reconnect Strava in Settings')
+    except (OSError, ConnectionError, TimeoutError, ValueError) as exc:
+        if isinstance(exc, StravaReauthenticationRequired):raise
+    raise ValueError('Strava did not return a GPX download for activity {}'.format(activity_id))
+
+
+def strava_save_original(folder_name, activity_id, raw):
+    # Optional original-file retention only in the folder chosen by the user.
+    folder=Path(folder_name)
+    if not folder.is_dir() or folder.is_symlink():raise ValueError('Your chosen activity folder is unavailable')
+    target=folder/('{}_Strava.gpx'.format(activity_id))
+    digest=hashlib.sha256(raw).hexdigest()
+    if target.exists():
+        if target.is_symlink():raise ValueError('Cannot overwrite a linked GPX file')
+        if hashlib.sha256(target.read_bytes()).hexdigest()==digest:return target,False
+        target=folder/('{}_Strava-{}.gpx'.format(activity_id,digest[:12]))
+        if target.exists():
+            if target.is_symlink() or hashlib.sha256(target.read_bytes()).hexdigest()!=digest:raise ValueError('Strava GPX filename conflict')
+            return target,False
+    fd,temp=tempfile.mkstemp(prefix='.strava-transfer-',suffix='.part',dir=str(folder))
+    try:
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(raw);stream.flush();os.fsync(stream.fileno())
+        os.replace(temp,target)
+        return target,True
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+
+
+def strava_connect_job():
+    global STRAVA_LAST_ATTEMPT_MONO
+    if not STRAVA_SYNC_LOCK.acquire(blocking=False):return
+    proc=None;cdp=None;connected_now=False
+    with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(connecting=True,running=True,message='Opening a separate Edge/Chrome profile for auto-sync. Your normal browser login cannot be reused automatically; sign in here once. LibreHeatmaps never receives your password.')
+    try:
+        if STRAVA_STOP.is_set():raise ValueError('Strava was disconnected')
+        proc,port=strava_start_browser(visible=True)
+        cdp=StravaDevTools(strava_browser_target(port))
+        ids=strava_recent_activity_ids(cdp,sign_in=True)
+        if STRAVA_STOP.is_set():raise ValueError('Strava was disconnected')
+        with db_connect() as con:
+            con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('strava_browser_connected','1')")
+            con.execute("DELETE FROM app_settings WHERE key=?", (STRAVA_RECONNECT_KEY,))
+        # Reserve the hourly timer so the scheduler cannot race the immediate check.
+        with STRAVA_SCHEDULE_LOCK:STRAVA_LAST_ATTEMPT_MONO=time.monotonic()
+        connected_now=True
+        with STRAVA_STATUS_LOCK:
+            STRAVA_STATUS.update(message=('Strava session verified; {} recent activity links visible. Checking for missing GPX routes…'.format(len(ids))
+                if ids else 'Strava session verified. No activity links were visible during sign-in; checking recent rides separately…'))
+    except Exception as exc:
+        if not STRAVA_STOP.is_set():
+            with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(message='Strava connection needs attention: '+str(exc)[:240])
+    finally:
+        closed_gracefully=False
+        if cdp:
+            try:
+                cdp.call('Browser.close')
+                closed_gracefully=True
+            except (ValueError,ConnectionError,OSError,TimeoutError,AttributeError):pass
+            cdp.close()
+        strava_end_browser(proc,graceful=closed_gracefully)
+        with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(connecting=False,running=False)
+        STRAVA_SYNC_LOCK.release()
+    if connected_now and not STRAVA_STOP.is_set():
+        threading.Thread(target=strava_first_sync_after_connect,daemon=True,name='LibreHeatmaps-Strava-First-Sync').start()
+
+
+def strava_first_sync_after_connect():
+    # Chromium may hold its profile lock briefly after the interactive window
+    # closes. Allow that lock to settle before reopening the same profile.
+    time.sleep(2)
+    if not STRAVA_STOP.is_set() and strava_connected():
+        strava_sync_job()
+
+
+def strava_disconnect():
+    global STRAVA_LAST_ATTEMPT_MONO
+    STRAVA_STOP.set()
+    with db_connect() as con:
+        con.execute("DELETE FROM app_settings WHERE key IN ('strava_browser_connected',?)", (STRAVA_RECONNECT_KEY,))
+    with STRAVA_BROWSER_LOCK:
+        proc=STRAVA_BROWSER_PROCESS
+    if proc is not None:strava_end_browser(proc)
+    # Synchronize teardown so no ongoing task can reopen or rewrite the profile.
+    if not STRAVA_SYNC_LOCK.acquire(timeout=15):
+        raise ValueError('Stopped Strava syncing. The browser session is still closing; please select Disconnect again to remove its files')
+    try:
+        # Remove any late connection-state writes from a task being stopped.
+        with db_connect() as con:
+            con.execute("DELETE FROM app_settings WHERE key IN ('strava_browser_connected',?)", (STRAVA_RECONNECT_KEY,))
+        profile=strava_profile_path()
+        if profile.is_symlink():
+            profile.unlink()
+        elif profile.is_dir():
+            shutil.rmtree(profile)
+        with STRAVA_SCHEDULE_LOCK:STRAVA_LAST_ATTEMPT_MONO=0.0
+        with STRAVA_STATUS_LOCK:
+            STRAVA_STATUS.update(running=False,connecting=False,message='Strava disconnected; the separate local browser session was deleted. To sign in again, acknowledge the Strava website warning above and select Sign in for auto-sync. Imported rides remain untouched.',last_sync=None)
+    finally:
+        STRAVA_SYNC_LOCK.release()
+    return strava_status()
+
+
+def strava_sync_job():
+    global STRAVA_LAST_ATTEMPT_MONO
+    if not STRAVA_SYNC_LOCK.acquire(blocking=False):return
+    cdp=None;proc=None
+    added=skipped=failed=checked=0
+    failure_examples=[]
+    skipped_because_busy=False
+    try:
+        if not strava_connected():raise ValueError('Connect your own Strava account in Settings first')
+        with STATE_LOCK:
+            if JOB.get('status')=='running':
+                skipped_because_busy=True
+                return
+            JOB.update(status='running',processed=0,total=0,added=0,skipped=0,failed=0,updated=0,message='Checking recent Strava rides')
+        recent_count = strava_recent_count()
+        with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(running=True,message='Checking your {} newest Strava activity links…'.format(recent_count))
+        if STRAVA_STOP.is_set():raise ValueError('Strava was disconnected')
+        proc,port=strava_start_browser(visible=False)
+        cdp=StravaDevTools(strava_browser_target(port))
+        ids=strava_recent_activity_ids(cdp, target=recent_count)
+        if not ids:raise ValueError('No recent activity links were found on your Strava training page')
+        checked=len(ids)
+        with db_connect() as con:
+            known={str(r[0]) for r in con.execute('SELECT activity_id FROM activities WHERE activity_id IS NOT NULL')}
+            pending=[aid for aid in reversed(ids) if str(aid) not in known]
+            folder_name=load_watch_folder()
+            set_job(total=len(pending),message='Downloading only missing Strava GPX rides')
+            with tempfile.TemporaryDirectory(prefix='libre-strava-') as temp:
+                for index,aid in enumerate(pending,1):
+                    if STRAVA_STOP.is_set() or not strava_connected():raise ValueError('Strava was disconnected')
+                    set_job(processed=index-1,message='Strava GPX for ride {}'.format(aid))
+                    try:
+                        raw=strava_download_gpx(cdp,aid,Path(temp))
+                        key=hashlib.sha256(('strava-gpx:{}:'.format(aid)).encode()+hashlib.sha256(raw).digest()).hexdigest()
+                        outcome=insert_activity(con,'{}.gpx'.format(aid),key,io.BytesIO(raw),{})
+                        if outcome=='added':added+=1
+                        elif outcome=='skipped':skipped+=1
+                        else:
+                            failed+=1
+                            failure_examples.append('Activity {}: the downloaded GPX has no usable GPS track'.format(aid))
+                        if folder_name and outcome in ('added','skipped'):
+                            target,_=strava_save_original(folder_name,aid,raw)
+                            stat=target.stat()
+                            con.execute('INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)',(watch_seen_key(folder_name,target),'{}:{}'.format(stat.st_size,stat.st_mtime_ns)))
+                            con.commit()
+                    except StravaReauthenticationRequired:
+                        # An expired login is an account state, not a bad GPX.
+                        raise
+                    except Exception as exc:
+                        failed+=1
+                        detail='Activity {}: {}'.format(aid,str(exc).strip()[:140] or type(exc).__name__)
+                        if len(failure_examples)<3:failure_examples.append(detail)
+                        print('[LibreHeatmaps] Strava GPX import problem: {}'.format(detail),flush=True)
+                    set_job(processed=index,added=added,skipped=skipped,failed=failed)
+            con.execute('INSERT INTO import_history(imported_at,label,added,skipped,no_gps,failed,updated) VALUES (?,?,?,?,?,?,?)',(dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),'Strava GPX (browser)',added,skipped,0,failed,0))
+        existing=checked-len(pending)+skipped
+        if added:
+            message='Strava: imported {} new GPS route{}; {} already present; {} failed ({} recent activities checked).'.format(added,'' if added==1 else 's',existing,failed,checked)
+        elif failed:
+            message='Strava: no rides imported; {} missing GPX download{} failed ({} recent activities checked).'.format(failed,'' if failed==1 else 's',checked)
+        else:
+            message='Strava: no new GPS routes; {} recent activities were already in LibreHeatmaps. The heatmap is unchanged.'.format(existing)
+        if checked<recent_count:
+            message+=' Only {} of the requested {} activity links were available from Strava’s visible activity pages.'.format(checked,recent_count)
+        if failure_examples:
+            message+=' '+failure_examples[0]
+        result_status='error' if failed and not added else 'done'
+        with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(last_sync=dt.datetime.now().isoformat(timespec='seconds'),checked=checked,added=added,skipped=existing,failed=failed,message=message)
+        set_job(status=result_status,message=message,added=added,skipped=existing,failed=failed,processed=len(pending),total=len(pending))
+        if added:start_heat_warmup()
+    except StravaReauthenticationRequired as exc:
+        strava_require_reconnect()
+        message='Strava sync paused: '+str(exc)[:220]
+        with STATE_LOCK:
+            if JOB.get('status')=='running' and JOB.get('message','').startswith(('Checking recent Strava','Downloading only missing Strava','Strava GPX for ride')):
+                set_job(status='error',message=message)
+    except Exception as exc:
+        message='Strava GPX check failed: '+str(exc)[:260]
+        if not STRAVA_STOP.is_set():
+            with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(message=message,failed=failed)
+        with STATE_LOCK:
+            if JOB.get('status')=='running' and JOB.get('message','').startswith(('Checking recent Strava','Downloading only missing Strava','Strava GPX for ride')):
+                set_job(status='error',message=message)
+    finally:
+        closed_gracefully=False
+        if cdp:
+            try:
+                cdp.call('Browser.close')
+                closed_gracefully=True
+            except (ValueError,ConnectionError,OSError,TimeoutError,AttributeError):pass
+            cdp.close()
+        strava_end_browser(proc,graceful=closed_gracefully)
+        with STRAVA_SCHEDULE_LOCK:
+            STRAVA_LAST_ATTEMPT_MONO=0.0 if skipped_because_busy else time.monotonic()
+        with STRAVA_STATUS_LOCK:STRAVA_STATUS.update(running=False)
+        STRAVA_SYNC_LOCK.release()
+
+
+def strava_sync_due(now=None):
+    if now is None:now=time.monotonic()
+    with STRAVA_SCHEDULE_LOCK:last=STRAVA_LAST_ATTEMPT_MONO
+    return not last or now-last>=strava_sync_interval()*60
+
+
+def strava_sync_loop():
+    while True:
+        try:
+            if strava_connected() and strava_sync_due() and not STRAVA_SYNC_LOCK.locked():
+                with STATE_LOCK:busy=JOB.get('status')=='running'
+                if not busy:strava_sync_job()
+        except Exception as exc:
+            print('[LibreHeatmaps] Strava scheduling error: {}'.format(type(exc).__name__),flush=True)
+        time.sleep(20)
 
 
 def robust_speed_flags(rows):
@@ -1331,8 +3410,9 @@ def speed_review_snapshot():
     flagged = {}
     for r in rows:
         reasons = []
-        if prefs['filter_speed_anomalies'] and speed_outlier(r):
-            reasons.append('50 mph cycling speed threshold')
+        if prefs['filter_speed_anomalies'] and speed_outlier(r, prefs['speed_threshold_mph'] * 0.44704):
+            speed_label = format(prefs['speed_threshold_mph'], 'g') + ' mph'
+            reasons.append('Custom cycling speed threshold (' + speed_label + ')')
         if r[14] in smart:
             reasons.append('Unusual compared with similar rides (experimental)')
         if reasons:
@@ -1406,7 +3486,7 @@ def insights(params):
         rows = con.execute(query, args).fetchall()
     flagged, approved, prefs = speed_review_snapshot()
     with db_connect() as con:
-        extra=con.execute("SELECT day,calories_kcal,avg_temp_c,max_temp_c,weather_temp_c,wind_speed_mps,wind_gust_mps,humidity_pct,avg_cadence,avg_power,id,name,sport,avg_heart_rate,max_power FROM activities"+sql,args).fetchall() if prefs.get('advanced_data') else []
+        extra=con.execute("SELECT day,calories_kcal,avg_temp_c,max_temp_c,weather_temp_c,wind_speed_mps,wind_gust_mps,humidity_pct,avg_cadence,avg_power,id,name,sport,avg_heart_rate,max_power,max_cadence,total_cycles,normalized_power,training_stress_score,intensity_factor,max_heart_rate FROM activities"+sql,args).fetchall() if prefs.get('advanced_data') else []
     filter_anomalies=prefs['filter_speed_anomalies']
     valid_speed_rows=[r for r in rows if r[14] not in flagged or r[14] in approved]
     excluded_speeds = len(rows)-len(valid_speed_rows)
@@ -1488,9 +3568,9 @@ def insights(params):
             ('warmest_device',2,'max',-70,70),('coldest_device',2,'min',-70,70),
             ('windiest',5,'max',0,110),('strongest_gust',6,'max',0,130),
             ('highest_avg_cadence',8,'max',1,250),('highest_avg_power',9,'max',1,2500),
-            ('highest_max_power',14,'max',1,3500),('most_calories',1,'max',1,100000),
+            ('highest_max_power',14,'max',1,3500),('highest_max_cadence',15,'max',1,250),('most_cycles',16,'max',1,10000000),('highest_normalized_power',17,'max',1,3500),('highest_training_stress',18,'max',0,2000),('most_calories',1,'max',1,100000),
             ('highest_avg_heart_rate',13,'max',20,240)):
-            advanced_records[key]=advanced_extreme(col,mode,low,high,key=='highest_avg_cadence')
+            advanced_records[key]=advanced_extreme(col,mode,low,high,key in ('highest_avg_cadence','highest_max_cadence','most_cycles'))
         cadences=[r[8] for r in extra if isinstance(r[8],(int,float)) and math.isfinite(r[8]) and 1<=r[8]<=250 and any(w in (r[12] or '').casefold() for w in ('ride','bik','cycl'))]
         advanced_records['mean_ride_cadence']={'value':sum(cadences)/len(cadences),'coverage':len(cadences)} if cadences else None
     def ride_record(row):
@@ -1530,8 +3610,8 @@ def insights(params):
         "years":[{"year":k,"count":v[0],"distance_m":round(v[1],1)} for k,v in sorted(years.items())],
         "months":[{"month":k,"count":v[0],"distance_m":round(v[1],1)} for k,v in sorted(months.items())],
         "advanced_enabled":prefs.get('advanced_data',False),
-        "advanced": {"coverage":{name:sum(v[i] is not None for v in extra) for i,name in enumerate(("calories_kcal","avg_temp_c","max_temp_c","weather_temp_c","wind_speed_mps","wind_gust_mps","humidity_pct","avg_cadence","avg_power"),1)},
-            "rides":[{"day":r[0],"calories":r[1],"temp_c":r[2],"weather_temp_c":r[4],"wind_mps":r[5],"humidity":r[7],"cadence":r[8],"power":r[9]} for r in extra if r[0]][-20000:]} if prefs.get('advanced_data') else None,
+        "advanced": {"coverage":{name:sum(v[index] is not None for v in extra) for name,index in (("calories_kcal",1),("avg_temp_c",2),("max_temp_c",3),("weather_temp_c",4),("wind_speed_mps",5),("wind_gust_mps",6),("humidity_pct",7),("avg_cadence",8),("avg_power",9),("max_cadence",15),("total_cycles",16),("normalized_power",17),("training_stress_score",18),("intensity_factor",19),("max_heart_rate",20))},
+            "rides":[{"day":r[0],"calories":r[1],"temp_c":r[2],"weather_temp_c":r[4],"wind_mps":r[5],"humidity":r[7],"cadence":r[8],"power":r[9],"max_cadence":r[15],"cycles":r[16],"normalized_power":r[17],"training_stress":r[18],"intensity_factor":r[19]} for r in extra if r[0]][-20000:]} if prefs.get('advanced_data') else None,
         "analytics_limited": len(rows)>20000,
         "analytics": {
             "monthly_speeds":[{"month":k,"speed_kmh":round(sum(d/t*3.6 for d,t in vs)/len(vs),2),"count":len(vs)}
@@ -1668,7 +3748,7 @@ def activity_preview(params):
         row = con.execute("""SELECT id,name,sport,day,COALESCE(recorded_distance_m,distance_m),
             moving_seconds,elapsed_seconds,elevation_m,bike,avg_heart_rate,avg_speed,max_speed,
             coordinates,point_count,west,south,east,north,avg_power,filename,moving_source,
-            elevation_source,recorded_distance_m,distance_m,calories_kcal,avg_temp_c,max_temp_c,weather_temp_c,wind_speed_mps,wind_gust_mps,humidity_pct,avg_cadence,max_power,weather_condition FROM activities WHERE id=?""", (int(identity),)).fetchone()
+            elevation_source,recorded_distance_m,distance_m,""" + ",".join(ADV_NUM_FIELDS) + ",weather_condition FROM activities WHERE id=?", (int(identity),)).fetchone()
     if row is None:
         raise ValueError("Activity not found")
     step = max(1, math.ceil(max(1, row[13]) / 3800))
@@ -1695,7 +3775,7 @@ def activity_preview(params):
             "distance_m":row[4],"moving_seconds":row[5],"elapsed_seconds":row[6],
             "elevation_m":row[7],"bike":row[8],"avg_heart_rate":row[9],
             "avg_speed":row[10],"max_speed":row[11],"avg_power":row[18],
-            **dict(zip(ADV_NUM_FIELDS,list(row[24:33]))),"weather_condition":row[33],
+            **dict(zip(ADV_NUM_FIELDS,list(row[24:24+len(ADV_NUM_FIELDS)]))),"weather_condition":row[24+len(ADV_NUM_FIELDS)],
             "filename":row[19],"moving_source":row[20],"elevation_source":row[21],
             "reported_distance_m":row[22],"gps_distance_m":row[23],"point_count":row[13],
             "bounds":[row[14],row[15],row[16],row[17]],"points":points}
@@ -2215,6 +4295,8 @@ def duplicate_library_action(action):
                 original=con.execute('SELECT * FROM activities WHERE id=?',(remove,)).fetchone()
                 retained=con.execute('SELECT 1 FROM activities WHERE id=?',(keep,)).fetchone()
                 if not original or not retained:raise ValueError('Activity changed; please scan again')
+                if con.execute('SELECT 1 FROM activity_overrides WHERE activity_id=?',(remove,)).fetchone() or con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(remove,)).fetchone():
+                    raise ValueError('This recording has reviewed edits. Restore the original details and GPS track before archiving it as a duplicate')
                 raw=dict(original)
                 coords=raw.pop('coordinates')
                 telemetry=con.execute('SELECT payload,sample_count FROM activity_telemetry WHERE activity_id=?',(remove,)).fetchone()
@@ -2365,12 +4447,12 @@ def export_gpx(handler, params):
 PAGE = '''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LibreHeatmaps</title>
 <style>
-*{box-sizing:border-box}body{margin:0;overflow:hidden}button,input,select{font:inherit}button{cursor:pointer}select,input[type=date],input[type=search]{padding:9px;border:1px solid #46345f;color:#f4efff;border-radius:9px;min-width:0}input[type=range]{width:100%;accent-color:#b993ff}label{display:flex;align-items:center;gap:8px}small,.muted{color:#9cadc2}h1{margin:0}h2{margin:0 0 10px}header{border-bottom:1px solid #38264f;display:flex;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center}.workspace{display:flex}aside{flex:none;overflow-y:auto;border-right:1px solid #38264f}section{border-bottom:1px solid #39284f}.field{display:flex;flex-direction:column;gap:7px;margin-top:12px}.field label{justify-content:space-between;font-weight:600;font-size:12px;color:#d7caeb}.field .range{display:flex;gap:12px;align-items:center}.field output{font-variant-numeric:tabular-nums;color:#b993ff;min-width:40px;text-align:right}.row{display:flex;gap:8px}.row>*{flex:1;min-width:0}.primary{font-weight:700}.subtle{background:transparent}.full{width:100%;margin-top:12px}.status{font-size:12px;color:#a8b9cb;line-height:1.5;margin-top:9px;white-space:pre-wrap;overflow-wrap:anywhere}.status.error{color:#ff9d9d}.stats{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.stat{background:#271a3d;border:1px solid #423052;padding:12px;border-radius:10px}.stat strong{display:block;font-size:20px;color:#fafafa;margin-bottom:4px}.stat span{color:#b1a2c7;font-size:11px}.toggle{justify-content:space-between;padding:8px 0;color:#d6e1ee}.toggle input{accent-color:#b993ff}.foot{line-height:1.5;font-size:11px;color:#a793bd}main{flex:1;min-width:0;position:relative;overflow:hidden;background:#110d1d}#tiles{position:absolute;inset:0;overflow:hidden}#tiles img{position:absolute;left:0;top:0;width:256px;height:256px;user-select:none;pointer-events:none}#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}#interaction{position:absolute;inset:0;cursor:grab;touch-action:none}#interaction:active{cursor:grabbing}.maptop{position:absolute;top:17px;left:18px;pointer-events:none;background:#160e27de;color:white}.maptop span{display:block}.tools{position:absolute;display:flex;flex-direction:column}.tools button{font-size:19px}.attribution{position:absolute;bottom:10px;right:12px;padding:5px 8px;border-radius:5px;font-size:11px;background:#180f28e0;color:#e0e8ef}.attribution a{color:#b993ff}.legend{position:absolute;bottom:16px;left:16px;background:#160e27d9;border-radius:11px;border:1px solid #45305b}.legend .bar{border-radius:9px;margin:8px 0}.empty{position:absolute;inset:0;display:flex;justify-content:center;align-items:center;pointer-events:none}.empty .panel{background:#201433ea;color:#ede3ff;border:1px solid #4b3567;border-radius:16px;padding:28px 30px;text-align:center;max-width:460px;box-shadow:0 15px 40px #0005}.empty strong{font-size:20px;display:block;margin-bottom:9px}.empty span{line-height:1.6;color:#c3b0dc}.hidden{display:none!important}#file{display:none}#busy{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#251736;border:1px solid #5b4178;color:#eee;border-radius:9px;padding:11px 15px;z-index:5}#dateRange{font-size:11px;color:#a995c1;margin-top:4px}@media(max-width:750px){.workspace{min-height:calc(100vh - 64px)}aside{border-right:0;border-bottom:1px solid #293749}}
+*{box-sizing:border-box}body{margin:0;overflow:hidden}button,input,select{font:inherit}button{cursor:pointer}select,input[type=date],input[type=search],#settingsDialog input[type=number]{padding:9px;border:1px solid #46345f;color:#f4efff;border-radius:9px;min-width:0}input[type=range]{width:100%;accent-color:#b993ff}label{display:flex;align-items:center;gap:8px}small,.muted{color:#9cadc2}h1{margin:0}h2{margin:0 0 10px}header{border-bottom:1px solid #38264f;display:flex;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center}.workspace{display:flex}aside{flex:none;overflow-y:auto;border-right:1px solid #38264f}section{border-bottom:1px solid #39284f}.field{display:flex;flex-direction:column;gap:7px;margin-top:12px}.field label{justify-content:space-between;font-weight:600;font-size:12px;color:#d7caeb}.field .range{display:flex;gap:12px;align-items:center}.field output{font-variant-numeric:tabular-nums;color:#b993ff;min-width:40px;text-align:right}.row{display:flex;gap:8px}.row>*{flex:1;min-width:0}.primary{font-weight:700}.subtle{background:transparent}.full{width:100%;margin-top:12px}.status{font-size:12px;color:#a8b9cb;line-height:1.5;margin-top:9px;white-space:pre-wrap;overflow-wrap:anywhere}.status.error{color:#ff9d9d}.stats{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.stat{background:#271a3d;border:1px solid #423052;padding:12px;border-radius:10px}.stat strong{display:block;font-size:20px;color:#fafafa;margin-bottom:4px}.stat span{color:#b1a2c7;font-size:11px}.toggle{justify-content:space-between;padding:8px 0;color:#d6e1ee}.toggle input{accent-color:#b993ff}.foot{line-height:1.5;font-size:11px;color:#a793bd}main{flex:1;min-width:0;position:relative;overflow:hidden;background:#110d1d}#tiles{position:absolute;inset:0;overflow:hidden}#tiles img{position:absolute;left:0;top:0;width:256px;height:256px;user-select:none;pointer-events:none}#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}#interaction{position:absolute;inset:0;cursor:grab;touch-action:none}#interaction:active{cursor:grabbing}.maptop{position:absolute;top:17px;left:18px;pointer-events:none;background:#160e27de;color:white}.maptop span{display:block}.tools{position:absolute;display:flex;flex-direction:column}.tools button{font-size:19px}.attribution{position:absolute;bottom:10px;right:12px;padding:5px 8px;border-radius:5px;font-size:11px;background:#180f28e0;color:#e0e8ef}.attribution a{color:#b993ff}.legend{position:absolute;bottom:16px;left:16px;background:#160e27d9;border-radius:11px;border:1px solid #45305b}.legend .bar{border-radius:9px;margin:8px 0}.empty{position:absolute;inset:0;display:flex;justify-content:center;align-items:center;pointer-events:none}.empty .panel{background:#201433ea;color:#ede3ff;border:1px solid #4b3567;border-radius:16px;padding:28px 30px;text-align:center;max-width:460px;box-shadow:0 15px 40px #0005}.empty strong{font-size:20px;display:block;margin-bottom:9px}.empty span{line-height:1.6;color:#c3b0dc}.hidden{display:none!important}#file{display:none}#busy{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#251736;border:1px solid #5b4178;color:#eee;border-radius:9px;padding:11px 15px;z-index:5}#dateRange{font-size:11px;color:#a995c1;margin-top:4px}@media(max-width:750px){.workspace{min-height:calc(100vh - 64px)}aside{border-right:0;border-bottom:1px solid #293749}}
 
-header .header-actions{display:flex;align-items:center}#shutdown{font-size:12px;padding:7px 10px;background:#20132f}#tileNotice{font-size:11px;line-height:1.45;padding:7px 2px 8px}.privacy-notice{color:#bea8d7}#tiles{pointer-events:none}.logo{filter:drop-shadow(0 0 10px #9c67ff55)}dialog{border:1px solid #604480;border-radius:18px;max-width:min(790px,94vw);max-height:88vh;width:790px;overflow-y:auto;padding:23px;box-shadow:0 20px 80px #080312aa}dialog::backdrop{backdrop-filter:blur(4px)}.dialog-head{display:flex;align-items:start;justify-content:space-between;gap:16px;margin-bottom:18px}.dialog-head h2{letter-spacing:normal;text-transform:none;margin-bottom:4px}.metric-grid{display:grid;gap:9px}.metric{background:#291b3e;border:1px solid #48315f;border-radius:12px;padding:16px 12px}.metric strong{display:block;font-size:21px;color:#ead9ff;letter-spacing:-.5px}.metric span{display:block;font-size:11px;color:#b7a5ce;margin-top:6px}.facts{display:grid;gap:12px}.sport-summary{display:grid;gap:10px}.sport-row{display:flex;justify-content:space-between;gap:12px;font-size:12px}.sport-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sport-row strong{color:#c9a8ff;font-variant-numeric:tabular-nums}#statAccuracy{font-size:11px;line-height:1.6}button:focus-visible{outline:2px solid #b993ff}@media(max-width:680px){.metric-grid{grid-template-columns:repeat(2,1fr)}header .brand small{display:none}header{padding:0 10px}h1{font-size:16px}}header{border-color:#302a43}aside{border-color:#353041}section{border-color:#342e41}button{background:#2a2436;border-color:#4c425b;color:#f4edf8}button:hover{background:#373049}.primary{background:#baa6d1;border-color:#baa6d1;color:#201a2b}.primary:hover{background:#cab6dc}select,input[type=date],input[type=search]{background:#242031;border-color:#494051}input[type=range],.toggle input{accent-color:#ab91ca}.stat,.metric{background:#242033;border-color:#3e364b}.stat strong,.metric strong{color:#f7f2fc}.field output,.attribution a{color:#c6addf}.maptop,.legend{background:#171523ea;border-color:#4b3c60}.legend .bar{background:linear-gradient(90deg,#a470dc 0%,#e044bb 25%,#f44362 50%,#ff941f 75%,#fff3de 100%)}#tiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}dialog{background:#1d192b;border-color:#59496a}dialog::backdrop{background:#080710c9}.charts{margin-top:0}.stat-chart{display:grid;gap:10px;max-height:235px;overflow-y:auto}.chart-row{display:grid;grid-template-columns:67px 1fr 78px;gap:10px;align-items:center;font-size:11px}.chart-row>span{color:#c0b1d5;white-space:nowrap}.chart-row>strong{font-size:11px;color:#e3d2f6;text-align:right;white-space:nowrap}.chart-track{height:9px;border-radius:10px;background:#42394e;overflow:hidden}.chart-bar{height:100%;border-radius:10px;background:linear-gradient(90deg,#9675c5,#e285a7)}#tileNotice{color:#c6b8d4}#map.offline-dark{background:#11121b}#map.offline-light{background:#e7e5eb}
+header .header-actions{display:flex;align-items:center}#shutdown{font-size:12px;padding:7px 10px;background:#20132f}#tileNotice{font-size:11px;line-height:1.45;padding:7px 2px 8px}.privacy-notice{color:#bea8d7}#tiles{pointer-events:none}.logo{filter:drop-shadow(0 0 10px #9c67ff55)}dialog{border:1px solid #604480;border-radius:18px;max-width:min(790px,94vw);max-height:88vh;width:790px;overflow-y:auto;padding:23px;box-shadow:0 20px 80px #080312aa}dialog::backdrop{backdrop-filter:blur(4px)}.dialog-head{display:flex;align-items:start;justify-content:space-between;gap:16px;margin-bottom:18px}.dialog-head h2{letter-spacing:normal;text-transform:none;margin-bottom:4px}.metric-grid{display:grid;gap:9px}.metric{background:#291b3e;border:1px solid #48315f;border-radius:12px;padding:16px 12px}.metric strong{display:block;font-size:21px;color:#ead9ff;letter-spacing:-.5px}.metric span{display:block;font-size:11px;color:#b7a5ce;margin-top:6px}.facts{display:grid;gap:12px}.sport-summary{display:grid;gap:10px}.sport-row{display:flex;justify-content:space-between;gap:12px;font-size:12px}.sport-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sport-row strong{color:#c9a8ff;font-variant-numeric:tabular-nums}#statAccuracy{font-size:11px;line-height:1.6}button:focus-visible{outline:2px solid #b993ff}@media(max-width:680px){.metric-grid{grid-template-columns:repeat(2,1fr)}header .brand small{display:none}header{padding:0 10px}h1{font-size:16px}}header{border-color:#302a43}aside{border-color:#353041}section{border-color:#342e41}button{background:#2a2436;border-color:#4c425b;color:#f4edf8}button:hover{background:#373049}.primary{background:#baa6d1;border-color:#baa6d1;color:#201a2b}.primary:hover{background:#cab6dc}select,input[type=date],input[type=search],#settingsDialog input[type=number]{background:#242031;border-color:#494051}input[type=range],.toggle input{accent-color:#ab91ca}.stat,.metric{background:#242033;border-color:#3e364b}.stat strong,.metric strong{color:#f7f2fc}.field output,.attribution a{color:#c6addf}.maptop,.legend{background:#171523ea;border-color:#4b3c60}.legend .bar{background:linear-gradient(90deg,#a470dc 0%,#e044bb 25%,#f44362 50%,#ff941f 75%,#fff3de 100%)}#tiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}dialog{background:#1d192b;border-color:#59496a}dialog::backdrop{background:#080710c9}.charts{margin-top:0}.stat-chart{display:grid;gap:10px;max-height:235px;overflow-y:auto}.chart-row{display:grid;grid-template-columns:67px 1fr 78px;gap:10px;align-items:center;font-size:11px}.chart-row>span{color:#c0b1d5;white-space:nowrap}.chart-row>strong{font-size:11px;color:#e3d2f6;text-align:right;white-space:nowrap}.chart-track{height:9px;border-radius:10px;background:#42394e;overflow:hidden}.chart-bar{height:100%;border-radius:10px;background:linear-gradient(90deg,#9675c5,#e285a7)}#tileNotice{color:#c6b8d4}#map.offline-dark{background:#11121b}#map.offline-light{background:#e7e5eb}
 @media(max-width:680px){.chart-row{grid-template-columns:58px 1fr 64px}}
 header .logo{clip-path:none;object-fit:contain;background:none;flex:none;filter:none} .stats-cta,.stats-header{background:#8b72b3;color:#fff;border-color:#9a84b8;font-weight:700}.stats-cta:hover,.stats-header:hover{background:#9d87c4}.stats-header{font-size:12px;padding:8px 12px}button.primary:not(.stats-cta):not(.stats-header){background:#b5a3cd}section{padding-bottom:15px;margin-bottom:15px} .metric-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.weekday-chart{display:grid;gap:8px;margin-top:10px}.weekday-row{display:grid;grid-template-columns:55px 1fr 62px;gap:9px;align-items:center;font-size:11px}.weekday-row .chart-track{height:11px}#legendLabel{color:#c7b9d1}select#palette{width:100%}
- .settings-stack{display:grid;gap:5px}.settings-section{margin-bottom:5px;padding-bottom:17px}.settings-section h2{font-size:13px;letter-spacing:.07em}.settings-note{font-size:12px;line-height:1.55;margin:12px 0}.settings-actions{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #3e354b}.settings-actions strong{display:block;font-size:13px;color:#f0e7fc}.settings-actions small{display:block;max-width:460px;line-height:1.5;margin-top:5px;color:#b7a9c4}.settings-actions button{flex:none}.settings-status{min-height:18px;font-size:12px;color:#ccb6e7;white-space:pre-wrap}.settings-status.error{color:#ffa5a5}button.danger{border-color:#994d61;color:#ffc5cf;background:#3c202d}button.danger:hover{background:#532735}#openSettings{padding:8px 12px;font-size:12px}#settingsDialog .field select{max-width:100%;width:100%}@media(max-width:670px){.settings-actions{align-items:stretch;flex-direction:column}.settings-actions button{align-self:flex-start}}
+ .settings-stack{display:grid;gap:5px}.settings-section{margin-bottom:5px;padding-bottom:17px}.settings-section h2{font-size:13px;letter-spacing:.07em}.settings-note{font-size:12px;line-height:1.55;margin:12px 0}.settings-actions{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #3e354b}.settings-actions strong{display:block;font-size:13px;color:#f0e7fc}.settings-actions small{display:block;max-width:460px;line-height:1.5;margin-top:5px;color:#b7a9c4}.settings-actions button{flex:none}.settings-status{min-height:18px;font-size:12px;color:#ccb6e7;white-space:pre-wrap}.settings-status.error{color:#ffa5a5}button.danger{border-color:#994d61;color:#ffc5cf;background:#3c202d}button.danger:hover{background:#532735}#openSettings{padding:8px 12px;font-size:12px}#settingsDialog .field select,#settingsDialog .field input[type=number]{max-width:100%;width:100%}#garminSyncCustom[hidden],#garminSyncCustomLabel[hidden]{display:none!important}@media(max-width:670px){.settings-actions{align-items:stretch;flex-direction:column}.settings-actions button{align-self:flex-start}}
 .bike-row{padding-left:16px;margin-left:9px;border-left:2px solid #655078;font-size:12px;color:#cdbed9}.bike-row strong{font-weight:600}.local-storage{padding:14px 0}.local-storage>strong{display:block;font-size:13px;margin-bottom:8px}.path-label{font-size:11px;color:#b8a9cb;margin-top:10px}.local-storage code{display:block;word-break:break-all;font-size:12px;line-height:1.5;padding:9px 10px;background:#171421;border:1px solid #42374f;border-radius:7px;color:#e2d4f0}#releaseLink{display:inline-block;margin-top:8px;color:#cdb4f0}#updateStatus{margin-top:8px}#settingsDialog .settings-stack{display:block}
 .anomaly-setting{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;font-size:13px;color:#e6d7f3;cursor:pointer}.anomaly-setting input{accent-color:#b779ec;width:19px;height:19px}
 .analytics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.analytics-plot{min-height:200px;overflow:hidden}.analytics-plot svg{display:block;width:100%;height:210px}@media(max-width:850px){.analytics-grid{grid-template-columns:minmax(0,1fr)}}
@@ -2774,7 +4856,7 @@ header .header-actions{gap:6px}
 #settingsDialog>.dialog-head{background:linear-gradient(95deg,#32243e,#241c30);border-color:#624d6e}
 #settingsDialog>.dialog-head::after{content:"";position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#9b67d4,#d86aaf,#f4ac79)}
 #settingsDialog .settings-section h2{font-size:18px;font-weight:700;color:#f0e6f5}
-#settingsDialog .settings-savebar{background:#292033;border-color:#6a5178}
+#settingsDialog .settings-savebar{background:#292033;border-color:#6a5178}#settingsDialog .settings-watch{padding:15px 0;border-top:1px solid #44364e;border-bottom:1px solid #44364e}#settingsDialog .settings-watch h3{margin:0 0 6px}#settingsDialog .settings-watch>label{display:block;margin:12px 0 7px;font-size:14px;font-weight:650}#settingsDialog .settings-watch input{width:100%;background:#242031;border:1px solid #675878;border-radius:9px;padding:12px;color:#fff;font:inherit}#settingsDialog .settings-watch .settings-actions{margin-top:10px}#watchStatus{overflow-wrap:anywhere}
 #settingsDialog #saveSettings{font-weight:700}
 #welcomeDialog .welcome-icon{color:#dfb1f1;text-shadow:0 0 23px #dc87ef6a}
 #welcomeDialog .welcome-privacy{font-size:14px;line-height:1.5}
@@ -3237,7 +5319,45 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 #flyoverDialog .flyover-disclosure{margin:0;font-size:11px;color:#c2b0d0;line-height:1.35}#flyoverStatus{min-height:17px;font-size:12px;color:#d6c4dd;line-height:1.45}
 #flyoverStatus.is-error{color:#ffb8ba}
 @media(max-width:720px){#flyoverDialog{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;border-radius:0}#flyoverDialog .flyover-top{padding:11px 13px}#flyoverDialog .flyover-top h2{font-size:17px}#flyoverDialog .flyover-controls{padding:11px 13px;gap:9px}#flyoverDialog .flyover-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}#flyoverDialog .flyover-metrics div{padding:7px}#flyoverDialog .flyover-metrics strong{font-size:13px}#flyoverDialog .flyover-metrics span{font-size:10px}#flyoverDialog .flyover-actions{gap:6px}#flyoverDialog .flyover-actions button{font-size:12px;padding:7px}}
+.v122-speed-review{grid-column:1/-1;display:grid;gap:8px;margin-top:12px;padding:12px;border:1px solid #675178;border-radius:12px;background:#241c33}.v122-speed-review button{justify-self:start}.v122-speed-review p{font-size:12px;line-height:1.5}.garmin-usb-panel{margin-top:13px;padding:13px;border-radius:11px;background:#25192f;border:1px solid #634b73;display:grid;gap:9px}.garmin-usb-panel strong{font-size:14px;color:#f1dcf7}.garmin-usb-panel p{font-size:12px;margin:0;line-height:1.5}.garmin-usb-panel button{width:100%}.garmin-usb-panel #garminUsbFound[hidden]{display:none}.garmin-usb-panel #garminUsbFound{display:grid;gap:8px}.garmin-usb-panel label{font-size:12px;color:#e8d6f2}.garmin-usb-panel select{width:100%;min-width:0}.garmin-usb-panel #garminUsbStatus{overflow-wrap:anywhere;font-size:12px;line-height:1.5}
 #statsDialog #facts.facts{display:flex;flex-direction:column;align-items:stretch;gap:24px}
+
+#dropTarget{position:fixed;inset:10px;z-index:10050;pointer-events:none;display:grid;place-items:center;border:3px dashed #ad8aee;border-radius:18px;background:#190e28e8;box-shadow:inset 0 0 0 6px #241338e5;backdrop-filter:blur(6px)}#dropTarget[hidden]{display:none}#dropTarget>div{text-align:center;padding:26px;display:grid;gap:10px}#dropTarget strong{font-size:clamp(22px,4vw,36px);color:#fff6ff}#dropTarget span{color:#cdb8e0;font-size:14px}
+
+#settingsDialog .settings-panel .settings-section{margin-bottom:16px;padding-bottom:14px}
+#settingsDialog .settings-watch,#settingsDialog .garmin-usb-panel{border:1px solid #50415f;background:#241d30;border-radius:13px;padding:17px;margin:14px 0}
+#settingsDialog .settings-watch>h3,#settingsDialog .garmin-usb-panel>strong{margin:0 0 5px;font-size:16px;font-weight:650;color:#f0e5f6}
+#settingsDialog .settings-watch .settings-note{margin:8px 0 12px;font-size:14px;line-height:1.48;color:#c8bfd4}
+#settingsDialog .settings-actions{gap:10px 13px;flex-wrap:wrap;padding:13px 0}
+#settingsDialog .settings-actions>div:first-child{flex:1 1 215px;min-width:0}
+#settingsDialog .settings-actions>button{min-height:36px;max-width:100%;white-space:normal;flex:0 1 auto}
+#settingsDialog .settings-watch .field{border-top:1px solid #463953;padding-top:12px;margin-top:12px}
+#settingsDialog .settings-subdetails{border:1px solid #544364;border-radius:10px;padding:0 12px;margin:14px 0;background:#241b30}
+#settingsDialog .settings-subdetails>summary{cursor:pointer;font-size:14px;font-weight:650;color:#ddc9e9;padding:12px 3px}
+#settingsDialog .settings-subdetails[open]>summary{border-bottom:1px solid #4b395b;margin-bottom:10px}
+#settingsDialog .settings-danger{border-color:#78505d}
+#settingsDialog .settings-danger>summary{color:#f0b7bd}
+#settingsDialog .settings-storage .local-storage{padding:6px 0 12px}
+@media(max-width:620px){#settingsDialog .settings-watch,#settingsDialog .garmin-usb-panel{padding:12px}#settingsDialog .settings-actions>button{flex:1 1 135px}#settingsDialog .settings-actions{align-items:stretch}}
+#bikeTiles{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:1;opacity:1}
+#overlay{z-index:2}
+#interaction{z-index:3}
+#bikeTiles img{position:absolute;top:0;left:0;width:256px;height:256px;pointer-events:none;user-select:none}
+#bikeTiles img{filter:url(#lh-bike-tint)}
+#bikeTiles.bike-regional img{filter:url(#lh-bike-tint) drop-shadow(0 0 1px var(--bike-tint-color,#54dc96))}
+#bikeTiles.bike-regional-wide img{filter:url(#lh-bike-tint) drop-shadow(0 0 1.1px var(--bike-tint-color,#54dc96)) drop-shadow(0 0 1px var(--bike-tint-color,#54dc96))}
+#bikeLayerControls[hidden]{display:none!important}
+.bike-panel{border-top:1px solid #665073;padding-bottom:20px}
+.bike-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.bike-panel-heading h2{margin:0}.bike-panel-heading .toggle{gap:10px}
+.bike-layer-note{font-size:12px;line-height:1.5;margin:9px 0;color:#bdb0ca}
+#bikeLayerStatus.is-error{color:#edb7b7}
+#bikeLayerControls{display:flex;flex-direction:column;gap:12px;padding:12px;background:#20172e;border:1px solid #4d385e;border-radius:12px;margin-top:12px}
+#bikeLayerControls .field{margin:0;gap:6px}
+.bike-tint-control{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid #584368;border-radius:10px;background:#2b2138}
+.bike-tint-control label{font-weight:650;font-size:13px;flex:1}
+.bike-tint-control input[type=color]{width:58px;height:39px;flex:none;cursor:pointer;border:1px solid #8965a3;background:#23172f;border-radius:9px;padding:4px}
+#bikeTintColorValue{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#e1d3e8;min-width:66px;text-align:right}
 #statsDialog #facts .stats-record-group{min-width:0}
 #statsDialog #facts .stats-record-group h5{margin:0 0 4px;font-size:15px;font-weight:750;color:#f2dff5}
 #statsDialog #facts .stats-record-description{margin:0 0 12px;color:#c9b6d3;font-size:13px;line-height:1.5}
@@ -3245,16 +5365,99 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 #statsDialog #facts .stats-record-empty{margin:3px 0;padding:12px 0;font-size:14px;grid-column:1/-1}
 @media(max-width:980px){#statsDialog #facts .stats-record-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:390px){#statsDialog #facts .stats-record-grid{grid-template-columns:1fr}}
+
+.v122-review-dialog{width:min(760px,95vw);max-height:90vh;overflow:auto;background:#21192c;color:#f1e8fa;border:1px solid #765689;border-radius:17px;padding:20px;box-shadow:0 20px 90px #090614a0}
+.v122-review-dialog::backdrop{background:#080611ba;backdrop-filter:blur(3px)}
+.v122-review-dialog .dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.v122-review-dialog .dialog-head h2{margin:0 0 4px}.v122-review-dialog .dialog-head p{margin:0 0 14px}
+.v122-edit-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0}
+.v122-edit-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:#e4d2ec;font-weight:650}
+.v122-edit-fields input{width:100%;box-sizing:border-box;min-width:0;padding:10px 12px;border-radius:9px;border:1px solid #684d79;color:#f5effb;background:#30233d}
+.v122-edit-actions{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;margin:15px 0}
+#routeRepairCanvas{display:block;width:100%;height:240px;background:linear-gradient(145deg,#13131e,#241a33);border:1px solid #533e69;border-radius:12px;margin:12px 0}
+.v122-repair-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:#dfc6eb;margin:8px 0}
+.v122-repair-legend span:first-child{color:#ef9bc1}.v122-repair-legend span:last-child{color:#7aefba}
+.v122-repair-candidates{display:grid;gap:9px;margin-top:14px;max-height:230px;overflow:auto}
+.v122-repair-candidates label{display:flex;align-items:flex-start;gap:9px;padding:12px;border-radius:10px;border:1px solid #604773;background:#31233e;font-size:12px;line-height:1.55}
+@media(max-width:640px){.v122-edit-fields{grid-template-columns:1fr}.v122-review-dialog{padding:14px}#routeRepairCanvas{height:180px}}
+
+/* Settings categories: one focused panel at a time, no endless dialog scroll. */
+#settingsDialog{width:min(1040px,96vw);max-width:1040px;height:min(780px,calc(100dvh - 40px));max-height:calc(100dvh - 40px);padding:0;overflow:hidden;scrollbar-gutter:auto}
+#settingsDialog[open]{display:flex;flex-direction:column}
+#settingsDialog>.dialog-head{position:relative;top:auto;flex:none;padding:19px 26px;min-height:85px}
+#settingsDialog .settings-layout{display:grid;grid-template-columns:222px minmax(0,1fr);flex:1;min-height:0;overflow:hidden}
+#settingsDialog .settings-nav{display:flex;flex-direction:column;gap:5px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:22px 12px;background:#211a2e;border-right:1px solid #473751}
+#settingsDialog .settings-nav-caption{font-size:10px;font-weight:750;letter-spacing:.16em;color:#a697bb;padding:2px 12px 11px}
+#settingsDialog .settings-category{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;flex:none;width:100%;border-radius:11px;text-align:left;border:1px solid transparent;background:transparent;padding:13px 13px;color:#d8cce4;line-height:1.3;transition:background .13s,border-color .13s}
+#settingsDialog .settings-category strong{font-size:14px;font-weight:690}
+#settingsDialog .settings-category small{font-size:11px;line-height:1.3;color:#a99ab9;margin:0}
+#settingsDialog .settings-category:hover{background:#34273f;border-color:#51405f}
+#settingsDialog .settings-category[aria-selected="true"]{background:linear-gradient(110deg,#433053,#35263e);border-color:#79528f;box-shadow:inset 3px 0 #da82df}
+#settingsDialog .settings-category[aria-selected="true"] strong{color:#fff7ff}
+#settingsDialog .settings-category[aria-selected="true"] small{color:#d4badf}
+#settingsDialog .settings-category:focus-visible{outline:2px solid #daa5ed;outline-offset:-2px}
+#settingsDialog .settings-panels{min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:24px 29px 30px}
+#settingsDialog .settings-panel[hidden]{display:none!important}
+#settingsDialog .settings-panel{min-width:0}
+#settingsDialog .settings-panel-head{padding:0 0 20px;margin-bottom:14px;border-bottom:1px solid #45364f}
+#settingsDialog .settings-panel-head .settings-kicker{margin:0 0 7px;color:#c68ed8;letter-spacing:.095em;font-size:11px;font-weight:750;text-transform:uppercase}
+#settingsDialog .settings-panel-head h2{color:#f6eef8;font-size:23px;line-height:1.2;letter-spacing:-.015em;margin:0 0 8px}
+#settingsDialog .settings-panel-head>p:last-child{margin:0;color:#bcb0ca;font-size:13px;line-height:1.5}
+#settingsDialog .settings-section{margin:0 0 22px;padding:3px 0 24px;border-bottom:1px solid #43354e}
+#settingsDialog .settings-section:last-child{margin-bottom:0;border-bottom:0;padding-bottom:4px}
+#settingsDialog .settings-section>h2{font-size:17px;margin:4px 0 10px;line-height:1.35}
+#settingsDialog .settings-section .settings-actions{flex-wrap:wrap;gap:14px}
+#settingsDialog .settings-section .settings-actions>div{flex:1 1 235px}
+#settingsDialog .settings-section .settings-actions>button{flex:0 0 auto}
+#settingsDialog .settings-panel .settings-note{margin:10px 0 14px}
+#settingsDialog .settings-global-status{flex:none;padding:0 23px;background:#292033}
+#settingsDialog .settings-global-status .settings-status{min-height:0;font-size:12px;line-height:1.35;max-height:54px;overflow:auto}
+#settingsDialog .settings-global-status .settings-status:empty{display:none}
+#settingsDialog .settings-savebar{position:relative;bottom:auto;flex:none;padding:14px 23px}
+#settingsDialog .speed-threshold-control{display:flex;align-items:stretch;gap:9px;width:100%}
+#settingsDialog .speed-threshold-control input[type=number]{flex:1;min-width:0;width:100%;font-variant-numeric:tabular-nums}
+#settingsDialog .speed-threshold-suffix{display:flex;align-items:center;justify-content:center;flex:none;min-width:64px;padding:0 12px;border:1px solid #6a517e;border-radius:9px;background:#33273f;color:#f4d8ff;font-size:14px;font-weight:700;white-space:nowrap}
+@media(max-width:750px){
+ #settingsDialog{width:calc(100vw - 22px);max-height:calc(100dvh - 20px);height:calc(100dvh - 20px)}
+ #settingsDialog .settings-layout{display:flex;flex-direction:column}
+ #settingsDialog .settings-nav{display:flex;flex-direction:row;gap:7px;flex:none;min-height:auto;overflow-x:auto;overflow-y:hidden;padding:10px 12px;border-right:0;border-bottom:1px solid #473751;scrollbar-width:thin}
+ #settingsDialog .settings-nav-caption{display:none}
+ #settingsDialog .settings-category{width:auto;min-width:130px;min-height:56px;padding:10px 13px}
+ #settingsDialog .settings-category small{display:none}
+ #settingsDialog .settings-category[aria-selected="true"]{box-shadow:inset 0 -3px #da82df}
+ #settingsDialog .settings-panels{flex:1;padding:20px 19px 26px}
+ #settingsDialog .settings-panel-head h2{font-size:21px}
+ #settingsDialog .settings-section .settings-actions>div{flex:initial;width:100%}
+ #settingsDialog .settings-section .settings-actions>button{flex:initial}
+}
+@media(max-width:520px){
+ #settingsDialog>.dialog-head{padding:13px 15px;min-height:75px}
+ #settingsDialog>.dialog-head .muted{max-width:245px}
+ #settingsDialog .settings-panels{padding:17px 15px 22px}
+ #settingsDialog .settings-global-status{padding:0 14px}
+ #settingsDialog .settings-savebar{padding:11px 14px;gap:10px}
+ #settingsDialog #saveSettings{min-width:118px}
+}
+
+/* Garmin full-history import is visible without opening Settings. */
+.garmin-home-progress{display:grid;gap:5px;margin-top:10px;padding:11px 12px;border:1px solid #4e4264;border-radius:10px;background:#241a32;color:#e6dcef;font-size:12px;line-height:1.45}
+.garmin-home-progress[hidden],#importStatus[hidden]{display:none!important}
+.garmin-home-progress strong{font-size:12px;color:#f2e9ff}
+.garmin-home-progress small{font-size:11px;color:#bdb0cd}
 </style></head>
 <body><header><div class="brand"><img class="logo" src="/logo.png" alt="LibreHeatmaps route heatmap"><div class="brand-text"><div class="brand-title-row"><h1>LibreHeatmaps</h1><span class="brand-credit">In collaboration with <a href="https://trailsidecycles.com/" target="_blank" rel="noopener noreferrer">Trailside Cycles</a></span></div><small>Free, open-source GPS heatmaps. Your data stays local. Your history stays yours.</small></div></div><div class="header-actions"><button class="primary stats-header" id="statsTop">Activity statistics</button><button id="openSettings" title="Adjust appearance and manage your local activity data">Settings</button><button id="shutdown" title="Stop the local application">Exit app</button></div></header>
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute;overflow:hidden;pointer-events:none" xmlns="http://www.w3.org/2000/svg"><defs><filter id="lh-bike-tint" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB"><feFlood id="bikeTintFlood" flood-color="#54dc96" result="bike-color"/><feComposite in="bike-color" in2="SourceAlpha" operator="in"/></filter></defs></svg>
 <div class="workspace"><aside>
-<section><h2>Import activities</h2><div class="muted">Import your complete Strava or Garmin account ZIP without extraction, or choose activities.csv or individual FIT, GPX, and TCX tracks.</div><button class="primary full" id="import">Import GPS files or account ZIP</button><input id="file" type="file" accept=".zip,.csv,.fit,.fit.gz,.gpx,.gpx.gz,.tcx,.tcx.gz"><div class="status" id="importStatus">Your activities remain on your computer. No uploads to external services.</div><div class="stats"><div class="stat"><strong id="activityCount">0</strong><span>Activities</span></div><div class="stat"><strong id="pointCount">0</strong><span>Route points</span></div></div></section>
+<section><h2>Import activities</h2><div class="muted">Import your complete Strava or Garmin account ZIP without extraction, or choose activities.csv or individual FIT, GPX, TCX and GPS tracks. You can also drag and drop files anywhere onto this window.</div><button class="primary full" id="import">Import GPS files or account ZIP</button><input id="file" type="file" accept=".zip,.csv,.fit,.fit.gz,.gpx,.gpx.gz,.tcx,.tcx.gz,.gps" multiple><div class="status" id="importStatus">Your activities remain on your computer. No uploads to external services.</div><div id="garminHomeProgress" class="garmin-home-progress" role="status" aria-live="polite" hidden><strong>Garmin full-history import</strong><span id="garminHomeDetails">Waiting for Garmin Connect…</span><small id="garminHomeHeatStatus">Updating the heatmap after every 50 new rides</small></div><div class="stats"><div class="stat"><strong id="activityCount">0</strong><span>Activities</span></div><div class="stat"><strong id="pointCount">0</strong><span>Route points</span></div></div></section>
 <section><h2>Map view</h2><label class="toggle" for="onlineTiles">Online map tiles <input id="onlineTiles" type="checkbox" checked></label><div class="muted privacy-notice" id="tileNotice">Online basemaps load map tiles from third-party providers. Your Strava files and statistics stay local.</div><div class="row"><button data-map="dark" class="primary">Dark</button><button data-map="light">Light</button><button data-map="satellite">Satellite</button></div><label class="toggle">Show all routes <input type="checkbox" id="routes" checked></label><label class="toggle">Heatmap layer <input type="checkbox" id="heat" checked></label><div class="field"><label>Route definition <output id="definitionValue">78%</output></label><input type="range" id="definition" min="15" max="100" value="78"></div><div class="field"><label>Glow radius <output id="radiusValue">5 px</output></label><input type="range" id="radius" min="2" max="24" value="5"></div><div class="field"><label>Intensity <output id="intensityValue">120%</output></label><input type="range" id="intensity" min="10" max="200" value="120"></div><div class="field"><label>Transparency <output id="opacityValue">84%</output></label><input type="range" id="opacity" min="10" max="100" value="84"></div></section>
+<section class="bike-panel"><div class="bike-panel-heading"><h2>Cycle paths</h2><label class="toggle" for="bikeRoutes"><span>Show</span><input id="bikeRoutes" type="checkbox"></label></div>
+<div id="bikeLayerControls" hidden><div class="bike-tint-control"><label for="bikeTintColor">Overlay color</label><input id="bikeTintColor" type="color" value="#54dc96" aria-label="Cycle path overlay color"><output id="bikeTintColorValue" for="bikeTintColor">#54DC96</output></div></div>
+<p class="bike-layer-note" id="bikeLayerStatus" role="status" aria-live="polite">Optional cycling paths; off by default.</p></section>
 <section><h2>Filter activities</h2><div class="field"><label for="sport">Activity type</label><select id="sport"><option value="">All activity types</option></select></div><div class="field"><label for="search">Activity name</label><input type="search" id="search" placeholder="Search activities..."></div><div class="field"><label>Date range</label><div class="row"><input id="dateFrom" type="date" aria-label="Start date"><input id="dateTo" type="date" aria-label="End date"></div><div id="dateRange"></div></div><button class="full subtle" id="clear">Clear filters</button></section>
 <section><h2>Heatmap Time Machine</h2><div class="muted">See how your routes grew, year by year.</div><button type="button" id="openTimeMachine" class="primary full">Explore your timeline</button></section><section><h2>Activity insights</h2><div class="muted">Explore your habits, totals, streaks, yearly trends, personal records, and data coverage.</div><button class="primary full stats-cta" id="statsButton">Open activity statistics</button></section>
 <section><h2>Export</h2><button class="full" id="gpx">Download filtered GPX</button><button class="full" id="png">Create heatmap PNG</button><p class="foot">GPX uses evenly sampled route coordinates. PNG opens a capture editor where you can pan, zoom, change the framing and save the route overlay. Third-party map imagery is never exported.</p></section>
 <div class="foot">Your GPS tracks and statistics are stored locally. Online map tiles are enabled by default and contact third-party map providers; turning them off keeps your map requests local.</div>
-</aside><main id="map"><div id="tiles" class="dark"></div><canvas id="overlay"></canvas><div id="interaction"></div><div id="heatVisitTooltip" role="status" aria-live="off" hidden></div><div class="maptop" id="mapCaption"><span class="map-caption-title">Your GPS heatmap</span><span id="mapDetail">Import a GPS archive to begin</span><button id="clearRide" type="button" hidden>Show all activities</button></div><div class="tools" role="group" aria-label="Map zoom controls"><button id="plus" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button id="minus" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><button id="fit" type="button" title="Focus on main activity area. Shift-click to show every route." aria-label="Fit map to activities"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="3"/></svg></button></div><div class="legend">LESS TRAVELED · MORE TRAVELED<div class="bar" id="legendBar"></div><span id="legendLabel">Purple → red → orange → white</span><label class="legend-select" for="legendPalette"><span>Heat colors</span><select id="legendPalette" aria-label="Heatmap color scale"><option value="classic">Classic glow</option><option value="ember">Ember</option><option value="violet">Violet</option><option value="ocean">Ocean</option><option value="forest">Forest</option></select></label></div><div class="attribution" id="attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></div><div class="empty" id="empty"><div class="panel"><strong>Explore everywhere you’ve been</strong><span>Import a Strava or Garmin account ZIP, or GPS tracks, to see your routes on an interactive heatmap. No GIS tools or Python packages required.</span></div></div><div id="busy" class="hidden">Loading map data…</div></main></div><dialog id="statsDialog" aria-labelledby="insightsTitle">
+</aside><main id="map"><div id="tiles" class="dark"></div><div id="bikeTiles" aria-hidden="true"></div><canvas id="overlay"></canvas><div id="interaction"></div><div id="heatVisitTooltip" role="status" aria-live="off" hidden></div><div class="maptop" id="mapCaption"><span class="map-caption-title">Your GPS heatmap</span><span id="mapDetail">Import a GPS archive to begin</span><button id="clearRide" type="button" hidden>Show all activities</button></div><div class="tools" role="group" aria-label="Map zoom controls"><button id="plus" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button id="minus" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><button id="fit" type="button" title="Fit selected activity, or your recorded routes; use + and − to adjust zoom" aria-label="Fit activity or routes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="3"/></svg></button></div><div class="legend">LESS TRAVELED · MORE TRAVELED<div class="bar" id="legendBar"></div><span id="legendLabel">Purple → red → orange → white</span><label class="legend-select" for="legendPalette"><span>Heat colors</span><select id="legendPalette" aria-label="Heatmap color scale"><option value="classic">Classic glow</option><option value="ember">Ember</option><option value="violet">Violet</option><option value="ocean">Ocean</option><option value="forest">Forest</option></select></label></div><div class="attribution" id="attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></div><div class="empty" id="empty"><div class="panel"><strong>Explore everywhere you’ve been</strong><span>Import a Strava or Garmin account ZIP, or GPS tracks, to see your routes on an interactive heatmap. No GIS tools or Python packages required.</span></div></div><div id="busy" class="hidden">Loading map data…</div></main></div><div id="dropTarget" hidden role="status" aria-live="polite"><div><strong>Drop activity files to import</strong><span>FIT · GPX · TCX · GPS · Strava/Garmin ZIP · activities.csv</span></div></div><dialog id="statsDialog" aria-labelledby="insightsTitle">
   <div class="insights-shell">
     <div class="insights-topbar">
       <div class="insights-heading"><div class="insights-mark" aria-hidden="true"><img src="/logo.png" alt="" width="46" height="46"></div><div><h2 id="insightsTitle">Activity insights</h2><p>Every journey adds another line to your story</p></div></div>
@@ -3277,7 +5480,7 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
       <div class="insights-main" id="insightsMain">
         <div class="insights-intro">
           <div><div class="insights-eyebrow" id="insightsEyebrow">OVERVIEW</div><h3 id="insightsViewTitle">Your activity, at a glance</h3><p id="insightsViewDesc">A clear summary of your GPS history.</p></div>
-          <label class="insights-units">Units <select id="units"><option value="mi">Miles</option><option value="km">Kilometers</option></select></label>
+          <label class="insights-units">Units <select id="units"><option value="mi">Miles · °F</option><option value="km">Kilometers · °C</option></select></label>
         </div>
         <details class="insights-filter-drawer" id="insightsFilters">
           <summary><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 7h16M7 12h10M10 17h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><strong>Filter your activities</strong><span>Sport, bike, year and month</span><span class="filter-caret" aria-hidden="true">⌄</span></summary>
@@ -3337,7 +5540,7 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
           </section>
         </div>
         <div aria-labelledby="tabAdvanced" class="stats-panel" data-stats-panel="advanced" hidden id="statsAdvanced" role="tabpanel">
-          <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">DEVICE &amp; WEATHER INSIGHTS</span><h4>Ride conditions &amp; effort</h4><p>Recorded Garmin and Strava measurements only. Device temperature can differ from ambient weather; missing values are left blank.</p></div></div><div class="advanced-cards" id="advancedCards"></div><div class="advanced-graph-grid" id="advancedGraphs"></div><p class="muted settings-note">These charts compare activity summaries, not second-by-second sensor traces. Weather speed comes from the original FIT or Strava metadata; no live weather is requested.</p></section>
+          <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">DEVICE &amp; WEATHER INSIGHTS</span><h4>Ride conditions &amp; effort</h4><p>Recorded Garmin FIT and Strava measurements only, including cycling cadence and sport-specific cycles / strokes when present. Device temperature differs from ambient weather; missing values remain unavailable.</p></div></div><div class="advanced-cards" id="advancedCards"></div><div class="advanced-graph-grid" id="advancedGraphs"></div><p class="muted settings-note">These charts compare activity summaries, not second-by-second sensor traces. Weather speed comes from the original FIT or Strava metadata; no live weather is requested.</p></section>
         </div>
 
         <div aria-labelledby="tabCompare" class="stats-panel" data-stats-panel="compare" hidden id="statsCompare" role="tabpanel">
@@ -3390,7 +5593,7 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
       </div>
     </div>
   </div>
-</dialog><dialog id="captureDialog" class="capture-dialog" aria-labelledby="captureTitle"><div class="dialog-head"><div class="capture-brand"><img src="/logo.png" alt="" aria-hidden="true" width="40" height="40"><div><h2 id="captureTitle">Export heatmap image</h2><p>Frame an exact area of your routes before saving.</p></div></div><button id="captureClose" type="button" aria-label="Close image editor">Close</button></div><div class="capture-settings"><label>Canvas shape<select id="captureShape"><option value="16:9">Wide · 16:9</option><option value="3:2">Landscape · 3:2</option><option value="1:1">Square · 1:1</option><option value="4:5">Portrait · 4:5</option></select></label><label>PNG width<select id="captureWidth"><option value="1600">1600 px</option><option value="2400" selected>2400 px</option><option value="3200">3200 px</option></select></label><label>PNG background<select id="captureBackground"><option value="dark">Dark · map preview</option><option value="light">Light · map preview</option><option value="transparent">Transparent · checkerboard</option></select></label></div><div class="capture-zoom-row"><label for="captureZoomSlider">Zoom</label><input type="range" id="captureZoomSlider" min="1" max="18" step="0.25" value="12" aria-label="Fine-adjust PNG framing zoom"><output id="captureZoomValue" for="captureZoomSlider">12.00</output><small>Use the slider for precise framing, scroll over an area to zoom toward it, or choose Fit to center your recorded routes.</small></div><div class="capture-stage" id="captureStage"><div class="capture-tiles dark" id="captureTiles" aria-hidden="true"></div><canvas id="captureCanvas" aria-label="Editable preview of the geographic area that will be exported"></canvas><div class="capture-controls" role="group" aria-label="Adjust captured area"><button type="button" id="capturePlus" aria-label="Zoom capture in">+</button><button type="button" id="captureMinus" aria-label="Zoom capture out">−</button><button type="button" id="captureFit" aria-label="Fit recorded routes in capture">Fit</button></div><div class="capture-overlay-status" id="captureProgress" role="status" aria-live="polite">Preparing capture…</div><span class="capture-map-credit" id="captureMapCredit" hidden>© OpenStreetMap contributors · preview only</span></div><div class="capture-editor-foot"><p>Drag to reposition, use fine zoom to frame the route, or choose Fit for balanced padding. Dark and light map tiles are preview guides only. PNGs save the route overlay on a solid dark, solid light, or transparent background without third-party map imagery.</p><div class="capture-editor-actions"><button type="button" id="captureReset">Use current map view</button><button type="button" id="captureSave" class="primary" disabled>Save PNG</button></div></div><div id="captureStatus" role="status" aria-live="polite" class="capture-status"></div></dialog><dialog id="ridePreviewDialog" class="ride-preview-dialog" aria-labelledby="ridePreviewTitle"><div class="dialog-head"><div><h2 id="ridePreviewTitle">Ride preview</h2><div class="muted" id="ridePreviewSubtitle">Recorded activity</div></div><button id="closeRidePreview" type="button">Close preview</button></div><div class="ride-explore"><div class="ride-preview-map"><div id="ridePreviewTiles" class="dark" aria-hidden="true"></div><canvas id="ridePreviewCanvas" role="img" aria-label="GPS activity route over a dark online map when online tiles are enabled"></canvas><canvas id="telemetryMarkerCanvas" aria-hidden="true"></canvas><span class="ride-preview-badge" id="ridePreviewBadge">Dark map · GPS route</span><a class="ride-preview-attribution" id="ridePreviewAttribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><section class="v120-telemetry" id="rideTelemetry" hidden><div class="v120-telemetry-heading"><div><strong>Ride telemetry</strong><p>Recorded sensor samples over this ride; move across the graph to locate a reading on the route.</p></div><label>Measurement<select id="telemetryMetric"></select></label></div><canvas id="telemetryCanvas" role="img" aria-label="Recorded ride measurements. Move pointer to inspect a sample."></canvas><label class="telemetry-scrub-label" for="telemetryScrub">Ride position <input id="telemetryScrub" type="range" min="0" max="0" value="0" step="1" aria-label="Select recorded ride position" hidden></label><div id="telemetryStatus" class="muted" role="status" aria-live="polite"></div></section></div><div id="ridePreviewDetails" class="ride-preview-details"></div><div class="ride-preview-source" id="ridePreviewSource"></div><div class="review-preview" id="rideReviewPanel" hidden><div><strong id="rideReviewHeading">Speed filter review</strong><p id="rideReviewText"></p></div><button type="button" id="rideReviewAction"></button></div><div class="ride-preview-actions"><button id="openFlyover" type="button" disabled>3D Flyover</button><button id="showRideMap" class="primary" type="button" disabled>Show only this activity on map</button><button id="backToStats" type="button">Back to statistics</button></div><div id="ridePreviewStatus" class="muted" role="status" aria-live="polite"></div></dialog><dialog id="flyoverDialog" aria-labelledby="flyoverTitle"><div class="flyover-shell"><div class="flyover-top"><div class="flyover-heading"><h2 id="flyoverTitle">3D Flyover</h2><p id="flyoverSubline">Activity replay</p></div><div id="flyoverTerrainBadge" role="status" aria-live="polite">Loading 3D scene…</div><button type="button" id="flyoverClose" aria-label="Close 3D flyover">Back to preview</button></div><div id="flyoverViewport" aria-label="Interactive 3D terrain with a recorded GPS route"></div><div class="flyover-controls"><div class="flyover-actions"><button type="button" id="flyoverPlay" disabled>Play flyover</button><button type="button" id="flyoverFollow" aria-pressed="true">Following rider</button><label>Playback speed <select id="flyoverSpeedControl" aria-label="Flyover playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><label>Surface <select id="flyoverSurface" aria-label="Flyover terrain surface"><option value="relief" selected>3D scenery + satellite</option><option value="satellite">Flat satellite · reference</option></select></label><label>Terrain relief <select id="flyoverRelief" aria-label="Flyover terrain relief"><option value="1">Natural · 1×</option><option value="2.6" selected>Enhanced · 2.6×</option></select></label><label>Camera <select id="flyoverCameraMode" aria-label="Flyover camera view"><option value="scenic" selected>Cinematic · aerial</option><option value="closer">Closer · rider</option></select></label></div><input id="flyoverProgress" type="range" min="0" max="1000" step="1" value="0" disabled aria-label="Scrub 3D activity replay"><div class="flyover-times"><span>Start</span><span id="flyoverPercent">0%</span><span>Finish</span></div><div class="flyover-metrics"><div><span>Distance along route</span><strong id="flyoverDistance">—</strong></div><div><span id="flyoverClockLabel">Recording time</span><strong id="flyoverClock">—</strong></div><div><span>Speed</span><strong id="flyoverSpeed">—</strong></div><div><span>Elevation</span><strong id="flyoverElevation">—</strong></div><div><span>Heart rate</span><strong id="flyoverHeart">—</strong></div></div><p class="flyover-disclosure">Flyover loads MapLibre, satellite imagery, elevation tiles and optional OpenStreetMap-based 3D building tiles on demand. Providers can see your IP address and viewed map area; your activity library is not uploaded.</p><div id="flyoverStatus" role="status" aria-live="polite"></div></div></div></dialog><dialog id="welcomeDialog" aria-labelledby="welcomeTitle"><div class="welcome-icon" aria-hidden="true">✦</div><h2 id="welcomeTitle">Welcome to LibreHeatmaps</h2><p>Your own GPS heatmaps and activity history, on your computer. Get started by importing a complete Strava or Garmin account ZIP (no extraction needed) or individual FIT, GPX, or TCX tracks.</p><div class="welcome-steps"><strong>Have a Strava account?</strong><span>Strava → Settings → My Account → Download My Account → Get Started. Select the entire downloaded ZIP here when it arrives—do not extract it or select the activity files individually.</span><strong>Have a Garmin account?</strong><span>Select your complete Garmin account export ZIP as downloaded. LibreHeatmaps also reads FIT tracks stored inside its nested ZIP files.</span></div><p class="welcome-privacy">Your GPS data stays on this device. Online map backgrounds request map tiles from external providers.</p><div class="welcome-actions"><button id="welcomeLater" type="button">Explore first</button><button id="welcomeImport" type="button" class="primary">Import my GPS data</button></div></dialog><dialog id="settingsDialog"><div class="dialog-head"><div class="settings-dialog-brand"><img src="/logo.png" alt="" aria-hidden="true" width="44" height="44"><div><h2>Settings</h2><div class="muted">Customize the map and manage locally stored activity data</div></div></div><button id="closeSettings" type="button" class="settings-close" aria-label="Close settings" title="Close settings">×</button></div><div class="settings-stack"><section class="settings-section"><h2>Appearance</h2><div class="field"><label for="palette">Heat color scale</label><select id="palette"><option value="classic">Purple → red → orange → white</option><option value="ember">Ember · red → orange → gold</option><option value="violet">Violet · purple → magenta → white</option><option value="ocean">Ocean · blue → cyan → white</option><option value="forest">Forest · teal → lime → yellow</option></select><div id="palettePreview" class="palette-preview" role="img" aria-label="Selected heat scale preview"></div><div class="palette-ends"><span>Less traveled</span><span>More traveled</span></div></div><div class="field"><label for="defaultMap">Default map background</label><select id="defaultMap"><option value="dark">Dark</option><option value="light">Light</option><option value="satellite">Satellite</option></select></div><p class="muted settings-note">Changes can be previewed immediately and saved to your local data folder. Close without saving to discard them. Online map tiles can be disabled in Map view at any time.</p><button id="resetAppearance">Restore appearance defaults</button></section><section class="settings-section"><h2>Local data &amp; cache</h2><p class="muted settings-note">LibreHeatmaps stores imported GPS activities locally in a SQLite database. These options never delete your original downloaded files.</p><div class="settings-actions"><div><strong>Refresh rendered map data</strong><small>Discard temporary map calculations and reload the current view. Imported activities remain untouched.</small></div><button id="clearViewCache">Refresh map cache</button></div><section class="v121-duplicates"><h3>Review possible duplicate recordings</h3><p class="muted settings-note">Run an optional, strict comparison of previously imported activities. Nothing is removed automatically. Inspect each match and choose which recording to keep; removed copies can be restored from the local archive.</p><div class="settings-actions"><div><strong>Find existing duplicates</strong><small>This scan runs only when requested and does not change map loading or your data.</small></div><button id="scanDuplicates" type="button">Scan library</button></div><div id="duplicateStatus" class="muted" role="status" aria-live="polite"></div><div id="duplicatePairs" class="v121-duplicate-list"></div><div id="duplicateArchive" class="v121-duplicate-list"></div></section><div class="settings-actions danger-block"><div><strong>Delete all imported activities</strong><small>Permanently remove imported tracks and statistics from this local LibreHeatmaps database. Reimport the original files to restore them.</small></div><button id="clearActivities" class="danger">Delete local activity data</button></div><div class="local-storage"><strong>Local data location</strong><div class="path-label">Data folder</div><code id="dataFolder">Loading…</code><div class="path-label">SQLite database</div><code id="dataFile">Loading…</code><div class="settings-actions"><div><strong>Open local data folder</strong><small>View your database and diagnostic log in your file manager. Your original exports are never moved or deleted by this control.</small></div><button id="openDataFolder">Open folder</button></div></div><div id="settingsStatus" role="status" aria-live="polite" class="settings-status"></div></section><section class="settings-section"><h2>Portable library</h2><p class="muted settings-note">Library backups contain the original GPS locations and telemetry. Keep backups and exported routes private unless you intend to share those locations.</p><div class="settings-actions"><div><strong>Portable library backup</strong><small>Download a self-contained ZIP of the local SQLite library and settings. Original downloaded FIT/GPX/Strava ZIP files are not included.</small></div><button id="backupLibrary" type="button">Download backup ZIP</button></div><div class="settings-actions"><div><strong>Restore a library</strong><small>Replace the current local library with a verified LibreHeatmaps backup. Create a backup first; this operation requires confirmation.</small></div><button id="restoreLibrary" type="button">Restore from ZIP</button><input type="file" id="restoreLibraryFile" accept=".zip" hidden></div><div id="libraryStatus" class="muted" role="status"></div></section><section class="settings-section"><h2>Statistics &amp; data quality</h2><div class="settings-actions"><div><strong>Filter unlikely cycling speeds</strong><small>Optional: exclude cycling activities with a reported or calculated speed of 50 mph (80.5 km/h) or higher from speed statistics and Analytics. Other totals, routes, and original data stay unchanged. High-speed descents can be genuine.</small></div><label class="anomaly-setting"><input id="filterSpeedAnomalies" type="checkbox"><span>Enable filter</span></label></div><div class="settings-actions smart-filter-row"><div><strong>Experimental · Detect unusual speeds</strong><small>Compare cycling speeds with your own rides of the same activity type using a robust median-based method. Only substantial outliers are excluded from speed analysis. Works best with at least 12 comparable rides; genuine exceptional performances may be flagged.</small></div><label class="anomaly-setting"><input id="filterSpeedSmart" type="checkbox"><span>Enable anomaly filter</span></label></div><p class="muted settings-note" id="anomalyStatus">Both filters are optional and off by default. Your original rides, routes and non-speed totals are never changed.</p><div class="settings-actions"><div><strong>Review flagged rides</strong><small>Inspect excluded recordings, approve accurate rides, or return them to automatic filtering.</small><small id="anomalyReviewCount" class="anomaly-review-count" role="status" aria-live="polite">Checking saved filters…</small></div><button type="button" id="openSpeedReview">Review anomalies</button></div></section><section class="settings-section"><h2>Garmin &amp; advanced activity data</h2><div class="settings-actions"><div><strong>Show advanced activity insights</strong><small>Include available calories, recorded temperatures, cadence, weather observations, wind speed and additional power measurements in Statistics, activity previews and Data Explorer. FIT device measurements and Strava weather observations remain separate; unrecorded values are never estimated. Existing activity data can be enriched by reimporting your original Strava or Garmin account ZIP.</small></div><label class="anomaly-setting"><input id="advancedData" type="checkbox"><span>Enable advanced insights</span></label></div><p class="muted settings-note">Optional and off by default. Weather values depend on information contained in the original files; LibreHeatmaps does not request historical weather or upload routes.</p></section><section class="settings-section"><h2>Software update</h2><p class="muted settings-note">Current version: <strong id="installedVersion">1.2.1</strong>. Settings checks GitHub for updates when opened, with manual refresh available. Only release metadata is requested; activity data stays local. Downloads are SHA-256 verified before installation.</p><div class="settings-actions"><div><strong>Available releases</strong><small>Check automatically when Settings opens, or refresh manually. Your GPS data is never sent to GitHub.</small></div><button id="checkUpdate">Check for updates</button></div><div class="settings-actions"><div><strong>Install a verified release</strong><small>Previous app files are saved together in a dated ZIP inside LibreHeatmaps-backups. Imported activities stay untouched. Restart after updating.</small></div><button id="installUpdate" disabled>Install update</button></div><div id="updateStatus" class="settings-status" role="status" aria-live="polite"></div><a id="releaseLink" href="https://github.com/Gubna-Tech" rel="noreferrer noopener" target="_blank" hidden>View release on GitHub</a></section></div><div class="settings-savebar"><div id="settingsSaveState" role="status" aria-live="polite" class="settings-save-state">Checking saved settings…</div><button id="saveSettings" class="primary">Save settings</button></div></dialog>
+</dialog><dialog id="captureDialog" class="capture-dialog" aria-labelledby="captureTitle"><div class="dialog-head"><div class="capture-brand"><img src="/logo.png" alt="" aria-hidden="true" width="40" height="40"><div><h2 id="captureTitle">Export heatmap image</h2><p>Frame an exact area of your routes before saving.</p></div></div><button id="captureClose" type="button" aria-label="Close image editor">Close</button></div><div class="capture-settings"><label>Canvas shape<select id="captureShape"><option value="16:9">Wide · 16:9</option><option value="3:2">Landscape · 3:2</option><option value="1:1">Square · 1:1</option><option value="4:5">Portrait · 4:5</option></select></label><label>PNG width<select id="captureWidth"><option value="1600">1600 px</option><option value="2400" selected>2400 px</option><option value="3200">3200 px</option></select></label><label>PNG background<select id="captureBackground"><option value="dark">Dark · map preview</option><option value="light">Light · map preview</option><option value="transparent">Transparent · checkerboard</option></select></label></div><div class="capture-zoom-row"><label for="captureZoomSlider">Zoom</label><input type="range" id="captureZoomSlider" min="1" max="18" step="0.25" value="12" aria-label="Fine-adjust PNG framing zoom"><output id="captureZoomValue" for="captureZoomSlider">12.00</output><small>Use the slider for precise framing, scroll over an area to zoom toward it, or choose Fit to center your recorded routes.</small></div><div class="capture-stage" id="captureStage"><div class="capture-tiles dark" id="captureTiles" aria-hidden="true"></div><canvas id="captureCanvas" aria-label="Editable preview of the geographic area that will be exported"></canvas><div class="capture-controls" role="group" aria-label="Adjust captured area"><button type="button" id="capturePlus" aria-label="Zoom capture in">+</button><button type="button" id="captureMinus" aria-label="Zoom capture out">−</button><button type="button" id="captureFit" aria-label="Fit recorded routes in capture">Fit</button></div><div class="capture-overlay-status" id="captureProgress" role="status" aria-live="polite">Preparing capture…</div><span class="capture-map-credit" id="captureMapCredit" hidden>© OpenStreetMap contributors · preview only</span></div><div class="capture-editor-foot"><p>Drag to reposition, use fine zoom to frame the route, or choose Fit for balanced padding. Dark and light map tiles are preview guides only. PNGs save the route overlay on a solid dark, solid light, or transparent background without third-party map imagery.</p><div class="capture-editor-actions"><button type="button" id="captureReset">Use current map view</button><button type="button" id="captureSave" class="primary" disabled>Save PNG</button></div></div><div id="captureStatus" role="status" aria-live="polite" class="capture-status"></div></dialog><dialog id="ridePreviewDialog" class="ride-preview-dialog" aria-labelledby="ridePreviewTitle"><div class="dialog-head"><div><h2 id="ridePreviewTitle">Ride preview</h2><div class="muted" id="ridePreviewSubtitle">Recorded activity</div></div><button id="closeRidePreview" type="button">Close preview</button></div><div class="ride-explore"><div class="ride-preview-map"><div id="ridePreviewTiles" class="dark" aria-hidden="true"></div><canvas id="ridePreviewCanvas" role="img" aria-label="GPS activity route over a dark online map when online tiles are enabled"></canvas><canvas id="telemetryMarkerCanvas" aria-hidden="true"></canvas><span class="ride-preview-badge" id="ridePreviewBadge">Dark map · GPS route</span><a class="ride-preview-attribution" id="ridePreviewAttribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><section class="v120-telemetry" id="rideTelemetry" hidden><div class="v120-telemetry-heading"><div><strong>Ride telemetry</strong><p>Recorded sensor samples over this ride; move across the graph to locate a reading on the route.</p></div><label>Measurement<select id="telemetryMetric"></select></label></div><canvas id="telemetryCanvas" role="img" aria-label="Recorded ride measurements. Move pointer to inspect a sample."></canvas><label class="telemetry-scrub-label" for="telemetryScrub">Ride position <input id="telemetryScrub" type="range" min="0" max="0" value="0" step="1" aria-label="Select recorded ride position" hidden></label><div id="telemetryStatus" class="muted" role="status" aria-live="polite"></div></section></div><div id="ridePreviewDetails" class="ride-preview-details"></div><div class="ride-preview-source" id="ridePreviewSource"></div><div class="review-preview" id="rideReviewPanel" hidden><div><strong id="rideReviewHeading">Speed filter review</strong><p id="rideReviewText"></p></div><button type="button" id="rideReviewAction"></button></div><div class="ride-preview-actions"><button id="openActivityEdit" type="button" disabled>Edit details</button><button id="openRouteRepair" type="button" disabled>Review GPS spikes</button><button id="openFlyover" type="button" disabled>3D Flyover</button><button id="showRideMap" class="primary" type="button" disabled>Show only this activity on map</button><button id="backToStats" type="button">Back to statistics</button></div><div id="ridePreviewStatus" class="muted" role="status" aria-live="polite"></div></dialog><dialog id="activityEditDialog" class="v122-review-dialog" aria-labelledby="editActivityTitle"><div class="dialog-head"><div><h2 id="editActivityTitle">Edit activity details</h2><p class="muted">Local corrections to names, gear and summary measurements. Raw FIT, GPX and TCX files are not changed.</p></div><button type="button" id="closeActivityEdit">Close</button></div><form id="activityEditForm"><div class="v122-edit-fields"><label>Name<input id="editRideName" maxlength="300" required></label><label>Activity type<input id="editRideSport" maxlength="80" required></label><label>Date<input id="editRideDate" type="date"></label><label>Known bike / gear<select id="editRideBikeSelect"><option value="">Choose from your library or enter a name</option></select></label><label>Bike / gear name<input id="editRideBike" maxlength="160" placeholder="e.g. Road bike"></label><label>Gear ID (optional)<input id="editRideGearId" maxlength="120"></label><label>Summary distance (km)<input id="editRideDistance" type="number" min="0" max="20000" step="any" placeholder="Not recorded"></label><label>Moving time (minutes)<input id="editRideMoving" type="number" min="0" max="1666666" step="any" placeholder="Not recorded"></label><label>Elapsed time (minutes)<input id="editRideElapsed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average speed (km/h)<input id="editRideAvgSpeed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Maximum speed (km/h)<input id="editRideMaxSpeed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Climbing (m)<input id="editRideElevation" type="number" min="0" max="1000000" step="any" placeholder="Not recorded"></label><label>Average heart rate (bpm)<input id="editRideHeartRate" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average power (W)<input id="editRidePower" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average cadence (rpm)<input id="editRideCadence" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Calories (kcal)<input id="editRideCalories" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Device average temperature (°C)<input id="editRideTemp" type="number" step="any" placeholder="Not recorded"></label><label>Device maximum temperature (°C)<input id="editRideMaxTemp" type="number" step="any" placeholder="Not recorded"></label><label>Weather temperature (°C)<input id="editRideWeatherTemp" type="number" step="any" placeholder="Not recorded"></label><label>Wind speed (km/h)<input id="editRideWind" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Wind gust (km/h)<input id="editRideGust" type="number" min="0" step="any" placeholder="Not recorded"></label></div><section class="v122-speed-review"><div><strong>Review speed estimates</strong><p class="muted">Calculate an average from corrected distance and moving time; inspect GPS samples, elevation changes and similar routes before accepting a possible maximum speed. Recorded telemetry is never rewritten.</p></div><button type="button" id="reviewSpeedEstimate">Analyze speeds</button><div id="speedEstimateStatus" role="status" aria-live="polite"></div><button type="button" id="useSpeedEstimate" hidden>Fill suggested speed fields</button></section><p class="muted">Summary corrections affect library statistics. They do not rewrite the GPS positions, timestamps, device telemetry, or original source files. Original values are kept for restoring.</p><div class="v122-edit-actions"><button id="restoreActivityEdit" type="button" disabled>Restore original details</button><button id="saveActivityEdit" class="primary" type="submit">Save activity</button></div><div id="activityEditStatus" class="muted" role="status" aria-live="polite"></div></form></dialog><dialog id="routeRepairDialog" class="v122-review-dialog" aria-labelledby="routeRepairTitle"><div class="dialog-head"><div><h2 id="routeRepairTitle">Experimental GPS spike repair</h2><p class="muted">Review a proposed route change before applying. No automatic route edits.</p></div><button type="button" id="closeRouteRepair">Close</button></div><p id="routeRepairStatus" role="status" aria-live="polite">Checking GPS track and timestamped samples…</p><canvas id="routeRepairCanvas" width="900" height="270" role="img" aria-label="Comparison of original GPS route in pink and proposed GPS route in green"></canvas><div class="v122-repair-legend"><span>● Original track</span><span>● Proposed track</span></div><div id="routeRepairSummary" class="muted"></div><div id="routeRepairCandidates" class="v122-repair-candidates"></div><div class="v122-edit-actions"><button id="restoreRouteRepair" type="button" hidden>Restore original GPS route</button><button id="applyRouteRepair" type="button" class="primary" disabled>Apply selected repairs</button></div><p class="muted">This conservative detector requires timestamped GPS measurements and proposes only isolated, implausibly fast excursions. Genuine out-and-back routes and larger GPS errors may require manual source-data correction. The original coordinates and telemetry are retained in your local database for restoration; source FIT files are never changed.</p></dialog><dialog id="flyoverDialog" aria-labelledby="flyoverTitle"><div class="flyover-shell"><div class="flyover-top"><div class="flyover-heading"><h2 id="flyoverTitle">3D Flyover</h2><p id="flyoverSubline">Activity replay</p></div><div id="flyoverTerrainBadge" role="status" aria-live="polite">Loading 3D scene…</div><button type="button" id="flyoverClose" aria-label="Close 3D flyover">Back to preview</button></div><div id="flyoverViewport" aria-label="Interactive 3D terrain with a recorded GPS route"></div><div class="flyover-controls"><div class="flyover-actions"><button type="button" id="flyoverPlay" disabled>Play flyover</button><button type="button" id="flyoverFollow" aria-pressed="true">Following rider</button><label>Playback speed <select id="flyoverSpeedControl" aria-label="Flyover playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><label>Surface <select id="flyoverSurface" aria-label="Flyover terrain surface"><option value="relief" selected>3D scenery + satellite</option><option value="satellite">Flat satellite · reference</option></select></label><label>Terrain relief <select id="flyoverRelief" aria-label="Flyover terrain relief"><option value="1">Natural · 1×</option><option value="2.6" selected>Enhanced · 2.6×</option></select></label><label>Camera <select id="flyoverCameraMode" aria-label="Flyover camera view"><option value="scenic" selected>Cinematic · aerial</option><option value="closer">Closer · rider</option></select></label></div><input id="flyoverProgress" type="range" min="0" max="1000" step="1" value="0" disabled aria-label="Scrub 3D activity replay"><div class="flyover-times"><span>Start</span><span id="flyoverPercent">0%</span><span>Finish</span></div><div class="flyover-metrics"><div><span>Distance along route</span><strong id="flyoverDistance">—</strong></div><div><span id="flyoverClockLabel">Recording time</span><strong id="flyoverClock">—</strong></div><div><span>Speed</span><strong id="flyoverSpeed">—</strong></div><div><span>Elevation</span><strong id="flyoverElevation">—</strong></div><div><span>Heart rate</span><strong id="flyoverHeart">—</strong></div></div><p class="flyover-disclosure">Flyover loads MapLibre, satellite imagery, elevation tiles and optional OpenStreetMap-based 3D building tiles on demand. Providers can see your IP address and viewed map area; your activity library is not uploaded.</p><div id="flyoverStatus" role="status" aria-live="polite"></div></div></div></dialog><dialog id="welcomeDialog" aria-labelledby="welcomeTitle"><div class="welcome-icon" aria-hidden="true">✦</div><h2 id="welcomeTitle">Welcome to LibreHeatmaps</h2><p>Your own GPS heatmaps and activity history, on your computer. Get started by importing a complete Strava or Garmin account ZIP (no extraction needed) or individual FIT, GPX, or TCX tracks.</p><div class="welcome-steps"><strong>Have a Strava account?</strong><span>Strava → Settings → My Account → Download My Account → Get Started. Select the entire downloaded ZIP here when it arrives—do not extract it or select the activity files individually.</span><strong>Have a Garmin account?</strong><span>Select your complete Garmin account export ZIP as downloaded. LibreHeatmaps also reads FIT tracks stored inside its nested ZIP files.</span></div><p class="welcome-privacy">Your GPS data stays on this device. Online map backgrounds request map tiles from external providers.</p><div class="welcome-actions"><button id="welcomeLater" type="button">Explore first</button><button id="welcomeImport" type="button" class="primary">Import my GPS data</button></div></dialog><dialog id="settingsDialog"><div class="dialog-head"><div class="settings-dialog-brand"><img alt="" aria-hidden="true" height="44" src="/logo.png" width="44"/><div><h2>Settings</h2><div class="muted">Customize the map and manage locally stored activity data</div></div></div><button aria-label="Close settings" class="settings-close" id="closeSettings" title="Close settings" type="button">×</button></div><div class="settings-layout"><nav class="settings-nav" id="settingsCategories" role="tablist" aria-label="Settings sections" aria-orientation="vertical"><div class="settings-nav-caption">PREFERENCES</div><button class="settings-category" type="button" id="settingsTab-appearance" data-settings-category="appearance" role="tab" aria-controls="settingsPanel-appearance" aria-selected="true" tabindex="0"><strong>Appearance</strong><small>Map & display</small></button><button class="settings-category" type="button" id="settingsTab-imports" data-settings-category="imports" role="tab" aria-controls="settingsPanel-imports" aria-selected="false" tabindex="-1"><strong>Imports & connections</strong><small>Files, Garmin & Strava</small></button><button class="settings-category" type="button" id="settingsTab-insights" data-settings-category="insights" role="tab" aria-controls="settingsPanel-insights" aria-selected="false" tabindex="-1"><strong>Insights</strong><small>Statistics & insights</small></button><button class="settings-category" type="button" id="settingsTab-library" data-settings-category="library" role="tab" aria-controls="settingsPanel-library" aria-selected="false" tabindex="-1"><strong>Library & backups</strong><small>Local library & backups</small></button><button class="settings-category" type="button" id="settingsTab-updates" data-settings-category="updates" role="tab" aria-controls="settingsPanel-updates" aria-selected="false" tabindex="-1"><strong>Updates</strong><small>Software updates</small></button></nav><div class="settings-panels" id="settingsPanels"><div class="settings-panel" id="settingsPanel-appearance" role="tabpanel" aria-labelledby="settingsTab-appearance" data-settings-panel="appearance"><div class="settings-panel-head"><p class="settings-kicker">Map & display</p><h2>Appearance</h2><p>Choose units, map backgrounds and heatmap colors</p></div><section class="settings-section"><h2>Appearance</h2><div class="field"><label for="settingsUnits">Display units</label><select id="settingsUnits"><option value="mi">Miles, mph, feet and °F</option><option value="km">Kilometers, km/h, meters and °C</option></select></div><div class="field"><label for="palette">Heat color scale</label><select id="palette"><option value="classic">Purple → red → orange → white</option><option value="ember">Ember · red → orange → gold</option><option value="violet">Violet · purple → magenta → white</option><option value="ocean">Ocean · blue → cyan → white</option><option value="forest">Forest · teal → lime → yellow</option></select><div aria-label="Selected heat scale preview" class="palette-preview" id="palettePreview" role="img"></div><div class="palette-ends"><span>Less traveled</span><span>More traveled</span></div></div><div class="field"><label for="defaultMap">Default map background</label><select id="defaultMap"><option value="dark">Dark</option><option value="light">Light</option><option value="satellite">Satellite</option></select></div><p class="muted settings-note">Changes can be previewed immediately and saved to your local data folder. Close without saving to discard them. Online map tiles can be disabled in Map view at any time.</p><button id="resetAppearance">Restore appearance defaults</button></section></div><div class="settings-panel" id="settingsPanel-imports" role="tabpanel" aria-labelledby="settingsTab-imports" data-settings-panel="imports" hidden><div class="settings-panel-head"><p class="settings-kicker">Files & connected accounts</p><h2>Imports & connections</h2><p>Automatic file imports, Garmin and Strava GPX</p></div><section class="settings-section" id="fileImportSettings"><h2>File imports</h2><p class="muted settings-note">Use the top-left Import button or drag-and-drop for manual files. Automatic imports and account connections are optional.</p><div class="settings-watch"><h3>Your automatic import folder</h3><p class="muted settings-note">Choose any existing local or network folder. New FIT, GPX, TCX and recognized .gps files import on startup and about every 15 seconds while open. Nothing is moved or deleted; subfolders are not scanned. Leave blank to disable.</p><label for="watchFolder">Watched activity folder</label><input autocomplete="off" id="watchFolder" placeholder="Leave blank to turn automatic import off" spellcheck="false" type="text"/><div class="settings-actions"><div><small id="watchStatus" role="status">Automatic import is off.</small></div><button id="watchBrowse" type="button">Choose folder…</button><button id="watchRescan" type="button">Scan now</button></div></div><div class="settings-watch garmin-cloud-panel"><h3>Garmin wireless activity sync</h3><p class="muted settings-note">Wirelessly import original FIT recordings through Garmin Connect using your Personal API key. Checks run at startup, on your chosen timer, or with Sync now. If you select a watched folder, downloaded originals can also be saved there. Garmin Connect—not your PC—receives the Edge's Wi-Fi uploads.</p><p class="muted settings-note"><a href="https://connect.garmin.com/" rel="noopener noreferrer" target="_blank">Open Garmin Connect to create a Personal API key</a> · <a href="https://developer.garmin.com/gc-developer-program/personal/personal-faq/" rel="noopener noreferrer" target="_blank">Garmin's setup instructions</a></p><label for="garminPersonalKey">Personal API key (only needed when connecting or replacing it)</label><input autocomplete="new-password" id="garminPersonalKey" placeholder="Paste your personal Garmin API key" spellcheck="false" type="password"/><div class="settings-actions"><div><small aria-live="polite" id="garminPersonalStatus" role="status">Wireless sync is not connected.</small></div><button id="garminPersonalConnect" type="button">Connect Garmin</button><button id="garminPersonalSync" type="button">Sync now</button><button id="garminPersonalDisconnect" type="button">Disconnect</button></div><div class="settings-actions"><div><strong>Import complete Garmin history</strong><small>For older rides beyond the recent 500. Reviews 50 activities per batch, waits between batches, and resumes after restarting LibreHeatmaps. Original recordings and saved settings are preserved.</small><small id="garminHistoryStatus" role="status" aria-live="polite">Not started</small></div><button id="garminHistoryStart" type="button">Import full history</button><button id="garminHistoryPause" type="button" disabled>Pause</button></div><div class="field"><label for="garminSyncPreset">Automatic Garmin sync interval</label><select id="garminSyncPreset"><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option selected="" value="60">Every hour · default</option><option value="120">Every 2 hours</option><option value="240">Every 4 hours</option><option value="custom">Custom interval…</option></select><label for="garminSyncCustom" hidden="" id="garminSyncCustomLabel">Custom interval (minutes, 15–1440)</label><input hidden="" id="garminSyncCustom" max="1440" min="15" step="1" type="number" value="60"/><small>Checks on startup, at this interval, and on demand. Save settings to apply.</small></div><p class="muted settings-note">Requires Garmin Connect and internet access. Disconnect deletes the local key; revoke it in Garmin Connect to invalidate it remotely.</p></div><div class="garmin-usb-panel"><strong>Garmin via USB</strong><p class="muted">Connect your Edge using a USB data cable. Find saved FIT rides, copy them into your local archive, and import—without Garmin Connect or Strava.</p><button id="garminScan" type="button">Find connected Garmin</button><div hidden="" id="garminUsbFound"><label for="garminUsbDevice">Connected device</label><select id="garminUsbDevice"></select><button class="primary full" id="garminUsbImport" type="button">Copy &amp; import FIT rides</button></div><button id="garminOpenArchive" type="button">Open local FIT archive</button><div aria-live="polite" class="muted" id="garminUsbStatus" role="status">USB mass-storage Garmin devices only. Recordings on the device are never deleted.</div></div><div class="settings-watch strava-sync-panel" id="stravaSettings"><h3>Strava GPX sync · no developer API</h3><p class="muted settings-note">Import a Strava history ZIP once, then check up to ten recent activities for missing GPX routes. Automatic checks require a separate one-time browser sign-in. This is unofficial website automation, prohibited by Strava's terms and subject to interruption; use only if you accept that limitation.</p><label class="toggle" for="stravaTerms"><input id="stravaTerms" type="checkbox"/> I understand this uses an unofficial Strava website workflow and may be restricted by Strava's terms.</label><div class="settings-actions"><div><strong>Experimental automatic GPX sync · separate sign-in</strong><small>Sign in through the dedicated browser profile. Your existing browser cookies and passwords are not copied.</small><small>The session survives application updates while valid. Reconnect if Strava expires it.</small><small id="stravaBrowserStatus" role="status">Disconnected. Automated sync requires a separate one-time sign-in.</small></div><button id="stravaBrowserConnect" type="button">Sign in for auto-sync</button><button id="stravaBrowserSync" type="button">Sync now</button><button id="stravaBrowserDisconnect" type="button">Disconnect &amp; delete session</button></div><div class="field"><label for="stravaSyncPreset">Automatic Strava GPX sync interval</label><select id="stravaSyncPreset"><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option value="60" selected>Every hour · default</option><option value="120">Every 2 hours</option><option value="240">Every 4 hours</option><option value="custom">Custom interval…</option></select><label id="stravaSyncCustomLabel" for="stravaSyncCustom" hidden>Custom interval (minutes, 15–1440)</label><input id="stravaSyncCustom" type="number" min="15" max="1440" step="1" value="60" hidden/><small>Checks on startup, at this interval, and on demand. The newest 25 rides are checked by default; choose 1–50 below. Save settings to apply.</small></div><div class="field"><label for="stravaRecentCount">Recent Strava rides to check (1–50)</label><input id="stravaRecentCount" type="number" min="1" max="50" step="1" value="25" inputmode="numeric"/><small>Default 25. Only missing rides are downloaded; this does not change your saved history.</small></div><p class="muted settings-note">Disconnect deletes the local browser session, not your imported activities. Official Strava OAuth/API access is not part of this connection.</p></div></section></div><div class="settings-panel" id="settingsPanel-insights" role="tabpanel" aria-labelledby="settingsTab-insights" data-settings-panel="insights" hidden><div class="settings-panel-head"><p class="settings-kicker">Statistics & insights</p><h2>Insights</h2><p>Speed filtering and recorded activity measurements</p></div><section class="settings-section"><h2>Statistics &amp; data quality</h2><div class="settings-actions"><div><strong>Custom cycling speed filter</strong><small>Exclude unusually fast rides from speed charts using your chosen limit. Default: 50 mph (80.5 km/h). Routes and ride totals stay unchanged.</small></div><label class="anomaly-setting"><input id="filterSpeedAnomalies" type="checkbox"/><span>Enable filter</span></label></div><div class="field"><label for="speedThreshold">Maximum cycling speed</label><div class="speed-threshold-control"><input aria-describedby="speedThresholdUnit speedThresholdHint" id="speedThreshold" inputmode="decimal" max="200" min="5" step="0.1" type="number" value="50"/><span class="speed-threshold-suffix" id="speedThresholdUnit">mph</span></div><small id="speedThresholdHint">Only affects speed statistics when enabled; units follow your display preference.</small></div><div class="settings-actions smart-filter-row"><div><strong>Experimental · Detect unusual speeds</strong><small>Find exceptional speed outliers compared with similar rides. Works best with 12+ activities; review genuine fast rides before excluding them.</small></div><label class="anomaly-setting"><input id="filterSpeedSmart" type="checkbox"/><span>Enable anomaly filter</span></label></div><p class="muted settings-note" id="anomalyStatus">Both filters are optional and off by default. Your original rides, routes and non-speed totals are never changed.</p><div class="settings-actions"><div><strong>Review flagged rides</strong><small>Review flagged rides and approve genuine performances.</small><small aria-live="polite" class="anomaly-review-count" id="anomalyReviewCount" role="status">Checking saved filters…</small></div><button id="openSpeedReview" type="button">Review anomalies</button></div></section><section class="settings-section"><h2>Garmin &amp; advanced activity data</h2><div class="settings-actions"><div><strong>Show advanced activity insights</strong><small>Show available cadence, power, heart-rate, calories and weather measurements in Statistics and activity previews. Reimporting source FIT/ZIP files can enrich older rides.</small></div><label class="anomaly-setting"><input id="advancedData" type="checkbox"/><span>Enable advanced insights</span></label></div><p class="muted settings-note">Available values come from imported files. Missing values are not estimated.</p></section></div><div class="settings-panel" id="settingsPanel-library" role="tabpanel" aria-labelledby="settingsTab-library" data-settings-panel="library" hidden><div class="settings-panel-head"><p class="settings-kicker">Local library & backups</p><h2>Library & backups</h2><p>Storage, duplicates, backup and restore</p></div><section class="settings-section"><h2>Local data &amp; cache</h2><p class="muted settings-note">Your SQLite activity library stays local. Original source files are not modified by these tools.</p><div class="settings-actions"><div><strong>Refresh rendered map data</strong><small>Discard temporary map calculations and reload the current view. Imported activities remain untouched.</small></div><button id="clearViewCache">Refresh map cache</button></div><section class="v121-duplicates"><h3>Review possible duplicate recordings</h3><p class="muted settings-note">Run an optional, strict comparison of previously imported activities. Nothing is removed automatically. Inspect each match and choose which recording to keep; removed copies can be restored from the local archive.</p><div class="settings-actions"><div><strong>Find existing duplicates</strong><small>This scan runs only when requested and does not change map loading or your data.</small></div><button id="scanDuplicates" type="button">Scan library</button></div><div aria-live="polite" class="muted" id="duplicateStatus" role="status"></div><div class="v121-duplicate-list" id="duplicatePairs"></div><div class="v121-duplicate-list" id="duplicateArchive"></div></section><details class="settings-subdetails settings-danger"><summary>Delete activity data</summary><div class="settings-actions danger-block"><div><strong>Delete all imported activities</strong><small>Delete only LibreHeatmaps activity records, statistics and import history. Original FIT/GPX files, watched folders, saved account sessions and settings are retained. Connected accounts may reimport missing rides.</small></div><button class="danger" id="clearActivities">Delete local activity data</button></div></details><details class="settings-subdetails settings-storage"><summary>Local data location</summary><div class="local-storage"><strong>Local data location</strong><div class="path-label">Data folder</div><code id="dataFolder">Loading…</code><div class="path-label">SQLite database</div><code id="dataFile">Loading…</code><div class="settings-actions"><div><strong>Open local data folder</strong><small>View your database and diagnostic log in your file manager. Your original exports are never moved or deleted by this control.</small></div><button id="openDataFolder">Open folder</button></div></div></details></section><section class="settings-section"><h2>Portable library</h2><p class="muted settings-note">Library backups contain the original GPS locations and telemetry. Keep backups and exported routes private unless you intend to share those locations.</p><div class="settings-actions"><div><strong>Portable library backup</strong><small>Download a self-contained ZIP of the local SQLite library and settings. Original downloaded FIT/GPX/Strava ZIP files are not included.</small></div><button id="backupLibrary" type="button">Download backup ZIP</button></div><div class="settings-actions"><div><strong>Restore a library</strong><small>Replace the current local library with a verified LibreHeatmaps backup. Create a backup first; this operation requires confirmation.</small></div><button id="restoreLibrary" type="button">Restore from ZIP</button><input accept=".zip" hidden="" id="restoreLibraryFile" type="file"/></div><div class="muted" id="libraryStatus" role="status"></div></section></div><div class="settings-panel" id="settingsPanel-updates" role="tabpanel" aria-labelledby="settingsTab-updates" data-settings-panel="updates" hidden><div class="settings-panel-head"><p class="settings-kicker">Software updates</p><h2>Updates</h2><p>Check and install verified LibreHeatmaps releases</p></div><section class="settings-section"><h2>Software update</h2><p class="muted settings-note">Current version: <strong id="installedVersion">1.2.2</strong>. Settings checks GitHub for updates when opened, with manual refresh available. Only release metadata is requested; activity data stays local. Downloads are SHA-256 verified before installation.</p><div class="settings-actions"><div><strong>Available releases</strong><small>Check automatically when Settings opens, or refresh manually. Your GPS data is never sent to GitHub.</small></div><button id="checkUpdate">Check for updates</button></div><div class="settings-actions"><div><strong>Install a verified release</strong><small>Previous app files are saved together in a dated ZIP inside LibreHeatmaps-backups. Imported activities stay untouched. Restart after updating.</small></div><button disabled="" id="installUpdate">Install update</button></div><div aria-live="polite" class="settings-status" id="updateStatus" role="status"></div><a hidden="" href="https://github.com/Gubna-Tech" id="releaseLink" rel="noreferrer noopener" target="_blank">View release on GitHub</a></section></div></div></div><div id="settingsGlobalStatus" class="settings-global-status"><div id="settingsStatus" role="status" aria-live="polite" class="settings-status"></div></div><div class="settings-savebar"><div aria-live="polite" class="settings-save-state" id="settingsSaveState" role="status">Checking saved settings…</div><button class="primary" id="saveSettings">Save settings</button></div></dialog>
 <dialog id="timeMachineDialog" aria-label="Heatmap Time Machine"><div class="tm-dock"><strong class="tm-title">Time Machine</strong><label class="tm-mode">History<select id="timeMachineMode"><option value="through">Through selected year</option><option value="year">Selected year only</option></select></label><div class="tm-year"><strong id="timeMachineYearLabel">2026</strong><input id="timeMachineYear" aria-label="Select activity year" type="range" min="2020" max="2026" step="1" value="2026"></div><div class="tm-step"><button id="timeMachinePrev" type="button" aria-label="Previous year">‹</button><button id="timeMachinePlay" type="button">Play years</button><button id="timeMachineNext" type="button" aria-label="Next year">›</button></div><div class="tm-summary" id="timeMachineNumbers" aria-live="polite"></div><div class="tm-actions"><button id="timeMachineReset" type="button">All years</button><button id="timeMachineApply" class="primary" type="button">Apply</button><button id="timeMachineClose" type="button" aria-label="Close Time Machine">×</button></div></div><p class="tm-status" id="timeMachineStatus" role="status"></p></dialog>
 <script>
 const TOKEN = '__APP_TOKEN__';
@@ -3402,9 +5605,11 @@ ocean:{colors:['#354ebd','#367fd8','#31c5d0','#9bf2ff','#f6fcff'],name:'Blue →
 forest:{colors:['#206f7f','#30ab82','#76d373','#d4e86b','#fff7c6'],name:'Teal → lime → yellow'}
 };
 const $ = id => document.getElementById(id);
-const map = $('map'), tiles = $('tiles'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+const map = $('map'), tiles = $('tiles'), bikeTiles=$('bikeTiles'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+const bikeTileNodes=new Map();
+
 const heatVisitTooltip=$('heatVisitTooltip');let heatVisitGrid=new Map();
-const state = {lat:36.1627,lon:-86.7816,z:12,activeRideId:null,online:true,mode:'dark',bounds:null,data:{step:2,cells:[],activities:0,peak:0},tileNodes:new Map(),generation:0,known:0};
+const state = {lat:36.1627,lon:-86.7816,z:12,activeRideId:null,activeRideBounds:null,online:true,mode:'dark',bikeRoutes:false,bikeTintColor:'#54dc96',bounds:null,data:{step:2,cells:[],activities:0,peak:0},tileNodes:new Map(),generation:0,known:0};
 const earth = z => 256*Math.pow(2,z);
 const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
 const px = (lat,lon,z=state.z) => {const e=earth(z),r=clamp(lat,-85.0511,85.0511)*Math.PI/180;return [(lon+180)/360*e,(1-Math.asinh(Math.tan(r))/Math.PI)/2*e]};
@@ -3413,10 +5618,63 @@ const dimensions = () => [map.clientWidth,map.clientHeight];
 const viewport = () => {const [w,h]=dimensions(),p=px(state.lat,state.lon);return {left:p[0]-w/2,top:p[1]-h/2,w,h}};
 function fitBounds(b,tight=true){if(!b||b.some(x=>x===null))return;const [w,h]=dimensions();if(w<100||h<100){requestAnimationFrame(()=>fitBounds(b,tight));return;}const a=px(b[1],b[0],0),c=px(b[3],b[2],0);const dx=Math.max(1,Math.abs(c[0]-a[0])),dy=Math.max(1,Math.abs(a[1]-c[1]));const zoom=clamp(Math.floor(Math.log2(Math.min(w*.90/dx,h*.90/dy)))+(tight?2:0),tight?12:1,17);state.z=zoom;const center=geo((a[0]+c[0])/2,(a[1]+c[1])/2,0);state.lat=center[0];state.lon=center[1];updateMap(true)}
 function tileUrl(z,x,y){if(state.mode==='satellite')return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;return `https://tile.openstreetmap.org/${z}/${x}/${y}.png`}
+function bikeLayerStatus(message,error=false){const el=$('bikeLayerStatus');if(el.textContent!==message)el.textContent=message;el.classList.toggle('is-error',error)} 
+function updateBikeControls(){
+ const active=state.bikeRoutes;
+ $('bikeLayerControls').hidden=!active;
+ $('bikeTintColor').value=state.bikeTintColor;
+ $('bikeTintColorValue').textContent=state.bikeTintColor.toUpperCase();
+ bikeTiles.classList.toggle('bike-regional',state.z<=10);
+ bikeTiles.classList.toggle('bike-regional-wide',state.z<=7);
+ bikeTiles.style.setProperty('--bike-tint-color',state.bikeTintColor);
+ $('bikeTintFlood').setAttribute('flood-color',state.bikeTintColor);
+}
+function clearBikeTiles(){for(const item of bikeTileNodes.values())item.remove();bikeTileNodes.clear()}
+function bikeTileMap(){
+ updateBikeControls();
+ if(!state.bikeRoutes){clearBikeTiles();bikeLayerStatus('Optional cycling overlay · no cycling tile requests while off.');return}
+ if(!state.online){clearBikeTiles();bikeLayerStatus('Enable Online map tiles to view cycling paths and lanes.');return}
+ drawBikeOverview();
+}
+function bikeSourceZoom(v){
+ // CyclOSM generalizes away small paths on distant raster tiles. Display one
+ // source level more detailed when its tile request count is bounded; preserve
+ // the single CyclOSM overlay and avoid high-volume regional prefetching.
+ if(state.z>=14)return state.z;
+ const source=state.z+1,scale=2;
+ const columns=Math.floor((v.left+v.w)*scale/256)-Math.floor(v.left*scale/256)+1;
+ const rows=Math.floor((v.top+v.h)*scale/256)-Math.floor(v.top*scale/256)+1;
+ return columns*rows<=120?source:state.z;
+}
+function drawBikeOverview(){
+ const v=viewport(),t=256,sourceZoom=bikeSourceZoom(v),scale=2**(sourceZoom-state.z);
+ const max=2**sourceZoom,used=new Set();let created=0;
+ const left=v.left*scale,top=v.top*scale;
+ for(let y=Math.floor(top/t);y<=Math.floor((top+v.h*scale)/t);y++){
+  if(y<0||y>=max)continue;
+  for(let x=Math.floor(left/t);x<=Math.floor((left+v.w*scale)/t);x++){
+   const wrapped=((x%max)+max)%max,key=sourceZoom+'-'+wrapped+'-'+y+'-'+x;
+   used.add(key);let item=bikeTileNodes.get(key);
+   if(!item){
+    item=document.createElement('img');item.alt='';item.decoding='async';item.loading='eager';item.referrerPolicy='strict-origin-when-cross-origin';
+    item.onerror=()=>{item.style.visibility='hidden';if(item.isConnected&&state.online&&state.bikeRoutes)bikeLayerStatus('Some cycling tiles could not load. Check the map connection.',true)};
+    item.onload=()=>{item.style.visibility='visible';if(item.isConnected&&state.online&&state.bikeRoutes)bikeLayerStatus('CyclOSM cycle paths · selected overlay color active.');};
+    const host=['a','b','c'][(wrapped+y)%3];item.src=`https://${host}.tile-cyclosm.openstreetmap.fr/cyclosm-lite/${sourceZoom}/${wrapped}/${y}.png`;
+    bikeTiles.appendChild(item);bikeTileNodes.set(key,item);created++;
+   }
+   item.style.width=(t/scale)+'px';item.style.height=(t/scale)+'px';
+   item.style.transform=`translate3d(${(x*t-left)/scale}px,${(y*t-top)/scale}px,0)`;
+  }
+ }
+ for(const [key,item] of bikeTileNodes)if(!used.has(key)){item.remove();bikeTileNodes.delete(key)}
+ if(created)bikeLayerStatus('Loading CyclOSM cycling tiles…');
+ else if(bikeTileNodes.size)bikeLayerStatus('CyclOSM cycle paths · selected overlay color active.');
+ else bikeLayerStatus('CyclOSM has no tiles at this map position.');
+}
 function tileMap(){
 const enabled=state.online;
 map.classList.toggle('offline-light',!enabled&&state.mode==='light');map.classList.toggle('offline-dark',!enabled&&state.mode!=='light');
-if(!enabled){tiles.replaceChildren();state.tileNodes.clear();$('attribution').textContent='Offline · Local activity routes';return}
+if(!enabled){tiles.replaceChildren();state.tileNodes.clear();bikeTileMap();$('attribution').textContent='Offline · Local activity routes';return}
 const v=viewport(),t=256,used=new Set(),count=Math.pow(2,state.z);
 tiles.className=state.mode==='dark'?'dark':'';
 for(let y=Math.floor(v.top/t);y<=Math.floor((v.top+v.h)/t);y++){
@@ -3428,7 +5686,8 @@ if(!item){item=document.createElement('img');item.alt='';item.decoding='async';i
 item.style.transform=`translate3d(${x*t-v.left}px,${y*t-v.top}px,0)`
 }}
 for(const [key,item] of state.tileNodes){if(!used.has(key)){item.remove();state.tileNodes.delete(key)}}
-$('attribution').innerHTML=state.mode==='satellite'?'Imagery © <a href="https://www.esri.com/" target="_blank" rel="noopener noreferrer">Esri</a> and imagery providers':'<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>';
+bikeTileMap();
+$('attribution').innerHTML=(state.mode==='satellite'?'Imagery © <a href="https://www.esri.com/" target="_blank" rel="noopener noreferrer">Esri</a> and imagery providers':'<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>')+(state.bikeRoutes?' · <a href="https://www.cyclosm.org/" target="_blank" rel="noopener noreferrer">CyclOSM</a>':'');
 }
 let tileFrame=0;function queueTiles(){if(tileFrame)return;tileFrame=requestAnimationFrame(()=>{tileFrame=0;tileMap()})}
 const renderSurface=document.createElement('canvas'),renderContext=renderSurface.getContext('2d',{alpha:true});
@@ -3567,7 +5826,7 @@ try{const res=await fetch('/api/view?'+key,{signal:controller.signal,headers:{'X
 const data=await res.json();if(id!==state.generation)return;state.data=data;heatVisitGrid=new Map();
 for(const cell of data.visits||[]){if(Array.isArray(cell)&&cell.length===3)heatVisitGrid.set(cell[0]+','+cell[1],cell[2]);}
 heatVisitTooltip.hidden=true;previousGeometry=null;loadedKey=key;zoomWaiting=false;
-$('mapDetail').textContent=state.activeRideId?'Selected route · '+data.activities.toLocaleString()+' matching activity':data.activities.toLocaleString()+' matching activities in map area';queueRender();scheduleHeatPrefetch()}
+if(!garminHomeActive||state.activeRideId)$('mapDetail').textContent=state.activeRideId?'Selected route · '+data.activities.toLocaleString()+' matching activity':data.activities.toLocaleString()+' matching activities in map area';queueRender();scheduleHeatPrefetch()}
 catch(e){if(e.name!=='AbortError'){zoomWaiting=false;canvas.style.transform='';canvas.style.opacity='1';$('busy').classList.add('hidden');loadedKey='';queueRender();$('mapDetail').textContent='Map update failed: '+e.message}}
 finally{if(id===state.generation)$('busy').classList.add('hidden')}
 }
@@ -3576,8 +5835,13 @@ function chooseMap(mode){state.mode=mode;$('defaultMap').value=mode;document.que
 document.querySelectorAll('[data-map]').forEach(b=>b.onclick=()=>chooseMap(b.dataset.map));
 function updatePrivacy(){
 
-$('tileNotice').textContent=state.online?'Map tiles come from external providers and may reveal your IP and map area. Track files and statistics remain local.':'Offline mode: no third-party map requests. Your route overlay remains available.';
+$('tileNotice').textContent=state.online?'Online map tiles contact external providers'+(state.bikeRoutes?' including CyclOSM':'')+' and may reveal your IP and viewed map area. Track files and statistics remain local.':'Offline mode: no third-party map requests. Your route overlay remains available.';
 }
+$('bikeRoutes').addEventListener('change',()=>{state.bikeRoutes=$('bikeRoutes').checked;tileMap();updatePrivacy();savePreferences()});
+
+
+
+$('bikeTintColor').addEventListener('input',()=>{state.bikeTintColor=$('bikeTintColor').value.toLowerCase();updateBikeControls();savePreferences()});
 $('onlineTiles').addEventListener('change',()=>{state.online=$('onlineTiles').checked;if($('ridePreviewDialog').open&&previewRide)drawRidePreview(previewRide);state.tileNodes.clear();tiles.replaceChildren();updatePrivacy();tileMap();queueRender();savePreferences()});
 updatePrivacy();
 
@@ -3709,6 +5973,10 @@ if(s.advanced_enabled){
  addAdvanced(sensors,'warmest_device','Highest device temperature',tempValue);
  addAdvanced(sensors,'coldest_device','Lowest device temperature',tempValue);
  addAdvanced(sensors,'highest_avg_cadence','Highest cycling cadence average',v=>nice(v,0)+' rpm');
+ addAdvanced(sensors,'highest_max_cadence','Highest recorded cadence peak',v=>nice(v,0)+' rpm');
+ addAdvanced(sensors,'most_cycles','Most recorded cycles / strokes',v=>nice(v,0)+' cycles');
+ addAdvanced(sensors,'highest_normalized_power','Highest normalized power',v=>nice(v,0)+' W');
+ addAdvanced(sensors,'highest_training_stress','Highest training stress',v=>nice(v,1)+' TSS');
  if(ar.mean_ride_cadence)sensors.push(['Average of recorded ride cadences',nice(ar.mean_ride_cadence.value,0)+' rpm',nice(ar.mean_ride_cadence.coverage)+' activities with cadence data']);
  addAdvanced(sensors,'highest_avg_power','Highest average power',v=>nice(v,0)+' W');
  addAdvanced(sensors,'highest_max_power','Highest recorded power',v=>nice(v,0)+' W');
@@ -3757,11 +6025,11 @@ function renderAdvanced(data){
  const root=$('advancedCards'),charts=$('advancedGraphs');root.replaceChildren();charts.replaceChildren();
  if(!data){root.textContent='Enable advanced activity insights in Settings to explore recorded sensor and weather data.';return}
  const c=data.coverage||{},rides=data.rides||[];
- for(const [name,key] of [['Calories','calories_kcal'],['Device temperature','avg_temp_c'],['Weather temperature','weather_temp_c'],['Wind speed','wind_speed_mps'],['Average cadence','avg_cadence'],['Power','avg_power']]){
+ for(const [name,key] of [['Calories','calories_kcal'],['Device temperature','avg_temp_c'],['Weather temperature','weather_temp_c'],['Wind speed','wind_speed_mps'],['Average cadence','avg_cadence'],['Peak cadence','max_cadence'],['Recorded cycles / strokes','total_cycles'],['Normalized power','normalized_power'],['Power','avg_power']]){
   const card=document.createElement('div');card.className='advanced-summary';const value=document.createElement('strong');value.textContent=(c[key]||0).toLocaleString()+' rides';const label=document.createElement('span');label.textContent=name+' recorded';card.append(value,label);root.append(card)
  }
  const metric=$('units').value==='mi',temperature=v=>metric?v*9/5+32:v,wind=v=>metric?v*2.236936:v*3.6;
- const specs=[['Calories by month','calories','kcal','sum',v=>v],['Device temperature by month','temp_c',metric?'°F':'°C','mean',temperature],['Weather temperature by month','weather_temp_c',metric?'°F':'°C','mean',temperature],['Wind speed by month','wind_mps',metric?'mph':'km/h','mean',wind],['Average power by month','power','W','mean',v=>v],['Cadence by month','cadence','rpm','mean',v=>v]];
+ const specs=[['Calories by month','calories','kcal','sum',v=>v],['Device temperature by month','temp_c',metric?'°F':'°C','mean',temperature],['Weather temperature by month','weather_temp_c',metric?'°F':'°C','mean',temperature],['Wind speed by month','wind_mps',metric?'mph':'km/h','mean',wind],['Average power by month','power','W','mean',v=>v],['Cadence by month','cadence','rpm','mean',v=>v],['Peak cadence by month','max_cadence','rpm','mean',v=>v],['Normalized power by month','normalized_power','W','mean',v=>v],['Training stress by month','training_stress','TSS','sum',v=>v]];
  for(const [title,key,unit,aggregation,convert] of specs){
   const card=document.createElement('article');card.className='advanced-graph';const heading=document.createElement('h5');heading.textContent=title;card.append(heading);
   const byMonth=new Map();for(const ride of rides){const v=ride[key];if(v===null||v===undefined||!Number.isFinite(Number(v))||!ride.day)continue;const month=ride.day.slice(0,7),a=byMonth.get(month)||[0,0];a[0]+=Number(v);a[1]+=1;byMonth.set(month,a)}
@@ -4217,14 +6485,57 @@ $('flyoverRelief').onchange=()=>{
 $('flyoverSurface').onchange=()=>{if(flyoverPlaying)flyoverPause();flyoverApplySurface()};
 $('flyoverCameraMode').onchange=()=>{flyoverCamera=null;if(flyoverFollow)flyoverCameraMove(flyoverPoint(flyoverProgress),true)};
 
+
+let activityEditId=null,routeRepairId=null,routeRepairSnapshot=null,v122LoadedText={},v122LoadedNumbers={},v122SpeedSuggestion=null,v122KnownGears=[];
+const v122EditInputs={name:'editRideName',sport:'editRideSport',day:'editRideDate',bike:'editRideBike',gear_id:'editRideGearId',recorded_distance_m:'editRideDistance',moving_seconds:'editRideMoving',elapsed_seconds:'editRideElapsed',avg_speed:'editRideAvgSpeed',max_speed:'editRideMaxSpeed',elevation_m:'editRideElevation',avg_heart_rate:'editRideHeartRate',avg_power:'editRidePower',avg_cadence:'editRideCadence',calories_kcal:'editRideCalories',avg_temp_c:'editRideTemp',max_temp_c:'editRideMaxTemp',weather_temp_c:'editRideWeatherTemp',wind_speed_mps:'editRideWind',wind_gust_mps:'editRideGust'};
+async function v122Post(path,data){const r=await fetch(path,{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(data),cache:'no-store'});const json=await r.json();if(!r.ok)throw Error(json.error||'Request failed');return json}
+const activityEditUnitFactor=key=>{
+ const imperial=$('units').value==='mi';
+ if(key==='recorded_distance_m')return imperial?1609.344:1000;
+ if(key==='elevation_m')return imperial?0.3048:1;
+ if(['avg_speed','max_speed','wind_speed_mps','wind_gust_mps'].includes(key))return imperial?1/2.2369362921:1/3.6;
+ return ['moving_seconds','elapsed_seconds'].includes(key)?60:1;
+};
+const activityEditTemperatureFields=['avg_temp_c','max_temp_c','weather_temp_c'];
+function updateActivityEditUnitLabels(){const miles=$('units').value==='mi';
+ const suffix=miles?'mi':'km',speed=miles?'mph':'km/h',climb=miles?'ft':'m',temp=miles?'°F':'°C';
+ for(const [id,label] of [['editRideDistance','Summary distance ('+suffix+')'],['editRideAvgSpeed','Average speed ('+speed+')'],['editRideMaxSpeed','Maximum speed ('+speed+')'],['editRideElevation','Climbing ('+climb+')'],['editRideTemp','Device average temperature ('+temp+')'],['editRideMaxTemp','Device maximum temperature ('+temp+')'],['editRideWeatherTemp','Weather temperature ('+temp+')'],['editRideWind','Wind speed ('+speed+')'],['editRideGust','Wind gust ('+speed+')']])$(id).closest('label').firstChild.nodeValue=label;
+ $('editRideDistance').max=miles?'12427':'20000';$('editRideElevation').max=miles?'3280840':'1000000';
+}
+async function openActivityEdit(){updateActivityEditUnitLabels();if(!previewRide)return;activityEditId=previewRide.id;const selected=activityEditId;const status=$('activityEditStatus');status.textContent='Reading saved activity information…';for(const id of Object.values(v122EditInputs))$(id).disabled=true;$('saveActivityEdit').disabled=true;$('activityEditDialog').showModal();v122LoadedText={};v122LoadedNumbers={};v122SpeedSuggestion=null;$('speedEstimateStatus').textContent='';$('useSpeedEstimate').hidden=true;try{const data=await getJson('/api/activity-edit?id='+activityEditId);if(!$('activityEditDialog').open||activityEditId!==selected)return;for(const [key,id] of Object.entries(v122EditInputs)){
+let val=data.values[key];if(val===null||val===undefined)val='';else if(key==='recorded_distance_m')val=(val/activityEditUnitFactor(key)).toFixed(3).replace(/0+$/,'').replace(/[.]$/,'');else if(key==='moving_seconds'||key==='elapsed_seconds')val=(val/60).toFixed(2).replace(/0+$/,'').replace(/[.]$/,'');else if(key==='elevation_m')val=(val/activityEditUnitFactor(key)).toFixed(1).replace(/0+$/,'').replace(/[.]$/,'');else if(activityEditTemperatureFields.includes(key)&&$('units').value==='mi')val=(val*9/5+32).toFixed(1).replace(/0+$/,'').replace(/[.]$/,'');else if(['avg_speed','max_speed','wind_speed_mps','wind_gust_mps'].includes(key))val=(val/activityEditUnitFactor(key)).toFixed(2).replace(/0+$/,'').replace(/[.]$/,'');$(id).value=val;v122LoadedText[id]=String(val);v122LoadedNumbers[key]=data.values[key]}
+v122KnownGears=data.gear_options||[];const chooser=$('editRideBikeSelect');chooser.replaceChildren();const start=document.createElement('option');start.value='';start.textContent='Use custom name or no gear';chooser.append(start);for(let i=0;i<v122KnownGears.length;i++){const g=v122KnownGears[i],opt=document.createElement('option');opt.value=String(i);opt.textContent=g.name+' ('+g.count+' activities)';chooser.append(opt)}const index=v122KnownGears.findIndex(g=>g.name===data.values.bike);chooser.value=index>=0?String(index):'';
+$('restoreActivityEdit').disabled=!data.edited;for(const id of Object.values(v122EditInputs))$(id).disabled=false;$('saveActivityEdit').disabled=false;status.textContent=data.edited?'This activity has local edits; Restore original returns to the values before editing.':'Edit only the fields that need correcting. Original source files stay intact.'
+}catch(e){status.textContent='Unable to load activity: '+e.message}}
+$('openActivityEdit').onclick=openActivityEdit;$('closeActivityEdit').onclick=()=>$('activityEditDialog').close();
+$('editRideBikeSelect').onchange=()=>{const gear=v122KnownGears[Number($('editRideBikeSelect').value)];if($('editRideBikeSelect').value!==''&&gear){$('editRideBike').value=gear.name;$('editRideGearId').value=gear.gear_id||''}};
+$('reviewSpeedEstimate').onclick=async()=>{if(!activityEditId)return;const status=$('speedEstimateStatus');status.textContent='Checking GPS samples and similar activities…';$('useSpeedEstimate').hidden=true;v122SpeedSuggestion=null;try{const data=await getJson('/api/activity-speed-estimate?id='+activityEditId);let lines=[];const dist=Number($('editRideDistance').value),minutes=Number($('editRideMoving').value);if(dist>0&&minutes>0)lines.push('Distance ÷ moving time: '+(dist/(minutes/60)).toFixed(2)+($('units').value==='mi'?' mph':' km/h')+' (based on your entered values).');if(data.sustained_max_mps!==null)lines.push('GPS-supported sustained peak: '+(data.sustained_max_mps/activityEditUnitFactor('max_speed')).toFixed(2)+($('units').value==='mi'?' mph':' km/h')+' from '+data.valid_intervals+' validated intervals.');else lines.push('No reliable sustained GPS maximum was found; this field cannot be inferred from average speed.');if(data.comparable_count)lines.push('Similar routes: '+data.comparable_count+' recordings, median average '+(data.comparable_median_avg_mps/activityEditUnitFactor('avg_speed')).toFixed(2)+($('units').value==='mi'?' mph':' km/h')+'. Comparisons are context, not proof.');else lines.push('No route-matched comparisons were found.');if(data.rejected_intervals)lines.push(data.rejected_intervals+' GPS intervals rejected because position, time, or elevation appeared implausible.');status.textContent=lines.join(' ');v122SpeedSuggestion={avg:dist>0&&minutes>0?dist*activityEditUnitFactor('recorded_distance_m')/(minutes*60):null,max:data.sustained_max_mps};$('useSpeedEstimate').hidden=v122SpeedSuggestion.avg===null&&v122SpeedSuggestion.max===null;}catch(e){status.textContent='Speed review unavailable: '+e.message}};
+$('useSpeedEstimate').onclick=()=>{if(!v122SpeedSuggestion)return;if(v122SpeedSuggestion.avg!==null)$('editRideAvgSpeed').value=(v122SpeedSuggestion.avg/activityEditUnitFactor('avg_speed')).toFixed(2);if(v122SpeedSuggestion.max!==null)$('editRideMaxSpeed').value=(v122SpeedSuggestion.max/activityEditUnitFactor('max_speed')).toFixed(2);$('speedEstimateStatus').textContent+=' Suggested values filled; review them, then select Save activity to apply. Original sensor data remains unchanged.'};
+$('activityEditForm').onsubmit=async event=>{event.preventDefault();if(!activityEditId)return;const status=$('activityEditStatus');let values={};for(const [key,id] of Object.entries(v122EditInputs))values[key]=$(id).value.trim();for(const key of ['recorded_distance_m','moving_seconds','elapsed_seconds','elevation_m','avg_speed','max_speed','wind_speed_mps','wind_gust_mps','avg_heart_rate','avg_power','avg_cadence','calories_kcal','avg_temp_c','max_temp_c','weather_temp_c']){const typed=values[key],id=v122EditInputs[key];values[key]=typed===v122LoadedText[id]?v122LoadedNumbers[key]:(typed===''?null:(activityEditTemperatureFields.includes(key)&&$('units').value==='mi'?(Number(typed)-32)*5/9:Number(typed)*activityEditUnitFactor(key)))}values.day=values.day||null;
+const btn=$('saveActivityEdit');btn.disabled=true;status.textContent='Saving local corrections…';try{await v122Post('/api/activity-edit',{activity_id:activityEditId,action:'save',values});$('activityEditDialog').close();await openRidePreview(activityEditId);await refreshStats(true)}catch(e){status.textContent=e.message}finally{btn.disabled=false}};
+$('restoreActivityEdit').onclick=async()=>{if(!activityEditId||!confirm('Restore the original imported values for this activity?'))return;try{await v122Post('/api/activity-edit',{activity_id:activityEditId,action:'restore'});$('activityEditDialog').close();await openRidePreview(activityEditId);await refreshStats(true)}catch(e){$('activityEditStatus').textContent=e.message}};
+function drawRouteRepairComparison(review){const canvas=$('routeRepairCanvas'),ctx=canvas.getContext('2d');if(!ctx)return;const w=canvas.width,h=canvas.height;ctx.clearRect(0,0,w,h);const before=review.original_points||[],after=review.proposed_points||[];const valid=before.filter(Boolean);if(!valid.length)return;let north=-90,south=90,west=180,east=-180;for(const point of valid){north=Math.max(north,point[0]);south=Math.min(south,point[0]);west=Math.min(west,point[1]);east=Math.max(east,point[1])}const mid=(north+south)/2,lonFactor=Math.max(.1,Math.cos(mid*Math.PI/180));const spanX=Math.max(.000015,(east-west)*lonFactor),spanY=Math.max(.000015,north-south),scale=Math.min((w-48)/spanX,(h-36)/spanY);const centerX=(east+west)/2,centerY=(north+south)/2;
+const xy=p=>[w/2+(p[1]-centerX)*lonFactor*scale,h/2-(p[0]-centerY)*scale];const draw=(points,color,width,dash)=>{ctx.beginPath();let begun=false;for(const p of points){if(!p){begun=false;continue}const [x,y]=xy(p);if(begun)ctx.lineTo(x,y);else ctx.moveTo(x,y);begun=true}ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineCap='round';ctx.lineJoin='round';ctx.setLineDash(dash);ctx.stroke();ctx.setLineDash([])};
+draw(before,'#db70ad',3,[7,4]);draw(after,'#7aefba',2.5,[]);for(const p of review.proposals||[]){const [x,y]=xy(p.outlier);ctx.beginPath();ctx.arc(x,y,4,0,2*Math.PI);ctx.fillStyle='#ffc76e';ctx.fill()}}
+async function openRouteRepair(){if(!previewRide)return;routeRepairId=previewRide.id;routeRepairSnapshot=null;$('routeRepairDialog').showModal();$('routeRepairStatus').textContent='Reviewing local GPS positions…';$('routeRepairCandidates').replaceChildren();$('applyRouteRepair').disabled=true;$('restoreRouteRepair').hidden=true;const ctx=$('routeRepairCanvas').getContext('2d');ctx?.clearRect(0,0,900,270);
+try{const review=await getJson('/api/route-repair?id='+routeRepairId);routeRepairSnapshot=review;
+if(review.applied){$('routeRepairStatus').textContent='A reviewed repair has been applied to this route.';$('routeRepairSummary').textContent=(review.changes?.length||0)+' GPS anomaly correction(s); original GPS coordinates and recorded telemetry are preserved for restoration.';$('restoreRouteRepair').hidden=false;return}
+$('routeRepairStatus').textContent=review.proposals.length?review.proposals.length+' high-confidence candidate(s) found; nothing has been changed.':'No high-confidence isolated spikes detected. No changes are recommended.';
+$('routeRepairSummary').textContent='Original stored GPS distance: '+(review.original_distance_m/1000).toFixed(2)+' km · All proposals applied: '+(review.proposed_distance_m/1000).toFixed(2)+' km. The visual preview shows all proposals; only checked repairs will be applied. Device-reported distance remains unchanged.';drawRouteRepairComparison(review);
+for(const proposal of review.proposals){const label=document.createElement('label'),input=document.createElement('input'),copy=document.createElement('span');input.type='checkbox';input.value=proposal.sample_index;input.checked=true;input.onchange=()=>{$('applyRouteRepair').disabled=!$('routeRepairCandidates').querySelector('input:checked')};copy.textContent='Suspicious GPS point: '+proposal.jump_speed_kmh+' km/h apparent jump over '+proposal.time_seconds+' seconds · detour ~'+proposal.detour_m+' m · original position '+proposal.outlier.join(', ')+' → interpolated between '+proposal.before.join(', ')+' and '+proposal.after.join(', ');label.append(input,copy);$('routeRepairCandidates').append(label)}$('applyRouteRepair').disabled=!review.proposals.length;
+}catch(e){$('routeRepairStatus').textContent='Review unavailable: '+e.message}}
+$('openRouteRepair').onclick=openRouteRepair;$('closeRouteRepair').onclick=()=>$('routeRepairDialog').close();
+$('applyRouteRepair').onclick=async()=>{if(!routeRepairId||!routeRepairSnapshot)return;const selection=[...$('routeRepairCandidates').querySelectorAll('input:checked')].map(el=>Number(el.value));if(!selection.length)return;if(!confirm('Apply '+selection.length+' reviewed GPS spike correction(s)?\\n\\nOriginal route and telemetry will be preserved in your local library for restoration.'))return;const btn=$('applyRouteRepair');btn.disabled=true;try{await v122Post('/api/route-repair',{activity_id:routeRepairId,action:'apply',selection});$('routeRepairDialog').close();await openRidePreview(routeRepairId);await refreshStats(true)}catch(e){$('routeRepairStatus').textContent=e.message;btn.disabled=false}};
+$('restoreRouteRepair').onclick=async()=>{if(!routeRepairId||!confirm('Restore the original GPS track and sensor locations for this ride?'))return;try{await v122Post('/api/route-repair',{activity_id:routeRepairId,action:'restore'});$('routeRepairDialog').close();await openRidePreview(routeRepairId);await refreshStats(true)}catch(e){$('routeRepairStatus').textContent=e.message}};
+
 async function openRidePreview(id){
-const dialog=$('ridePreviewDialog');previewRide=null;$('showRideMap').disabled=true;$('openFlyover').disabled=true;$('ridePreviewTitle').textContent='Loading activity…';$('ridePreviewSubtitle').textContent='Private, local GPS preview';$('ridePreviewDetails').replaceChildren();$('ridePreviewStatus').textContent='Reading the route from your local database…';if(!dialog.open)dialog.showModal();$('rideReviewPanel').hidden=true;$('rideTelemetry').hidden=true;
-try{const data=await getJson('/api/activity?id='+encodeURIComponent(id));if(!dialog.open)return;previewRide=data;$('ridePreviewTitle').textContent=data.name||'Untitled activity';$('ridePreviewSubtitle').textContent=[data.day,data.sport].filter(Boolean).join(' · ');$('ridePreviewStatus').textContent=state.online?'Route remains local. Dark map tiles come from OpenStreetMap and reveal the displayed map area and your IP to the provider.':'Online map tiles are disabled. Enable them in Map view to see the dark basemap behind this route.';$('showRideMap').disabled=false;$('openFlyover').disabled=!(Array.isArray(data.points)&&data.points.filter(Boolean).length>=2);
+const dialog=$('ridePreviewDialog');previewRide=null;$('showRideMap').disabled=true;$('openFlyover').disabled=true;$('openActivityEdit').disabled=true;$('openRouteRepair').disabled=true;$('ridePreviewTitle').textContent='Loading activity…';$('ridePreviewSubtitle').textContent='Private, local GPS preview';$('ridePreviewDetails').replaceChildren();$('ridePreviewStatus').textContent='Reading the route from your local database…';if(!dialog.open)dialog.showModal();$('rideReviewPanel').hidden=true;$('rideTelemetry').hidden=true;
+try{const data=await getJson('/api/activity?id='+encodeURIComponent(id));if(!dialog.open)return;previewRide=data;$('ridePreviewTitle').textContent=data.name||'Untitled activity';$('ridePreviewSubtitle').textContent=[data.day,data.sport].filter(Boolean).join(' · ');$('ridePreviewStatus').textContent=state.online?'Route remains local. Dark map tiles come from OpenStreetMap and reveal the displayed map area and your IP to the provider.':'Online map tiles are disabled. Enable them in Map view to see the dark basemap behind this route.';$('showRideMap').disabled=false;$('openActivityEdit').disabled=false;$('openRouteRepair').disabled=false;$('openFlyover').disabled=!(Array.isArray(data.points)&&data.points.filter(Boolean).length>=2);
 const speedUnit=$('units').value==='mi'?' mph':' km/h',speedFactor=$('units').value==='mi'?2.236936:3.6;
 const recorded=n=>n===null||n===undefined||!Number.isFinite(Number(n))?null:Number(n);
 const facts=[['Distance',distanceLabel(data.distance_m)],['Moving time',timeLabel(data.moving_seconds)],['Elapsed time',timeLabel(data.elapsed_seconds)],['Elevation gain',recorded(data.elevation_m)===null?'Not recorded':nice(data.elevation_m*($('units').value==='mi'?3.28084:1),0)+($('units').value==='mi'?' ft':' m')],['Average speed',recorded(data.avg_speed)===null?'Not recorded':nice(data.avg_speed*speedFactor,1)+speedUnit],['Maximum speed',recorded(data.max_speed)===null?'Not recorded':nice(data.max_speed*speedFactor,1)+speedUnit],['Average power',recorded(data.avg_power)===null?'Not recorded':nice(data.avg_power,0)+' W'],['Average heart rate',recorded(data.avg_heart_rate)===null?'Not recorded':nice(data.avg_heart_rate,0)+' bpm'],['Gear',data.bike||'Not recorded'],['GPS samples',nice(data.point_count,0)],['GPS track distance',recorded(data.gps_distance_m)===null?'Not recorded':distanceLabel(data.gps_distance_m)],['Source distance',recorded(data.reported_distance_m)===null?'Not recorded':distanceLabel(data.reported_distance_m)]];
 if(advancedDataEnabled){
- const more=[['Calories','calories_kcal',v=>nice(v,0)+' kcal'],['Device temperature','avg_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Weather temperature','weather_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Wind speed','wind_speed_mps',v=>nice(v*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h')],['Average cadence','avg_cadence',v=>nice(v,0)+' rpm'],['Max power','max_power',v=>nice(v,0)+' W'],['Weather condition','weather_condition',v=>String(v)]];
+ const more=[['Calories','calories_kcal',v=>nice(v,0)+' kcal'],['Device temperature','avg_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Weather temperature','weather_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Wind speed','wind_speed_mps',v=>nice(v*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h')],['Average cadence','avg_cadence',v=>nice(v,0)+' rpm'],['Max cadence','max_cadence',v=>nice(v,0)+' rpm'],[(/ride|cycl|bik/i.test(data.sport||'')?'Pedal cycles (FIT)':/swim/i.test(data.sport||'')?'Swim strokes (FIT)':'Cycles / strokes (FIT)'),'total_cycles',v=>nice(v,0)],['Normalized power','normalized_power',v=>nice(v,0)+' W'],['Training stress','training_stress_score',v=>nice(v,1)+' TSS'],['Intensity factor','intensity_factor',v=>nice(v,2)],['Peak heart rate','max_heart_rate',v=>nice(v,0)+' bpm'],['Max power','max_power',v=>nice(v,0)+' W'],['Weather condition','weather_condition',v=>String(v)]];
  for(const [label,key,format] of more){const v=data[key];if(v!==null&&v!==undefined&&v!=='')facts.push([label,format(v)])}
 }
 for(const [label,value] of facts){const box=document.createElement('div');box.className='ride-preview-detail';const k=document.createElement('span');k.textContent=label;const v=document.createElement('strong');v.textContent=value;box.append(k,v);$('ridePreviewDetails').append(box)}
@@ -4252,15 +6563,15 @@ if(first){context.beginPath();context.arc(first[0],first[1],5,0,Math.PI*2);conte
 const endpoint=all.at(-1);if(endpoint){const end=coord(endpoint);context.beginPath();context.arc(end[0],end[1],5,0,Math.PI*2);context.fillStyle='#ffc58b';context.fill()}
 drawTelemetryMarker();
 }
-$('closeRidePreview').onclick=()=>$('ridePreviewDialog').close();$('backToStats').onclick=()=>$('ridePreviewDialog').close();$('ridePreviewDialog').addEventListener('close',()=>{if($('flyoverDialog').open)$('flyoverDialog').close();++telemetryRequest;telemetrySamples=[];telemetrySelection=-1;previewRide=null;rideProjection=null;$('ridePreviewTiles').replaceChildren();$('rideTelemetry').hidden=true});
-$('showRideMap').onclick=()=>{if(!previewRide)return;const ride=previewRide;state.activeRideId=ride.id;$('clearRide').hidden=false;$('mapCaption').querySelector('.map-caption-title').textContent=ride.name||'Selected GPS activity';$('ridePreviewDialog').close();if($('statsDialog').open)$('statsDialog').close();loadedKey='';fitBounds(ride.bounds,false)};
+$('closeRidePreview').onclick=()=>$('ridePreviewDialog').close();$('backToStats').onclick=()=>$('ridePreviewDialog').close();$('ridePreviewDialog').addEventListener('close',()=>{if($('activityEditDialog').open)$('activityEditDialog').close();if($('routeRepairDialog').open)$('routeRepairDialog').close();if($('flyoverDialog').open)$('flyoverDialog').close();++telemetryRequest;telemetrySamples=[];telemetrySelection=-1;previewRide=null;rideProjection=null;$('ridePreviewTiles').replaceChildren();$('rideTelemetry').hidden=true});
+$('showRideMap').onclick=()=>{if(!previewRide)return;const ride=previewRide;state.activeRideId=ride.id;state.activeRideBounds=ride.bounds;$('clearRide').hidden=false;$('mapCaption').querySelector('.map-caption-title').textContent=ride.name||'Selected GPS activity';$('ridePreviewDialog').close();if($('statsDialog').open)$('statsDialog').close();loadedKey='';fitBounds(ride.bounds,false)};
 $('clearRide').onclick=()=>{state.activeRideId=null;$('clearRide').hidden=true;$('mapCaption').querySelector('.map-caption-title').textContent='Your GPS heatmap';loadedKey='';fitBounds(state.focusBounds||state.bounds)};
 window.addEventListener('resize',()=>{if($('ridePreviewDialog').open&&previewRide){drawRidePreview(previewRide);if(telemetrySamples.length)drawTelemetryChart()}});
 async function refreshInsights(){if($('statsDialog').open&&!$('statsData').hidden)loadDataTable();try{const info=await getJson('/api/insights?'+statsParams());fillStats(info);if($('statsDialog').open&&!$('statsReview').hidden)await loadSpeedReview()}catch(e){$('statAccuracy').textContent='Unable to load statistics: '+e.message}}
 async function refreshStatsFilters(){const s=await getJson('/api/stats');const oldSport=$('statsSport').value,oldYear=$('statsYear').value,oldBike=$('statsBike').value;$('statsSport').replaceChildren();let o=document.createElement('option');o.value='';o.textContent='All types';$('statsSport').append(o);for(const [name] of s.types){let e=document.createElement('option');e.value=name;e.textContent=name;$('statsSport').append(e)}$('statsSport').value=oldSport;$('statsBike').replaceChildren();let allBikes=document.createElement('option');allBikes.value='';allBikes.textContent='All bikes';$('statsBike').append(allBikes);for(const name of s.bikes||[]){const e=document.createElement('option');e.value=name;e.textContent=name;$('statsBike').append(e)}$('statsBike').value=oldBike;const overview=await getJson('/api/insights');$('statsYear').replaceChildren();o=document.createElement('option');o.value='';o.textContent='All years';$('statsYear').append(o);for(const y of overview.years){const e=document.createElement('option');e.value=y.year;e.textContent=y.year;$('statsYear').append(e)}$('statsYear').value=oldYear;statsYears=overview.months;updateStatsMonths()}
 function updateStatsMonths(){const old=$('statsMonth').value,year=$('statsYear').value;$('statsMonth').replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent='All months';$('statsMonth').append(blank);for(const m of statsYears.filter(m=>!year||m.month.startsWith(year))){const e=document.createElement('option');e.value=m.month;e.textContent=m.month;$('statsMonth').append(e)}$('statsMonth').value=old;if($('statsMonth').value!==old)$('statsMonth').value=''}
 $('statsTop').onclick=()=>{$('statsButton').click()};$('statsButton').onclick=async()=>{selectStatsTab('overview');$('statsDialog').showModal();try{await refreshStatsFilters()}catch(e){$('statAccuracy').textContent=e.message}refreshInsights()};
-$('closeStats').onclick=()=>$('statsDialog').close();$('openSpeedReview').onclick=async()=>{if(settingsDirty){showSettingsStatus('Save your speed-filter settings before reviewing anomalies.',true);return}if(!(savedSettings&& (savedSettings.filter_speed_anomalies||savedSettings.filter_speed_smart))){showSettingsStatus('Enable and save a speed filter to review flagged activities.',true);return}closeSettings();$('statsDialog').showModal();selectStatsTab('review');try{await refreshStatsFilters()}catch(e){}await refreshInsights()};$('units').onchange=()=>{if(currentInsights)fillStats(currentInsights);loadDataTable()};
+$('closeStats').onclick=()=>$('statsDialog').close();$('openSpeedReview').onclick=async()=>{if(settingsDirty){showSettingsStatus('Save your speed-filter settings before reviewing anomalies.',true);return}if(!(savedSettings&& (savedSettings.filter_speed_anomalies||savedSettings.filter_speed_smart))){showSettingsStatus('Enable and save a speed filter to review flagged activities.',true);return}closeSettings();$('statsDialog').showModal();selectStatsTab('review');try{await refreshStatsFilters()}catch(e){}await refreshInsights()};$('units').onchange=async()=>{if(currentInsights)fillStats(currentInsights);loadDataTable();try{await v122Post('/api/display-units',{display_units:$('units').value});$('settingsUnits').value=$('units').value;showSavedSpeedThreshold(settingsSpeedThresholdMph);if(savedSettings)savedSettings.display_units=$('units').value}catch(e){console.warn('Could not store display units:',e.message)}};
 $('statsSport').onchange=refreshInsights;$('statsBike').onchange=refreshInsights;$('statsMonth').onchange=refreshInsights;$('statsYear').onchange=()=>{updateStatsMonths();refreshInsights()};
 let sliderTimer=0;
 for(const id of ['radius','intensity','opacity','definition']){$(id).addEventListener('input',()=>{$(id+'Value').textContent=$(id).value+(id==='radius'?' px':'%');clearTimeout(sliderTimer);sliderTimer=setTimeout(queueRender,85);savePreferences()})}
@@ -4297,14 +6608,93 @@ function zoomAtPointer(target,localX,localY){const old=state.z,next=clamp(target
 let wheelTimer=0;interactive.addEventListener('wheel',e=>{e.preventDefault();const rect=interactive.getBoundingClientRect();if(!zoomAtPointer(state.z+(e.deltaY<0?1:-1),e.clientX-rect.left,e.clientY-rect.top))return;clearTimeout(wheelTimer);wheelTimer=setTimeout(()=>updateMap(true),110)},{passive:false});
 interactive.addEventListener('dblclick',e=>{const rect=interactive.getBoundingClientRect();if(zoomAtPointer(state.z+1,e.clientX-rect.left,e.clientY-rect.top))updateMap(true)});
 function zoomButton(delta){const old=state.z;state.z=clamp(old+delta,1,18);if(state.z!==old)updateMap(true)}
-$('plus').onclick=()=>zoomButton(1);$('minus').onclick=()=>zoomButton(-1);$('fit').onclick=e=>fitBounds(e.shiftKey?state.bounds:state.focusBounds||state.bounds,!e.shiftKey);
-let restoringDetails=false;$('import').onclick=()=>{restoringDetails=false;$('file').click()};$('repairDetails').onclick=()=>{restoringDetails=true;if($('statsDialog').open)$('statsDialog').close();$('file').click()};$('file').addEventListener('change',()=>{if($('file').files.length)upload($('file').files[0])});
-function setImportMapStatus(message){$('mapCaption').querySelector('.map-caption-title').textContent='Importing GPS activities';$('mapDetail').textContent=message;}
-function restoreImportMapStatus(){if(state.activeRideId)return;const title=$('mapCaption').querySelector('.map-caption-title');title.textContent='Your GPS heatmap';$('mapDetail').textContent='Updating your local heatmap…';}
-function upload(file){$('import').disabled=true;setImportMapStatus('Preparing '+file.name+' · 0%');const status=$('importStatus');status.classList.remove('error');status.textContent='Uploading '+file.name+' to the local importer…';const xhr=new XMLHttpRequest();xhr.open('POST','/api/import');xhr.setRequestHeader('X-LibreHeatmaps-Token',TOKEN);xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));xhr.upload.onprogress=e=>{if(e.lengthComputable){const progress=Math.floor(e.loaded/e.total*100);status.textContent='Copying ZIP locally: '+progress+'%';setImportMapStatus('Transferring '+progress+'% · '+file.name)}};xhr.onload=()=>{if(xhr.status===202){pollImport()}else{status.classList.add('error');status.textContent='Import could not start: '+xhr.responseText;$('import').disabled=false;restoreImportMapStatus()}};xhr.onerror=()=>{status.classList.add('error');status.textContent='Could not transfer activity to local app.';$('import').disabled=false;restoreImportMapStatus()};xhr.send(file)}
-async function pollImport(){try{const job=await getJson('/api/job');$('importStatus').textContent=job.status==='running'?`Processing ${job.processed} / ${job.total}: ${job.message}
+$('plus').onclick=()=>zoomButton(1);$('minus').onclick=()=>zoomButton(-1);$('fit').onclick=e=>fitBounds(state.activeRideId&&state.activeRideBounds?state.activeRideBounds:(e.shiftKey?state.bounds:state.focusBounds||state.bounds),!e.shiftKey);
+let restoringDetails=false;
+$('import').onclick=()=>{restoringDetails=false;$('file').click()};
+$('repairDetails').onclick=()=>{restoringDetails=true;if($('statsDialog').open)$('statsDialog').close();$('file').click()};
+const queuedImports=[];let importingManual=false,dragDepth=0;
+const allowedDropFile=name=>/[.](zip|csv|gps)$/i.test(name||'')||/[.](fit|gpx|tcx)([.]gz)?$/i.test(name||'');
+function enqueueActivityFiles(files){
+ const list=Array.from(files||[]).filter(f=>f&&f.size>0);
+ const supported=list.filter(f=>allowedDropFile(f.name));
+ const rejected=list.length-supported.length;
+ if(!supported.length){$('importStatus').textContent='No supported activity files found. Drop FIT, GPX, TCX, GPS, CSV, or ZIP files.';return}
+ if(supported.length>50){$('importStatus').textContent='Import up to 50 files per drop; divide this batch into smaller groups.';return}
+ queuedImports.push(...supported);
+ $('importStatus').classList.toggle('error',!!rejected);
+ $('importStatus').textContent=supported.length+' supported file(s) queued'+(rejected?' · '+rejected+' unsupported ignored':'')+'.';
+ nextManualImport();
+}
+function nextManualImport(){if(importingManual||!queuedImports.length)return;importingManual=true;upload(queuedImports.shift())}
+$('file').addEventListener('change',()=>{enqueueActivityFiles($('file').files);$('file').value=''})
+const dropTarget=$('dropTarget');
+function showDrop(show){dropTarget.hidden=!show}
+document.addEventListener('dragenter',event=>{if(!event.dataTransfer||!Array.from(event.dataTransfer.types||[]).includes('Files'))return;event.preventDefault();dragDepth++;showDrop(true)});
+document.addEventListener('dragover',event=>{if(!event.dataTransfer||!Array.from(event.dataTransfer.types||[]).includes('Files'))return;event.preventDefault();event.dataTransfer.dropEffect='copy';showDrop(true)});
+document.addEventListener('dragleave',event=>{if(!event.dataTransfer||!Array.from(event.dataTransfer.types||[]).includes('Files'))return;event.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)showDrop(false)});
+document.addEventListener('drop',event=>{event.preventDefault();dragDepth=0;showDrop(false);if(event.dataTransfer&&event.dataTransfer.files.length)enqueueActivityFiles(event.dataTransfer.files)});
+window.addEventListener('blur',()=>{dragDepth=0;showDrop(false)});
+let garminUsbDevices=[];
+function garminMessage(message,error=false){const node=$('garminUsbStatus');node.textContent=message;node.style.color=error?'#ffb7be':'#d3c0dc'}
+$('garminScan').onclick=async()=>{const button=$('garminScan');button.disabled=true;garminMessage('Searching connected USB storage…');$('garminUsbFound').hidden=true;try{const data=await protectedAction('/api/garmin/scan');garminUsbDevices=data.devices||[];if(!garminUsbDevices.length){garminMessage('No Garmin activity folder found. Connect the Edge with a USB data cable and wait for Windows to recognize the removable drive.');return}const select=$('garminUsbDevice');select.replaceChildren();for(const device of garminUsbDevices){const option=document.createElement('option');option.value=device.id;option.textContent=device.label+' · '+device.count.toLocaleString()+' FIT files';select.appendChild(option)}$('garminUsbFound').hidden=false;garminMessage(garminUsbDevices.length+' Garmin drive(s) found. Files will be copied to '+data.archive+' before import.')}catch(e){garminMessage(e.message,true)}finally{button.disabled=false}};
+$('garminUsbImport').onclick=async()=>{const device=$('garminUsbDevice').value;if(!device)return;const button=$('garminUsbImport');button.disabled=true;let started=false;garminMessage('Starting local FIT copy…');try{const r=await fetch('/api/garmin/import',{method:'POST',headers:{'Content-Type':'application/json','X-LibreHeatmaps-Token':TOKEN},body:JSON.stringify({device})});const data=await r.json();if(!r.ok)throw Error(data.error||'USB import could not start');$('import').disabled=true;started=true;pollImport()}catch(e){garminMessage(e.message,true)}finally{if(!started)button.disabled=false}};
+$('garminOpenArchive').onclick=async()=>{try{await protectedAction('/api/garmin/open-archive');garminMessage('Opened local FIT archive.')}catch(e){garminMessage(e.message,true)}};
+async function refreshGarminPersonalStatus(){try{const data=await getJson('/api/garmin-personal/status');$('garminPersonalStatus').textContent=(data.authenticated?'Verified Garmin account · ':(data.connected?'API key saved (access not verified) · ':'Disconnected · '))+data.message;$('garminPersonalSync').disabled=!data.connected||data.running;$('garminPersonalDisconnect').disabled=!data.connected;
+ const h=data.history||{};
+ $('garminHistoryStatus').textContent=(h.active&&Number(h.reviewed)>0?'Checked '+Number(h.reviewed).toLocaleString()+' activities · '+Number(h.imported).toLocaleString()+' newly imported. ':'')+(h.message||'Not started');
+ $('garminHistoryStart').textContent=h.completed?'Rescan full history':(h.cursor>0?'Resume full import':'Import full history');
+ $('garminHistoryStart').disabled=!data.connected||!!data.running||!!h.active;
+ $('garminHistoryPause').disabled=!data.connected||!h.active;
+ }catch(e){$('garminPersonalStatus').textContent='Garmin status unavailable: '+e.message}}
+$('garminPersonalConnect').onclick=async()=>{
+ const key=$('garminPersonalKey').value.trim();if(!key){$('garminPersonalStatus').textContent='Paste the personal API key you created in Garmin Connect.';return}
+ const button=$('garminPersonalConnect');button.disabled=true;
+ try{const response=await fetch('/api/garmin-personal/connect',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});const data=await response.json();if(!response.ok)throw Error(data.error||'Connection failed');$('garminPersonalKey').value='';await refreshGarminPersonalStatus();$('garminPersonalStatus').textContent='Key saved privately on this computer. Use Sync now to retrieve wireless recordings.';}catch(e){$('garminPersonalStatus').textContent=e.message}finally{button.disabled=false}
+};
+$('garminPersonalDisconnect').onclick=async()=>{if(!confirm('Disconnect Garmin wireless sync on this computer? The existing imported rides will remain.'))return;try{await protectedAction('/api/garmin-personal/disconnect');$('garminPersonalKey').value='';await refreshGarminPersonalStatus()}catch(e){$('garminPersonalStatus').textContent=e.message}};
+$('garminPersonalSync').onclick=async()=>{const button=$('garminPersonalSync');button.disabled=true;try{const result=await protectedAction('/api/garmin-personal/sync');if(result.status!=='started')throw Error('Garmin sync did not start');$('garminPersonalStatus').textContent='Checking Garmin Connect securely…';$('import').disabled=true;setTimeout(pollImport,650)}catch(e){$('garminPersonalStatus').textContent=e.message;button.disabled=false}};
+$('garminHistoryStart').onclick=async()=>{const btn=$('garminHistoryStart');btn.disabled=true;try{const r=await protectedAction('/api/garmin-personal/history/start');$('garminHistoryStatus').textContent=r.history.message;await refreshGarminPersonalStatus()}catch(e){$('garminHistoryStatus').textContent=e.message;btn.disabled=false}};
+$('garminHistoryPause').onclick=async()=>{const btn=$('garminHistoryPause');btn.disabled=true;try{const r=await protectedAction('/api/garmin-personal/history/pause');$('garminHistoryStatus').textContent=r.history.message;await refreshGarminPersonalStatus()}catch(e){$('garminHistoryStatus').textContent=e.message;btn.disabled=false}};
+let stravaSessionPreviouslyAuthorized=false;
+async function refreshStravaBrowserStatus(){
+ try{const data=await getJson('/api/strava-browser/status');
+  stravaSessionPreviouslyAuthorized=!!data.session_saved;
+  const stateLabel=data.reconnect_required?'Reconnect required':data.connected?'Session saved':'Disconnected';
+  $('stravaBrowserStatus').textContent=stateLabel+' · '+data.message+(data.last_sync?' Last completed check: '+data.last_sync:'');
+  $('stravaBrowserSync').disabled=!data.connected||data.running;
+  $('stravaBrowserSync').title=data.running?'Connection or synchronization is already running':(!data.connected?'Sign in for auto-sync before checking rides':'Check for missing Strava GPX routes now');
+  $('stravaBrowserConnect').disabled=!!data.running;
+  $('stravaBrowserConnect').textContent=data.reconnect_required?'Reconnect Strava':data.connected?'Re-sign in for auto-sync':'Sign in for auto-sync';
+  $('stravaBrowserDisconnect').disabled=!data.has_session&&!data.running;
+ }catch(e){$('stravaBrowserStatus').textContent='Strava status unavailable: '+e.message}
+}
+$('stravaBrowserConnect').onclick=async()=>{
+ if(!$('stravaTerms').checked&&!stravaSessionPreviouslyAuthorized){
+  $('stravaBrowserStatus').textContent='To sign in again, check “I understand” above, then select Sign in for auto-sync. The separate Strava window will open.';
+  $('stravaTerms').focus();$('stravaTerms').scrollIntoView({block:'nearest'});return
+ }
+ const button=$('stravaBrowserConnect');button.disabled=true;
+ try{const response=await fetch('/api/strava-browser/connect',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({acknowledged:true})});const result=await response.json();if(!response.ok)throw Error(result.error||'Could not open Strava browser');$('stravaBrowserStatus').textContent='A separate Edge/Chrome profile is opening. Sign in there once; your regular browser login is private and cannot be copied.';}catch(e){$('stravaBrowserStatus').textContent=e.message}finally{setTimeout(refreshStravaBrowserStatus,1000)}
+};
+$('stravaBrowserSync').onclick=async()=>{const button=$('stravaBrowserSync');button.disabled=true;
+ try{await protectedAction('/api/strava-browser/sync');$('stravaBrowserStatus').textContent='Checking '+(Number(savedSettings&&savedSettings.strava_recent_count)||25)+' recent Strava activities for missing GPX rides…';$('import').disabled=true;setTimeout(pollImport,650)}catch(e){$('stravaBrowserStatus').textContent=e.message;button.disabled=false}
+};
+$('stravaBrowserDisconnect').onclick=async()=>{
+ if(!confirm('Disconnect Strava and delete the isolated local browser sign-in session? Imported rides will remain in LibreHeatmaps.'))return;
+ try{await protectedAction('/api/strava-browser/disconnect');
+  // Keep this screen's opt-in acknowledgement checked so the user can start
+  // another *new* session without re-discovering a hidden prerequisite.
+  // The actual browser credentials and connected state are still deleted.
+  await refreshStravaBrowserStatus()
+ }catch(e){$('stravaBrowserStatus').textContent=e.message}
+};
+setInterval(()=>{if($('settingsDialog').open){refreshStravaBrowserStatus();refreshGarminPersonalStatus()}},5000);
+function setImportMapStatus(message,title='Importing GPS activities'){$('mapCaption').querySelector('.map-caption-title').textContent=title;$('mapDetail').textContent=message;}
+function restoreImportMapStatus(){if(state.activeRideId)return;const title=$('mapCaption').querySelector('.map-caption-title');title.textContent='Your GPS heatmap';if(loadedKey&&state.data&&Number.isFinite(state.data.activities))$('mapDetail').textContent=state.data.activities.toLocaleString()+' matching activities in map area';else $('mapDetail').textContent=state.known?state.known.toLocaleString()+' activities in your local library':'No GPS activities imported yet';}
+function upload(file){$('import').disabled=true;setImportMapStatus('Preparing '+file.name+' · 0%');const status=$('importStatus');status.classList.remove('error');status.textContent='Uploading '+file.name+' to the local importer…';const xhr=new XMLHttpRequest();xhr.open('POST','/api/import');xhr.setRequestHeader('X-LibreHeatmaps-Token',TOKEN);xhr.setRequestHeader('X-File-Name',encodeURIComponent(file.name));xhr.upload.onprogress=e=>{if(e.lengthComputable){const progress=Math.floor(e.loaded/e.total*100);status.textContent='Transferring activity file locally: '+progress+'%';setImportMapStatus('Transferring '+progress+'% · '+file.name)}};xhr.onload=()=>{if(xhr.status===202){pollImport()}else{status.classList.add('error');status.textContent='Import could not start: '+xhr.responseText;$('import').disabled=false;restoreImportMapStatus();importingManual=false;nextManualImport()}};xhr.onerror=()=>{status.classList.add('error');status.textContent='Could not transfer activity to local app.';$('import').disabled=false;restoreImportMapStatus();importingManual=false;nextManualImport()};xhr.send(file)}
+async function pollImport(){try{const job=await getJson('/api/job');$('importStatus').classList.toggle('error',job.status==='error');$('importStatus').textContent=job.status==='running'?`Processing ${job.processed} / ${job.total}: ${job.message}
 Added ${job.added} · Already imported ${job.skipped} · No GPS ${job.no_gps||0} · Metadata updated ${job.updated||0} · Failed ${job.failed}`:`${job.message}
-Added ${job.added} · Already imported ${job.skipped} · No GPS ${job.no_gps||0} · Metadata updated ${job.updated||0} · Failed ${job.failed}`;if(job.status==='running'){setImportMapStatus(`${Number(job.processed||0).toLocaleString()} / ${Number(job.total||0).toLocaleString()} processed · ${Number(job.added||0).toLocaleString()} added`);setTimeout(pollImport,800);return}setImportMapStatus(`${Number(job.processed||0).toLocaleString()} / ${Number(job.total||0).toLocaleString()} processed · ${job.status==='done'?'Complete':'Import issue'}`);$('import').disabled=false;$('file').value='';if(job.status==='error')$('importStatus').classList.add('error');await refreshStats(true);restoreImportMapStatus();if(restoringDetails&&job.status==='done'){restoringDetails=false;$('statsButton').click()}else if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}}catch(e){$('importStatus').textContent=e.message;$('import').disabled=false;restoreImportMapStatus()}}
+Added ${job.added} · Already imported ${job.skipped} · No GPS ${job.no_gps||0} · Metadata updated ${job.updated||0} · Failed ${job.failed}`;if(job.status==='running'){const garminRecent=isGarminRecentJob(job);setImportMapStatus(garminRecent?`${job.message} · ${Number(job.added||0).toLocaleString()} imported`:`${Number(job.processed||0).toLocaleString()} / ${Number(job.total||0).toLocaleString()} processed · ${Number(job.added||0).toLocaleString()} added`,garminRecent?'Garmin wireless sync':'Importing GPS activities');setTimeout(pollImport,800);return}setImportMapStatus(`${Number(job.processed||0).toLocaleString()} / ${Number(job.total||0).toLocaleString()} processed · ${job.status==='done'?'Complete':'Import issue'}`);$('import').disabled=false;$('garminUsbImport').disabled=false;$('file').value='';lastCompletedJobSerial=Number(job.serial||0);if(job.copied!==undefined){const msg=job.message+' · '+Number(job.copied).toLocaleString()+' new files copied · '+Number(job.added||0).toLocaleString()+' added · '+Number(job.failed||0).toLocaleString()+' failed';garminMessage(msg,job.status==='error')}if(job.status==='error')$('importStatus').classList.add('error');refreshGarminPersonalStatus();refreshStravaBrowserStatus();await refreshStats(Number(job.added||0)>0);restoreImportMapStatus();if(restoringDetails&&job.status==='done'){restoringDetails=false;$('statsButton').click()}else if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}importingManual=false;nextManualImport()}catch(e){$('importStatus').textContent=e.message;$('import').disabled=false;restoreImportMapStatus();importingManual=false;nextManualImport()}}
 $('gpx').onclick=()=>{if(!state.known)return alert('Import activities first.');if(!confirm('Download GPS routes with original coordinates? The GPX can reveal sensitive locations.'))return;window.location.href='/api/export.gpx?'+filterParams()};$('png').onclick=()=>{if(!state.known)return alert('Import activities first.');openCaptureEditor()};
 
 const captureStage=$('captureStage'),captureCanvas=$('captureCanvas'),captureContext=captureCanvas.getContext('2d',{alpha:true});
@@ -4426,24 +6816,94 @@ async function updateAnomalySummary(){
   button.textContent='Review anomalies ('+count.toLocaleString()+')';
  }catch(e){if(request!==anomalySummaryRequest)return;el.textContent='Exclusion count unavailable: '+e.message;button.textContent='Review anomalies'}
 }
-function captureAppearance(){return {mode:state.mode,online:state.online,palette:$('palette').value,routes:$('routes').checked,heat:$('heat').checked,radius:Number($('radius').value),definition:Number($('definition').value),intensity:Number($('intensity').value),opacity:Number($('opacity').value)}}
+function captureAppearance(){return {mode:state.mode,online:state.online,palette:$('palette').value,routes:$('routes').checked,heat:$('heat').checked,radius:Number($('radius').value),definition:Number($('definition').value),intensity:Number($('intensity').value),opacity:Number($('opacity').value),bike_routes:state.bikeRoutes,bike_tint_color:state.bikeTintColor}}
 function paintPalette(){$('legendPalette').value=$('palette').value;const p=PALETTES[$('palette').value];$('legendBar').style.background='linear-gradient(90deg,'+p.colors.join(',')+')';$('palettePreview').style.background=$('legendBar').style.background;$('legendLabel').textContent=p.name;queueRender()}
-function applyAppearance(p){if(!p)return;appearanceApplying=true;try{if(PALETTES[p.palette])$('palette').value=p.palette;state.mode=['dark','light','satellite'].includes(p.mode)?p.mode:'dark';if(typeof p.online==='boolean')state.online=p.online;for(const id of ['routes','heat'])if(typeof p[id]==='boolean')$(id).checked=p[id];for(const id of ['radius','definition','intensity','opacity'])if(p[id]!==undefined&&Number.isFinite(Number(p[id]))){const e=$(id);e.value=clamp(Number(p[id]),Number(e.min),Number(e.max));$(id+'Value').textContent=e.value+(id==='radius'?' px':'%')}$('onlineTiles').checked=state.online;$('defaultMap').value=state.mode;document.querySelectorAll('[data-map]').forEach(b=>b.classList.toggle('primary',b.dataset.map===state.mode));state.tileNodes.clear();tiles.replaceChildren();updatePrivacy();tileMap();paintPalette()}finally{appearanceApplying=false}}
+function applyAppearance(p){if(!p)return;appearanceApplying=true;try{if(PALETTES[p.palette])$('palette').value=p.palette;state.mode=['dark','light','satellite'].includes(p.mode)?p.mode:'dark';if(typeof p.online==='boolean')state.online=p.online;if(typeof p.bike_routes==='boolean')state.bikeRoutes=p.bike_routes;const tint=p.bike_tint_color||p.bike_path_color;if(/^#[0-9a-f]{6}$/i.test(tint||''))state.bikeTintColor=tint.toLowerCase();$('bikeRoutes').checked=state.bikeRoutes;updateBikeControls();for(const id of ['routes','heat'])if(typeof p[id]==='boolean')$(id).checked=p[id];for(const id of ['radius','definition','intensity','opacity'])if(p[id]!==undefined&&Number.isFinite(Number(p[id]))){const e=$(id);e.value=clamp(Number(p[id]),Number(e.min),Number(e.max));$(id+'Value').textContent=e.value+(id==='radius'?' px':'%')}$('onlineTiles').checked=state.online;$('defaultMap').value=state.mode;document.querySelectorAll('[data-map]').forEach(b=>b.classList.toggle('primary',b.dataset.map===state.mode));state.tileNodes.clear();tiles.replaceChildren();updatePrivacy();tileMap();paintPalette()}finally{appearanceApplying=false}}
 async function writeAppearance(p){const response=await fetch('/api/preferences',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(p),cache:'no-store'});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not save settings');return data.appearance}
 function enqueueAppearance(p){prefSequence=prefSequence.catch(()=>{}).then(()=>writeAppearance(p));return prefSequence}
 function savePreferences(){if(appearanceApplying||$('settingsDialog').open)return;clearTimeout(prefTimer);prefTimer=setTimeout(()=>{enqueueAppearance(captureAppearance()).catch(e=>console.warn('Local preference save failed:',e.message))},220)}
-async function loadPreferences(){let p=null;try{p=(await getJson('/api/preferences')).appearance}catch(e){console.warn('Local preferences unavailable:',e.message)}applyAppearance(p||{mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84})}
-function captureSettings(){return {appearance:captureAppearance(),filter_speed_anomalies:$('filterSpeedAnomalies').checked,filter_speed_smart:$('filterSpeedSmart').checked,advanced_data:$('advancedData').checked}}
+async function loadPreferences(){let p=null;try{const response=await getJson('/api/preferences');p=response.appearance;$('units').value=response.display_units==='km'?'km':'mi';$('settingsUnits').value=$('units').value}catch(e){console.warn('Local preferences unavailable:',e.message)}applyAppearance(p||{mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84,bike_routes:false,bike_tint_color:"#54dc96"})}
+async function refreshWatchFolderStatus(){try{const result=await getJson('/api/watch-folder');$('watchStatus').textContent=(result.folder?result.folder+' · ':'')+result.message}catch(e){$('watchStatus').textContent='Watch status unavailable: '+e.message}}
+$('watchBrowse').onclick=async()=>{const button=$('watchBrowse');button.disabled=true;try{const result=await protectedAction('/api/watch-folder/pick');if(result.folder){$('watchFolder').value=result.folder;markSettingsDirty();$('watchStatus').textContent='Folder selected. Save settings to enable automatic import.'}}catch(e){$('watchStatus').textContent=e.message}finally{button.disabled=false}};
+$('watchRescan').onclick=async()=>{if(settingsDirty){$('watchStatus').textContent='Save the watched-folder setting before scanning.';return}try{await protectedAction('/api/watch-folder/scan');$('watchStatus').textContent='Folder scan requested. New activities appear after import completes.';setTimeout(refreshWatchFolderStatus,1700)}catch(e){$('watchStatus').textContent='Could not start scan: '+e.message}};
+let settingsSpeedThresholdMph=50;
+const GARMIN_SYNC_PRESETS=['15','30','60','120','240'];
+function showSavedSpeedThreshold(mph){
+ settingsSpeedThresholdMph=Number(mph);
+ const metric=$('settingsUnits').value==='km',inp=$('speedThreshold');
+ $('speedThresholdUnit').textContent=metric?'km/h':'mph';
+ inp.min=metric?'8.0':'5';inp.max=metric?'321.9':'200';
+ inp.value=Number((settingsSpeedThresholdMph*(metric?1.609344:1)).toFixed(1));
+}
+function setStravaSyncInterval(minutes){const value=String(minutes);$('stravaSyncPreset').value=GARMIN_SYNC_PRESETS.includes(value)?value:'custom';$('stravaSyncCustom').value=value;updateStravaCustomVisibility()}
+function updateStravaCustomVisibility(){const custom=$('stravaSyncPreset').value==='custom';$('stravaSyncCustom').hidden=!custom;$('stravaSyncCustomLabel').hidden=!custom}
+function setGarminSyncInterval(minutes){
+ const value=String(minutes);
+ $('garminSyncPreset').value=GARMIN_SYNC_PRESETS.includes(value)?value:'custom';
+ $('garminSyncCustom').value=value;
+ updateGarminCustomVisibility();
+}
+function updateGarminCustomVisibility(){
+ const custom=$('garminSyncPreset').value==='custom';
+ $('garminSyncCustom').hidden=!custom;
+ $('garminSyncCustomLabel').hidden=!custom;
+}
+function captureSettings(){return {appearance:captureAppearance(),filter_speed_anomalies:$('filterSpeedAnomalies').checked,filter_speed_smart:$('filterSpeedSmart').checked,advanced_data:$('advancedData').checked,speed_threshold_mph:settingsSpeedThresholdMph,garmin_sync_minutes:$('garminSyncPreset').value==='custom'?Number($('garminSyncCustom').value):Number($('garminSyncPreset').value),strava_sync_minutes:$('stravaSyncPreset').value==='custom'?Number($('stravaSyncCustom').value):Number($('stravaSyncPreset').value),strava_recent_count:Number($('stravaRecentCount').value),display_units:$('settingsUnits').value,watch_folder:$('watchFolder').value.trim()}}
 function updateSaveState(){const indicator=$('settingsSaveState'),button=$('saveSettings');indicator.classList.toggle('dirty',settingsDirty);indicator.classList.toggle('error',!!settingsSaveError);indicator.classList.toggle('saved',!settingsDirty&&!settingsSaveError);indicator.textContent=settingsSaving?'Saving and verifying…':settingsSaveError||(settingsDirty?'Changes not saved yet':settingsVerifiedJustNow?'✓ Saved and applied on this computer':'Settings saved on this computer');button.disabled=settingsSaving;button.textContent=settingsSaving?'Saving…':'Save settings'}
 function markSettingsDirty(){if(!$('settingsDialog').open||appearanceApplying)return;settingsSaveError=null;settingsVerifiedJustNow=false;settingsDirty=JSON.stringify(captureSettings())!==JSON.stringify(savedSettings);updateSaveState();$('anomalyStatus').textContent=settingsDirty?'Changes are being previewed. Select Save settings to apply them to Statistics.':'Original recordings are never changed by either speed filter.';updateAnomalySummary()}
-function closeSettings(){if(settingsSaving)return;if(settingsDirty){if(!confirm('Discard unsaved settings changes?'))return;applyAppearance(savedSettings.appearance);$('filterSpeedAnomalies').checked=savedSettings.filter_speed_anomalies;$('filterSpeedSmart').checked=savedSettings.filter_speed_smart;$('advancedData').checked=savedSettings.advanced_data;settingsDirty=false;updateSaveState()}$('settingsDialog').close()}
-for(const name of ['filterSpeedAnomalies','filterSpeedSmart','advancedData'])$(name).addEventListener('change',markSettingsDirty);
+function closeSettings(){if(settingsSaving)return;if(settingsDirty){if(!confirm('Discard unsaved settings changes?'))return;applyAppearance(savedSettings.appearance);$('filterSpeedAnomalies').checked=savedSettings.filter_speed_anomalies;$('filterSpeedSmart').checked=savedSettings.filter_speed_smart;$('advancedData').checked=savedSettings.advanced_data;$('settingsUnits').value=savedSettings.display_units;$('watchFolder').value=savedSettings.watch_folder||'';showSavedSpeedThreshold(savedSettings.speed_threshold_mph);setGarminSyncInterval(savedSettings.garmin_sync_minutes);setStravaSyncInterval(savedSettings.strava_sync_minutes);$('stravaRecentCount').value=savedSettings.strava_recent_count||25;settingsDirty=false;updateSaveState()}$('settingsDialog').close()}
+for(const name of ['filterSpeedAnomalies','filterSpeedSmart','advancedData','watchFolder','garminSyncCustom','stravaSyncCustom'])$(name).addEventListener('change',markSettingsDirty);
+$('garminSyncPreset').addEventListener('change',()=>{updateGarminCustomVisibility();markSettingsDirty()});
+$('garminSyncCustom').addEventListener('input',markSettingsDirty);
+$('stravaSyncPreset').addEventListener('change',()=>{updateStravaCustomVisibility();markSettingsDirty()});
+$('stravaSyncCustom').addEventListener('input',markSettingsDirty);
+$('stravaRecentCount').addEventListener('input',markSettingsDirty);
+$('speedThreshold').addEventListener('input',()=>{
+ const raw=$('speedThreshold').value;
+ settingsSpeedThresholdMph=raw.trim()===''?NaN:Number((Number(raw)/($('settingsUnits').value==='km'?1.609344:1)).toFixed(5));
+ markSettingsDirty();
+});
+$('settingsUnits').addEventListener('change',()=>{showSavedSpeedThreshold(settingsSpeedThresholdMph);markSettingsDirty()});
+
+let activeSettingsCategory='appearance';
+const settingsCategoryButtons=[...document.querySelectorAll('#settingsCategories [data-settings-category]')];
+function selectSettingsCategory(category,focus=false){
+ const selected=settingsCategoryButtons.find(button=>button.dataset.settingsCategory===category);
+ if(!selected)return;
+ activeSettingsCategory=category;
+ for(const button of settingsCategoryButtons){
+  const active=button===selected;
+  button.setAttribute('aria-selected',String(active));
+  button.tabIndex=active?0:-1;
+  const panel=$('settingsPanel-'+button.dataset.settingsCategory);
+  if(panel)panel.hidden=!active;
+ }
+ $('settingsPanels').scrollTop=0;
+ if(focus)selected.focus();
+}
+function updateSettingsNavOrientation(){
+ $('settingsCategories').setAttribute('aria-orientation',window.innerWidth<=750?'horizontal':'vertical');
+}
+window.addEventListener('resize',updateSettingsNavOrientation);
+updateSettingsNavOrientation();
+settingsCategoryButtons.forEach((button,index)=>{
+ button.addEventListener('click',()=>selectSettingsCategory(button.dataset.settingsCategory));
+ button.addEventListener('keydown',event=>{
+  let next=null;
+  if(event.key==='ArrowDown'||event.key==='ArrowRight')next=(index+1)%settingsCategoryButtons.length;
+  if(event.key==='ArrowUp'||event.key==='ArrowLeft')next=(index-1+settingsCategoryButtons.length)%settingsCategoryButtons.length;
+  if(event.key==='Home')next=0;
+  if(event.key==='End')next=settingsCategoryButtons.length-1;
+  if(next===null)return;
+  event.preventDefault();selectSettingsCategory(settingsCategoryButtons[next].dataset.settingsCategory,true);
+ });
+});
 $('openSettings').onclick=async()=>{
  if(prefTimer){clearTimeout(prefTimer);prefTimer=null;try{await enqueueAppearance(captureAppearance())}catch(e){console.warn('Preference save failed:',e.message)}}
  try{await prefSequence}catch(e){}
- try{const stored=await getJson('/api/settings');$('filterSpeedAnomalies').checked=stored.filter_speed_anomalies;$('filterSpeedSmart').checked=stored.filter_speed_smart;$('advancedData').checked=stored.advanced_data;savedSettings=stored;applyAppearance(stored.appearance)}
+ try{const stored=await getJson('/api/settings');$('filterSpeedAnomalies').checked=stored.filter_speed_anomalies;$('filterSpeedSmart').checked=stored.filter_speed_smart;$('advancedData').checked=stored.advanced_data;$('settingsUnits').value=stored.display_units;$('watchFolder').value=stored.watch_folder||'';showSavedSpeedThreshold(stored.speed_threshold_mph);setGarminSyncInterval(stored.garmin_sync_minutes);setStravaSyncInterval(stored.strava_sync_minutes);$('stravaRecentCount').value=stored.strava_recent_count||25;savedSettings=stored;applyAppearance(stored.appearance)}
  catch(e){savedSettings=captureSettings();showSettingsStatus('Could not verify saved preferences: '+e.message,true)}
- settingsDirty=false;settingsSaving=false;settingsSaveError=null;settingsVerifiedJustNow=false;updateSaveState();$('settingsDialog').showModal();updateAnomalySummary();checkForUpdates();
+ settingsDirty=false;settingsSaving=false;settingsSaveError=null;settingsVerifiedJustNow=false;updateSaveState();$('settingsStatus').textContent='';$('settingsDialog').showModal();selectSettingsCategory(activeSettingsCategory);updateAnomalySummary();refreshWatchFolderStatus();refreshGarminPersonalStatus();refreshStravaBrowserStatus();checkForUpdates();
  try{const d=await getJson('/api/system');$('dataFolder').textContent=d.data_directory;$('dataFile').textContent=d.database;$('installedVersion').textContent=d.version}catch(e){showSettingsStatus('Could not read local storage path: '+e.message,true)}
 };
 $('closeSettings').onclick=closeSettings;
@@ -4453,14 +6913,14 @@ $('palette').addEventListener('change',markSettingsDirty);
 $('saveSettings').onclick=async()=>{if(settingsSaving)return;settingsSaveError=null;settingsSaving=true;updateSaveState();try{
  clearTimeout(prefTimer);const payload=captureSettings();const response=await fetch('/api/settings',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(payload),cache:'no-store'});
  const result=await response.json();if(!response.ok)throw Error(result.error||'Could not save settings');
- const verified=await getJson('/api/settings');if(JSON.stringify(verified)!==JSON.stringify(payload))throw Error('Saved settings could not be verified; please retry');
- savedSettings=verified;settingsDirty=false;settingsVerifiedJustNow=true;applyAppearance(verified.appearance);showSettingsStatus('Settings saved, verified, and applied on this computer.');$('anomalyStatus').textContent='Saved speed filters are active in Statistics and Analytics. Original activity records remain unchanged.';await updateAnomalySummary();if($('statsDialog').open)await refreshInsights();
+ const verified=await getJson('/api/settings');if(JSON.stringify(verified)!==JSON.stringify(result))throw Error('Saved settings could not be verified; please retry');
+ savedSettings=verified;settingsDirty=false;settingsVerifiedJustNow=true;applyAppearance(verified.appearance);$('units').value=verified.display_units;$('watchFolder').value=verified.watch_folder||'';showSavedSpeedThreshold(verified.speed_threshold_mph);setGarminSyncInterval(verified.garmin_sync_minutes);setStravaSyncInterval(verified.strava_sync_minutes);$('stravaRecentCount').value=verified.strava_recent_count||25;refreshWatchFolderStatus();showSettingsStatus('Settings saved, verified, and applied on this computer.');$('anomalyStatus').textContent='Saved speed filters are active in Statistics and Analytics. Original activity records remain unchanged.';await updateAnomalySummary();if($('statsDialog').open)await refreshInsights();
  }catch(e){settingsSaveError='Save could not be confirmed. Please retry.';settingsDirty=true;showSettingsStatus('Settings verification failed: '+e.message,true)}finally{settingsSaving=false;updateSaveState()}};
-$('resetAppearance').onclick=()=>{applyAppearance({mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84});markSettingsDirty();showSettingsStatus('Defaults previewed. Select Save settings to keep them.')};
+$('resetAppearance').onclick=()=>{applyAppearance({mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84,bike_routes:false,bike_tint_color:"#54dc96"});markSettingsDirty();showSettingsStatus('Defaults previewed. Select Save settings to keep them.')};
 async function protectedAction(endpoint){const response=await fetch(endpoint,{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN},cache:'no-store'});let data={};try{data=await response.json()}catch(e){}if(!response.ok)throw Error(data.error||('Request failed: '+response.status));return data}
 function showSettingsStatus(message,error=false){$('settingsStatus').textContent=message;$('settingsStatus').classList.toggle('error',error)}
 $('clearViewCache').onclick=async()=>{const button=$('clearViewCache');button.disabled=true;try{await protectedAction('/api/cache/clear-view');loadedKey='';previousGeometry=null;++state.generation;showSettingsStatus('Temporary map calculations cleared. Reloading the view.');scheduleData()}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
-$('clearActivities').onclick=async()=>{if(!state.known){showSettingsStatus('There are no imported activities to delete.');return}if(prompt('This permanently deletes all imported activity tracks and statistics in LibreHeatmaps. Your original files will not be changed. Type DELETE to confirm:')!=='DELETE')return;const button=$('clearActivities');button.disabled=true;try{const result=await protectedAction('/api/cache/clear-activities');loadedKey='';++state.generation;if(controller)controller.abort();state.data={step:2,cells:[],activities:0,peak:0};previousGeometry=null;for(const id of ['sport','dateFrom','dateTo','search','statsSport','statsBike','statsYear','statsMonth'])$(id).value='';state.bounds=null;state.focusBounds=null;state.known=0;queueRender();await refreshStats(false);if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}showSettingsStatus('Deleted '+result.deleted.toLocaleString()+' imported activities. Original downloaded files are unchanged.')}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
+$('clearActivities').onclick=async()=>{if(!state.known){showSettingsStatus('There are no imported activities to delete.');return}if(prompt('Delete LibreHeatmaps activity data only? Original GPX/FIT files, watched-folder preferences, Garmin/Strava connections and other settings will remain. Connected services may reimport missing rides. Type DELETE to confirm:')!=='DELETE')return;const button=$('clearActivities');button.disabled=true;try{const result=await protectedAction('/api/cache/clear-activities');loadedKey='';++state.generation;if(controller)controller.abort();state.data={step:2,cells:[],activities:0,peak:0};previousGeometry=null;for(const id of ['sport','dateFrom','dateTo','search','statsSport','statsBike','statsYear','statsMonth'])$(id).value='';state.bounds=null;state.focusBounds=null;state.known=0;queueRender();await refreshStats(false);if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}showSettingsStatus('Cleared '+result.deleted.toLocaleString()+' activity records and import history. Original GPS files, saved accounts and settings remain untouched. Garmin can now restore missing rides.')}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
 $('openDataFolder').onclick=async()=>{try{await protectedAction('/api/system/open-folder');showSettingsStatus('Opened your local data folder.')}catch(e){showSettingsStatus(e.message,true)}};
 let updateCheckRunning=false,updateCheckTime=0,updateInstallRunning=false;
 async function checkForUpdates(force=false){
@@ -4483,22 +6943,103 @@ $('installUpdate').onclick=async()=>{
  catch(e){$('updateStatus').textContent='Update not installed: '+e.message;install.disabled=false;install.classList.add('update-available')}
  finally{updateInstallRunning=false;$('checkUpdate').disabled=false}
 };
+let lastCompletedJobSerial=0;
+let garminHomeActive=false,garminHomeRefreshing=false,garminHomeLastBatch=0,garminHomeLastImported=0,garminRecentHomeActive=false;
+async function showGarminHomeProgress(job){
+ // Garmin historical imports run independently of the ordinary file-upload job.
+ // Show their progress on the sidebar and map; publish each set of 50 newly
+ // committed rides to the heatmap without stopping the historical download.
+ const h=(await getJson('/api/garmin-personal/status')).history||{};
+ const running=job.status==='running'&&job.source==='garmin_history'&&!!h.active;
+ const banner=$('garminHomeProgress');
+ if(!running){
+  if(garminHomeActive){
+   garminHomeActive=false;banner.hidden=true;
+   $('importStatus').hidden=false;
+   $('importStatus').classList.toggle('error',job.status==='error');
+   $('importStatus').textContent=String(job.message||'Garmin full-history sync stopped.');
+   restoreImportMapStatus();
+  }
+  return false;
+ }
+ const count=Math.max(0,Number(h.imported)||0),reviewed=Math.max(0,Number(h.reviewed)||0);
+ const batchSize=Math.max(1,Number(h.map_batch_size)||50),batches=Math.floor(count/batchSize);
+ if(count<garminHomeLastImported)garminHomeLastBatch=0; // a new full-history pass
+ garminHomeLastImported=count;
+ garminHomeActive=true;banner.hidden=false;$('importStatus').hidden=true;
+ const detail=reviewed.toLocaleString()+' checked · '+count.toLocaleString()+' new rides imported';
+ $('garminHomeDetails').textContent=detail;
+ if(!state.activeRideId)setImportMapStatus(detail+' · heatmap refreshes every 50 new rides','Garmin full-history sync');
+ const batchesReady=batches>garminHomeLastBatch;
+ if(batchesReady&&!garminHomeRefreshing){
+  garminHomeRefreshing=true;
+  $('garminHomeHeatStatus').textContent='Refreshing heatmap with '+(batches*batchSize).toLocaleString()+' imported rides…';
+  try{
+   await refreshStats(false); // re-read local library without resetting user's map view
+   garminHomeLastBatch=batches;
+   $('garminHomeHeatStatus').textContent='Heatmap refresh requested after '+(batches*batchSize).toLocaleString()+' imported rides';
+  }catch(e){$('garminHomeHeatStatus').textContent='Map refresh delayed: '+e.message}
+  finally{garminHomeRefreshing=false}
+ }else if(!garminHomeRefreshing){
+  const remaining=batchSize-count%batchSize;
+  $('garminHomeHeatStatus').textContent=batches?'Map refresh requested at '+(batches*batchSize).toLocaleString()+' rides · next refresh in '+remaining+' new rides':'Next heatmap refresh after '+remaining+' new rides';
+ }
+ return true;
+}
+function isGarminRecentJob(job){
+ return job.status==='running'&&/^(Checking Garmin Connect for wireless rides|Downloading missing Garmin activity recordings|Garmin activity [0-9]+ [(])/.test(String(job.message||''));
+}
+function isGarminHistoryJob(job){
+ // The shared job record can outlive a completed history pass; inspect its
+ // message as well as its source so subsequent Strava/manual imports are not
+ // mistaken for Garmin history.
+ return job.source==='garmin_history'&&/^(Importing full Garmin account history|Scanning Garmin history|Garmin full history|Full Garmin history|Garmin history paused|Garmin activity [0-9]+ (failed|could not)|Garmin historical)/i.test(String(job.message||''));
+}
+async function checkBackgroundImports(){
+ if(importingManual||$('import').disabled)return;
+ try{
+  const job=await getJson('/api/job'),serial=Number(job.serial||0);
+  if(job.status==='running'&&isGarminHistoryJob(job)){
+   await showGarminHomeProgress(job);
+   return;
+  }
+  if(garminHomeActive)await showGarminHomeProgress(job);
+  if(isGarminRecentJob(job)){
+   garminRecentHomeActive=true;
+   $('importStatus').classList.remove('error');
+   $('importStatus').textContent='Garmin wireless sync running · '+job.message+' · '+Number(job.added||0).toLocaleString()+' rides added.';
+   if(!state.activeRideId)setImportMapStatus(job.message+' · '+Number(job.added||0).toLocaleString()+' imported','Garmin wireless sync');
+   return;
+  }
+  if(garminRecentHomeActive){garminRecentHomeActive=false;restoreImportMapStatus()}
+  if(job.status==='running'||!serial||serial<=lastCompletedJobSerial)return;
+  lastCompletedJobSerial=serial;
+  await refreshStats(isGarminHistoryJob(job)?false:Number(job.added||0)>0);
+  if($('settingsDialog').open){refreshWatchFolderStatus();refreshGarminPersonalStatus();refreshStravaBrowserStatus()}
+  if($('statsDialog').open)await refreshInsights();
+  $('importStatus').classList.toggle('error',job.status==='error');
+  $('importStatus').textContent=job.message+' · '+Number(job.added||0)+' new activities.';
+ }catch(e){console.warn('Background import status:',e.message)}
+}
+setInterval(checkBackgroundImports,4000);
 window.addEventListener('resize',()=>updateMap());loadPreferences().then(async()=>{const saved=await getJson('/api/settings');advancedDataEnabled=!!saved.advanced_data;await refreshStats(true)}).then(()=>tileMap()).catch(e=>{$('mapDetail').textContent=e.message});updatePrivacy();
 const LH_HELP={
  'LibreHeatmaps':'LibreHeatmaps is a local-first GPS heatmap viewer. Import activities from a Strava ZIP, FIT, GPX, or TCX file to explore routes and trends without uploading your activity database. Optional online map tiles contact the selected provider.',
  'Import activities':'Choose a complete Strava account export ZIP without extracting it, or a CSV, FIT, GPX, or TCX file. Imports are processed locally. Reimporting matching activities updates available details rather than adding duplicate routes.',
  'Activities':'Number of imported activities in the local database. This can include activities with limited metadata; filtering changes the map but does not delete records.',
  'Route points':'Count of sampled GPS coordinates held in your activity library. More points can provide finer route detail but can require additional processing when generating a heatmap.',
- 'Map view':'Choose the basemap, whether routes and visit-density glow appear, and how sharply and brightly paths are drawn. Only background map tiles use an external map provider when online tiles are enabled.',
+ 'Map view':'Choose the basemap, optional cycling infrastructure layer, and whether routes and visit-density glow appear. Online basemap and cycling tiles contact external providers.',
  'Online map tiles':'Load background map tiles from a third-party provider. The provider can see your IP address and the geographical area requested; your activity files and statistics are not uploaded. Turn this off for offline viewing.',
  'Dark':'Use a high-contrast dark background style for the online street map. The underlying GPS data and heat colors are unchanged.',
  'Light':'Use the light street-map style. This changes only the background; route data remains local.',
  'Satellite':'Request aerial/satellite imagery from an external map provider while online tiles are enabled. Requests expose the approximate map area and your IP, not your activity files.',
  'Show all routes':'Draw the base route lines for matching activities. Turn off to hide that route layer without losing imported GPS tracks.',
+ 'Bike paths & lanes':'Enable one CyclOSM cycle-path overlay and pick its color. The same transparent map tiles remain beneath your GPS heatmap at all supported zoom levels.',
  'Heatmap layer':'Show or hide heat-colored visit density on your GPS routes. The heatmap colors represent relative frequency of visits within the current view and filters.',
  'Route definition':'Adjust visibility and strength of the route-line detail. Higher percentages make the original GPS paths more pronounced; lower values reduce their visual emphasis.',
  'Glow radius':'Adjust the soft halo around route strokes, measured in screen pixels. Larger radii create wider glow and may increase canvas draw cost, especially in dense areas.',
  'Intensity':'Change the brightness of the heat glow. 120% is the fresh-install default; higher values brighten the effect without changing visit counts.',
+ 'Cycling layer visibility':'Control cycling infrastructure opacity independently from your recorded heatmap. Custom lines also offer separate category colors, line thicknesses and visibility toggles.',
  'Transparency':'Control overall opacity of drawn GPS routes and heatmap relative to the background map. Higher percentages make the overlay more opaque.',
  'Filter activities':'Limit which activities contribute to the map by type, name, or date. Clearing filters restores the complete set; your library is never modified by filtering.',
  'Activity type':'Choose a recorded activity type to restrict the visible map routes. All activity types combines your imported activities.',
@@ -4575,7 +7116,7 @@ const LH_HELP={
  'Restore appearance defaults':'Revert presentation settings to their built-in defaults, including the classic heat palette and the default map styling. It does not erase activities.',
  'Local data & cache':'Manage the locally stored SQLite activity database and temporary map-render cache. Original FIT, GPX, TCX and Strava ZIP files are not deleted by these controls.',
  'Refresh rendered map data':'Clear the temporary calculated map views and redraw the current area. This does not remove or alter imported activities.',
- 'Delete all imported activities':'Permanently clear all imported activities and associated statistics from the LibreHeatmaps local database. Your original export files remain wherever you saved them; reimport to restore the data.',
+ 'Delete all imported activities':'Remove derived activity records and statistics only. Original GPS files, watched folders, saved accounts and preferences are preserved.',
  'Local data location':'The computer folders containing your local SQLite database and related application files. These paths are shown so you can back up your own data.',
  'Open local data folder':'Open the app’s storage folder in the operating system file manager. This exposes your local database and log without sending them online.',
  'Average speed over time':'A chronological comparison of average speed for entire activities. Each point represents one ride, not second-by-second GPS speed.',
@@ -4584,7 +7125,7 @@ const LH_HELP={
  'Distance over time':'Distance traveled in each imported activity plotted by recording date, using Strava distance when available and sampled GPS distance otherwise.',
  'Distance vs. moving time':'Compares whole-activity distances with moving durations; useful for seeing longer or shorter trips at different effort levels.',
  'Monthly time on the move':'Total recorded moving time per calendar month. Activities without moving-time information do not contribute to the total.',
- 'Statistics & data quality':'Choose between the optional 50 mph cycling threshold and a separate experimental comparison with your own riding history. Filters affect speed calculations and charts, not the recorded GPS routes or other totals. Both start turned off.',
+ 'Statistics & data quality':'Set your own optional cycling speed threshold and separately compare with your own riding history. Filters affect speed calculations and charts, not the recorded GPS routes or other totals. Both start turned off.',
  'Speed & activity patterns':'These charts compare the average speed of whole activities with calendar dates and moving duration. They are not instantaneous speed traces. Activities without reliable distance or moving time are omitted.',
  'Software update':'Opening Settings checks GitHub for a newer release, and the Check for updates button refreshes the result. Installation requires confirmation and SHA-256 verification; previous application files are backed up together in a ZIP. No GPS data is sent.',
  'Check for updates':'Refresh the automatic update check against published GitHub releases. Only release metadata is requested, never your GPS tracks or database.',
@@ -4601,7 +7142,7 @@ const LH_HELP={
  'Import my GPS data':'Open a local file chooser to import a Strava account ZIP or individual activity tracks. Your files are processed locally.',
  'Loading map data':'Calculating the currently visible heatmap. The existing route overlay remains geographically aligned while updated visit-density colors are prepared.'
 };
-const ADVANCED_DATA_FIELDS={calories_kcal:'Calories',avg_temp_c:'Device temperature',max_temp_c:'Max device temperature',weather_temp_c:'Weather temperature',wind_speed_mps:'Wind speed',wind_gust_mps:'Wind gust',humidity_pct:'Humidity',avg_cadence:'Average cadence',max_power:'Max power',weather_condition:'Weather conditions'};
+const ADVANCED_DATA_FIELDS={calories_kcal:'Calories',avg_temp_c:'Device temperature',max_temp_c:'Max device temperature',weather_temp_c:'Weather temperature',wind_speed_mps:'Wind speed',wind_gust_mps:'Wind gust',humidity_pct:'Humidity',avg_cadence:'Average cadence',max_cadence:'Peak cadence',total_cycles:'Recorded cycles / strokes',normalized_power:'Normalized power',training_stress_score:'Training stress score',intensity_factor:'Intensity factor',max_heart_rate:'Maximum heart rate',max_power:'Max power',weather_condition:'Weather conditions'};
 let advancedDataEnabled=false;
 const DATA_FIELDS={
  day:'Date',name:'Activity',sport:'Type',distance_m:'Distance',moving_seconds:'Moving time',
@@ -4626,13 +7167,16 @@ function dataFormat(key,val){if(val===null||val===undefined||val==='')return '�
  case 'moving_seconds':case 'elapsed_seconds':return timeLabel(val);
  case 'avg_speed':case 'max_speed':return nice(val*($('units').value==='mi'?2.2369362921:3.6),1)+($('units').value==='mi'?' mph':' km/h');
  case 'elevation_m':return nice(val*($('units').value==='mi'?3.280839895:1),0)+($('units').value==='mi'?' ft':' m');
- case 'avg_heart_rate':return nice(val,0)+' bpm';
- case 'avg_power':case 'max_power':return nice(val,0)+' W';
+ case 'avg_heart_rate':case 'max_heart_rate':return nice(val,0)+' bpm';
+ case 'avg_power':case 'max_power':case 'normalized_power':return nice(val,0)+' W';
  case 'calories_kcal':return nice(val,0)+' kcal';
  case 'avg_temp_c':case 'max_temp_c':case 'weather_temp_c':return nice($('units').value==='mi'?val*9/5+32:val,1)+($('units').value==='mi'?' °F':' °C');
  case 'wind_speed_mps':case 'wind_gust_mps':return nice(val*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h');
  case 'humidity_pct':return nice(val,0)+'%';
- case 'avg_cadence':return nice(val,0)+' rpm';
+ case 'avg_cadence':case 'max_cadence':return nice(val,0)+' rpm';
+ case 'total_cycles':return nice(val,0);
+ case 'training_stress_score':return nice(val,1)+' TSS';
+ case 'intensity_factor':return nice(val,2);
  case 'point_count':return nice(val);
  default:return String(val)
 }}
@@ -5113,7 +7657,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; img-src 'self' data: blob: https://tile.openstreetmap.org https://server.arcgisonline.com https://s3.amazonaws.com https://tiles.mapterhorn.com https://tiles.openfreemap.org; connect-src 'self' https://server.arcgisonline.com https://s3.amazonaws.com https://tiles.mapterhorn.com https://tiles.openfreemap.org https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob:; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; img-src 'self' data: blob: https://tile.openstreetmap.org https://server.arcgisonline.com https://s3.amazonaws.com https://tiles.mapterhorn.com https://tiles.openfreemap.org https://*.tile-cyclosm.openstreetmap.fr; connect-src 'self' https://server.arcgisonline.com https://s3.amazonaws.com https://tiles.mapterhorn.com https://tiles.openfreemap.org https://cdn.jsdelivr.net https://unpkg.com; worker-src 'self' blob:; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(data)
@@ -5179,15 +7723,23 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/":
                 self.send_bytes(PAGE.replace('__APP_TOKEN__', TOKEN).encode(), "text/html; charset=utf-8")
             elif parsed.path == "/api/preferences":
-                self.respond({"appearance":load_appearance()})
+                self.respond({"appearance":load_appearance(),"display_units":load_display_units()})
             elif parsed.path == "/api/system":
                 self.respond({"version":VERSION,"data_directory":str(DB_PATH.parent),"database":str(DB_PATH),"log":str(DB_PATH.parent/"application.log"),"script":str(Path(__file__).resolve())})
             elif parsed.path == "/api/stats":
                 self.respond(statistics())
             elif parsed.path == "/api/stat-settings":
                 self.respond(statistics_preferences())
+            elif parsed.path == "/api/watch-folder":
+                self.respond(watch_folder_status())
             elif parsed.path == "/api/settings":
-                self.respond({"appearance":load_appearance() or dict(DEFAULT_APPEARANCE),**statistics_preferences()})
+                self.respond({"appearance":load_appearance() or dict(DEFAULT_APPEARANCE),**statistics_preferences(),"display_units":load_display_units(),"watch_folder":load_watch_folder()})
+            elif parsed.path == "/api/activity-edit":
+                self.respond(edit_activity_details(safe_activity_id(params)))
+            elif parsed.path == "/api/activity-speed-estimate":
+                self.respond(estimate_activity_speeds(safe_activity_id(params)))
+            elif parsed.path == "/api/route-repair":
+                self.respond(route_review(safe_activity_id(params)))
             elif parsed.path == "/api/activity-table":
                 self.respond(activity_table(params))
             elif parsed.path == "/api/speed-review":
@@ -5228,6 +7780,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(insights(params))
             elif parsed.path == "/api/activity":
                 self.respond(activity_preview(params))
+            elif parsed.path == '/api/garmin-personal/status':
+                self.respond(garmin_personal_status())
+            elif parsed.path == '/api/strava-browser/status':
+                self.respond(strava_status())
             elif parsed.path == "/api/job":
                 with STATE_LOCK:
                     self.respond(dict(JOB))
@@ -5264,6 +7820,68 @@ class Handler(BaseHTTPRequestHandler):
         if not self.valid_local_request():
             return
         endpoint = urlparse(self.path).path
+        if endpoint in ("/api/garmin/scan", "/api/garmin/import", "/api/garmin/open-archive"):
+            origin = self.headers.get("Origin", "")
+            if self.headers.get("X-LibreHeatmaps-Token") != TOKEN or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
+                self.respond({"error": "Forbidden"}, 403)
+                return
+            if endpoint == "/api/garmin/scan":
+                self.respond(garmin_usb_scan())
+                return
+            if endpoint == "/api/garmin/open-archive":
+                try:
+                    archive = garmin_usb_archive_directory()
+                    archive.mkdir(parents=True, exist_ok=True)
+                    if os.name == "nt":
+                        os.startfile(str(archive))
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", str(archive)])
+                    else:
+                        subprocess.Popen(["xdg-open", str(archive)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self.respond({"ok": True})
+                except OSError as exc:
+                    self.respond({"error": str(exc)[:160]}, 400)
+                return
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 2 <= size <= 128:
+                    raise ValueError("Invalid Garmin request")
+                request = json.loads(self.rfile.read(size).decode("utf-8"))
+                device_id = request.get("device")
+                if not isinstance(device_id, str) or not re.fullmatch(r"[0-9a-f]{20}", device_id):
+                    raise ValueError("Select a detected Garmin device")
+                if not any(device["id"] == device_id for device in garmin_usb_devices()):
+                    raise ValueError("Garmin no longer connected. Scan again")
+                with STATE_LOCK:
+                    if JOB["status"] == "running":
+                        self.respond({"error": "An import is already running"}, 409)
+                        return
+                    JOB.update(status="running", processed=0, total=0, added=0, skipped=0, failed=0, updated=0, no_gps=0, copied=0, message="Preparing Garmin USB import")
+                threading.Thread(target=garmin_usb_import_job, args=(device_id,), daemon=True).start()
+                self.respond({"status": "started"}, 202)
+            except (ValueError, TypeError, UnicodeDecodeError, OSError) as exc:
+                self.respond({"error": str(exc)[:200]}, 400)
+            return
+        if endpoint in ("/api/activity-edit", "/api/route-repair"):
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if not 2<=size<=4096:raise ValueError('Invalid activity change request')
+                payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                if not isinstance(payload,dict):raise ValueError('Invalid activity request')
+                aid=payload.get('activity_id');action=payload.get('action')
+                if endpoint=='/api/activity-edit':
+                    if set(payload)-{'activity_id','action','values'}:raise ValueError('Unexpected edit fields')
+                    result=edit_activity_details(aid,action,payload.get('values'))
+                else:
+                    if set(payload)-{'activity_id','action','selection'}:raise ValueError('Unexpected route fields')
+                    result=route_review(aid,action,payload.get('selection'))
+                self.respond(result)
+            except (ValueError,TypeError,IndexError,KeyError,UnicodeDecodeError,sqlite3.Error,zlib.error) as exc:
+                self.respond({'error':str(exc)[:240]},400)
+            return
         if endpoint == "/api/duplicates/action":
             origin=self.headers.get('Origin','')
             if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
@@ -5320,6 +7938,91 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,TypeError,KeyError,sqlite3.Error,zipfile.BadZipFile,OSError) as exc:self.respond({'error':str(exc)[:200]},400)
             finally:
                 if temporary:Path(temporary).unlink(missing_ok=True)
+            return
+        if endpoint == '/api/display-units':
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if not 2<=size<=100:raise ValueError('Invalid unit preference')
+                payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                if not isinstance(payload,dict) or set(payload)!={'display_units'}:raise ValueError('Invalid unit preference fields')
+                self.respond(save_display_units(payload['display_units']))
+            except (ValueError,UnicodeDecodeError,sqlite3.Error) as exc:self.respond({'error':str(exc)[:160]},400)
+            return
+        if endpoint in ('/api/strava-browser/connect','/api/strava-browser/disconnect','/api/strava-browser/sync'):
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:
+                if endpoint.endswith('/disconnect'):
+                    self.respond(strava_disconnect())
+                elif endpoint.endswith('/connect'):
+                    size=int(self.headers.get('Content-Length','0'))
+                    if not 2<=size<=128:raise ValueError('Invalid connection request')
+                    payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                    if not isinstance(payload,dict) or set(payload)!={'acknowledged'} or payload['acknowledged'] is not True:
+                        raise ValueError('Confirm that you understand this unofficial website-based Strava method')
+                    if STRAVA_SYNC_LOCK.locked():
+                        self.respond({'error':'A Strava connection or sync is already running'},409);return
+                    STRAVA_STOP.clear()
+                    threading.Thread(target=strava_connect_job,daemon=True).start()
+                    self.respond({'status':'started'},202)
+                else:
+                    if strava_connection_state()['reconnect_required']:
+                        raise ValueError('Strava sign-in expired. Select Reconnect Strava in Settings before syncing')
+                    if not strava_connected():raise ValueError('Connect your Strava browser session first')
+                    with STATE_LOCK:
+                        if JOB.get('status')=='running':self.respond({'error':'Another import is running'},409);return
+                    if STRAVA_SYNC_LOCK.locked():self.respond({'error':'A Strava sync is already running'},409);return
+                    STRAVA_STOP.clear()
+                    threading.Thread(target=strava_sync_job,daemon=True).start()
+                    self.respond({'status':'started'},202)
+            except (ValueError,TypeError,UnicodeDecodeError,OSError,json.JSONDecodeError) as exc:
+                self.respond({'error':str(exc)[:220]},400)
+            return
+        if endpoint in ('/api/garmin-personal/connect','/api/garmin-personal/disconnect','/api/garmin-personal/sync','/api/garmin-personal/history/start','/api/garmin-personal/history/pause'):
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:
+                if endpoint.endswith('/connect'):
+                    size=int(self.headers.get('Content-Length','0'))
+                    if not 12<=size<=1200:raise ValueError('Invalid Garmin key request')
+                    payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                    if not isinstance(payload,dict) or set(payload)!={'api_key'}:raise ValueError('Invalid Garmin connection request')
+                    self.respond(garmin_personal_store_key(payload['api_key']))
+                elif endpoint.endswith('/disconnect'):
+                    self.respond(garmin_personal_disconnect())
+                elif endpoint.endswith('/history/start'):
+                    self.respond({'history':garmin_history_start()})
+                elif endpoint.endswith('/history/pause'):
+                    self.respond({'history':garmin_history_pause()})
+                else:
+                    if not garmin_personal_key():raise ValueError('Connect a personal Garmin API key first')
+                    with STATE_LOCK:
+                        if JOB.get('status')=='running':self.respond({'error':'Another import is running'},409);return
+                    if GARMIN_SYNC_LOCK.locked():
+                        self.respond({'error':'Garmin synchronization is already running'},409);return
+                    threading.Thread(target=garmin_personal_sync_job,daemon=True).start()
+                    self.respond({'status':'started'},202)
+            except (ValueError,TypeError,UnicodeDecodeError,OSError,json.JSONDecodeError) as exc:
+                self.respond({'error':str(exc)[:180]},400)
+            return
+        if endpoint == '/api/watch-folder/pick':
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:self.respond(pick_watch_folder())
+            except ValueError as exc:self.respond({'error':str(exc)[:200]},400)
+            return
+        if endpoint == '/api/watch-folder/scan':
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            threading.Thread(target=watch_folder_scan,daemon=True).start()
+            self.respond({'status':'scan_started'},202)
             return
         if endpoint == "/api/settings":
             origin = self.headers.get("Origin", "")
@@ -5399,6 +8102,13 @@ class Handler(BaseHTTPRequestHandler):
                         connection.execute("DELETE FROM archived_duplicates")
                         connection.execute("DELETE FROM speed_filter_exceptions")
                         connection.execute("DELETE FROM activity_telemetry")
+                        connection.execute("DELETE FROM activity_overrides")
+                        connection.execute("DELETE FROM activity_edit_log")
+                        connection.execute("DELETE FROM activity_route_repairs")
+                        connection.execute("DELETE FROM import_history")
+                        # Delete only import-derived Garmin ledger state. Retain original
+                        # FIT/GPX files, watched-folder path/history, accounts and settings.
+                        connection.execute("DELETE FROM app_settings WHERE key LIKE 'garmin_personal_synced:%' OR key LIKE 'garmin_personal_nogps:%' OR key LIKE 'garmin_history_%'")
                 except sqlite3.Error:
                     self.respond({"error": "Unable to clear local activities"}, 500)
                     return
@@ -5480,7 +8190,7 @@ class Handler(BaseHTTPRequestHandler):
             if length < 1 or length > MAX_UPLOAD:
                 raise ValueError("Invalid file size")
             filename = unquote(self.headers.get("X-File-Name", "")).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            if not filename.lower().endswith((".zip", ".csv") + FORMATS):
+            if not filename.lower().endswith((".zip", ".csv", ".gps") + FORMATS):
                 raise ValueError("Select a Strava or Garmin account ZIP, activities.csv, FIT, GPX or TCX file")
             fd, temporary = tempfile.mkstemp(prefix="libreheatmaps-import-", suffix=".tmp", dir=str(DB_PATH.parent))
             with os.fdopen(fd, "wb") as output:
@@ -5491,6 +8201,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Upload ended prematurely")
                     output.write(chunk)
                     remaining -= len(chunk)
+            filename=sniff_gps_name(filename, temporary)
             if filename.lower().endswith(".zip") and not zipfile.is_zipfile(temporary):
                 raise ValueError("The selected file is not a valid ZIP")
             threading.Thread(target=import_job, args=(temporary, filename), daemon=True).start()
@@ -5549,6 +8260,57 @@ def shutdown_heat_workers():
             process.join(timeout=0.5)
 
 
+def open_launch_browser(url, log_dir):
+    opened = False
+    try:
+        opened = bool(webbrowser.open(url))
+    except Exception as exc:
+        print("Could not open the browser: {}".format(exc), flush=True)
+    if not opened:
+        print("Open {} manually in your browser.".format(url), flush=True)
+        if os.name == "nt" and sys.stdout is None:
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, "LibreHeatmaps is running. Open this address in your browser:\n" + url, "LibreHeatmaps", 0x40)
+            except Exception:
+                pass
+        return
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        window = kernel.GetConsoleWindow()
+        if not window:
+            return
+        members = (ctypes.c_ulong * 2)()
+        if kernel.GetConsoleProcessList(members, 2) != 1:
+            return
+        stream = open(log_dir / "application.log", "a", encoding="utf-8", buffering=1)
+        sys.stdout = stream
+        sys.stderr = stream
+        ctypes.windll.user32.ShowWindow(window, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def log_startup_failure():
+    details = traceback.format_exc()
+    try:
+        directory = Path.home() / ".libreheatmaps"
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(directory / "application.log", "a", encoding="utf-8") as log:
+            log.write("\nLibreHeatmaps startup failed:\n" + details + "\n")
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, "LibreHeatmaps could not start.\n\nDetails were saved in your local application.log.\n\n" + details.splitlines()[-1][:450], "LibreHeatmaps startup error", 0x10)
+        except Exception:
+            pass
+
+
 def main():
     global DB_PATH, SERVER_STARTED
     parser = argparse.ArgumentParser(description="LibreHeatmaps local GPS activity viewer")
@@ -5558,8 +8320,8 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=default_data)
     parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not args.background and not args.no_browser and args.port == 0 and args.data_dir == default_data:
-        gui_python = Path(sys.executable).with_name("pythonw.exe") if os.name == "nt" else Path(sys.executable)
+    if os.name != "nt" and not args.background and not args.no_browser and args.port == 0 and args.data_dir == default_data:
+        gui_python = Path(sys.executable)
         if not gui_python.is_file():
             gui_python = Path(sys.executable)
         if gui_python.is_file() and Path(__file__).is_file():
@@ -5573,6 +8335,9 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     DB_PATH = data_dir / "activities.sqlite3"
     init_db()
+    threading.Thread(target=watch_folder_loop,daemon=True).start()
+    threading.Thread(target=garmin_personal_loop,daemon=True).start()
+    threading.Thread(target=strava_sync_loop,daemon=True).start()
     start_heat_warmup()
     SERVER_STARTED = time.monotonic()
     with LocalServer(("127.0.0.1", args.port), Handler) as server:
@@ -5580,10 +8345,10 @@ def main():
         print("\nLibreHeatmaps {}".format(VERSION), flush=True)
         print("Open {} in your browser".format(url), flush=True)
         print("Activity cache: {}".format(DB_PATH), flush=True)
-        if args.background:
+        if args.background or (os.name == "nt" and not args.no_browser and args.port == 0 and args.data_dir == default_data):
             threading.Thread(target=idle_watcher, args=(server,), daemon=True).start()
         if not args.no_browser:
-            browser_launch = threading.Timer(0.65, lambda: webbrowser.open(url))
+            browser_launch = threading.Timer(0.65, lambda: open_launch_browser(url, data_dir))
             browser_launch.daemon = True
             browser_launch.start()
         try:
@@ -5862,4 +8627,8 @@ BX4oRz79xeD7qMB/Fc9vwH8D/hvw34D/Bvw34L8B/w34r+75/wFDnBwrEWLidQAAAABJRU5ErkJggg==
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log_startup_failure()
+        raise
