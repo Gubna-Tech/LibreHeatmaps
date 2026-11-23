@@ -27,18 +27,21 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import ExitStack
 import multiprocessing
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from xml.etree import ElementTree as ET
 import webbrowser
 import zipfile
 import zlib
 
-VERSION = "1.2.2"
-FORMATS = (".fit", ".fit.gz", ".gpx", ".gpx.gz", ".tcx", ".tcx.gz")
+VERSION = "1.3.0"
+DEFAULT_WEB_PORT = 63120   
+FORMATS = (".fit", ".fit.gz", ".gpx", ".gpx.gz", ".tcx", ".tcx.gz", ".kml", ".kml.gz", ".kmz", ".geojson", ".geojson.gz")
+MAP_FORMAT_LIMIT = 64 * 1024 * 1024   
 MAX_MEMBER = 512 * 1024 * 1024
 MAX_UPLOAD = 8 * 1024 * 1024 * 1024
 FIT_EPOCH = dt.datetime(1989, 12, 31, tzinfo=dt.timezone.utc)
@@ -208,7 +211,7 @@ def points_fit(stream, summary=None):
                     fmt = {1: "b", 2: "B", 4: "H", 6: "I", 5: "i"}.get(base & 31)
                     session_fields = {7: ("elapsed_seconds", 1000), 8: ("moving_seconds", 1000), 9: ("recorded_distance_m", 100), 11: ("calories_kcal", 1), 14: ("avg_speed", 1000), 15: ("max_speed", 1000), 16: ("avg_heart_rate", 1), 18: ("avg_cadence", 1), 19: ("max_cadence", 1), 10: ("total_cycles", 1), 17: ("max_heart_rate", 1), 20: ("avg_power", 1), 21: ("max_power", 1), 22: ("elevation_m", 1), 34: ("normalized_power", 1), 35: ("training_stress_score", 10), 36: ("intensity_factor", 1000), 57: ("avg_temp_c", 1), 58: ("max_temp_c", 1)}
                     if number == 5 and size == 1 and (base & 31) == 0:
-                        sport_name = {1:"Run",2:"Ride",5:"Swim",11:"Walk"}.get(record[at])
+                        sport_name = {1:"Run",2:"Ride",5:"Swim",11:"Walk",12:"Cross-country ski",13:"Ski",14:"Snowboard",15:"Row",16:"Mountaineering",17:"Hike",18:"Multisport",19:"Paddle",35:"Snowshoeing"}.get(record[at])
                         if sport_name and not summary.get('sport'):
                             summary['sport'] = sport_name
                     if number in session_fields and fmt and size == struct.calcsize(fmt):
@@ -404,10 +407,17 @@ def summarize_track_samples(samples, summary=None):
 def points_gpx(stream, summary=None):
     import xml.etree.ElementTree as ET
     def items():
+        in_route = 0
         for event, element in ET.iterparse(stream, events=("start", "end")):
             tag = element.tag.rsplit("}", 1)[-1]
+            if event == "start" and tag in ("trk", "rte"):
+                in_route += 1
             if event == "start" and tag in ("trkseg", "rte"):
                 yield None
+            elif event == "end" and tag == "type" and in_route and summary is not None and not summary.get("sport"):
+                activity_type = (element.text or "").strip()
+                if activity_type and any(word in activity_type.casefold() for word in ('run', 'jog', 'walk', 'hik', 'trek', 'ride', 'cycl', 'bik', 'velo')):
+                    summary['sport'] = activity_type[:80]
             elif event == "end" and tag in ("trkpt", "rtept"):
                 try:
                     lat = float(element.attrib["lat"])
@@ -440,6 +450,8 @@ def points_gpx(stream, summary=None):
                 element.clear()
             elif event == "end" and tag in ("trkseg", "rte"):
                 element.clear()
+            if event == "end" and tag in ("trk", "rte"):
+                in_route = max(0, in_route - 1)
     yield from summarize_track_samples(items(), summary)
 
 
@@ -478,7 +490,129 @@ def points_tcx(stream, summary=None):
             elif tag == "Track":
                 yield None
                 element.clear()
+            elif tag == "Activity" and summary is not None and not summary.get('sport'):
+                activity_type = (element.attrib.get('Sport') or '').strip()
+                if activity_type:
+                    summary['sport'] = {'biking':'Ride','running':'Run','walking':'Walk','hiking':'Hike'}.get(activity_type.casefold(),activity_type[:80])
     yield from summarize_track_samples(items(), summary)
+
+def points_kml(stream, summary=None):
+
+    import xml.etree.ElementTree as ET
+    def items():
+        for event, element in ET.iterparse(BoundedStream(stream, MAP_FORMAT_LIMIT), events=('end',)):
+            tag = element.tag.rsplit('}', 1)[-1]
+            if tag == 'LineString':
+                coordinates = next((child.text for child in element.iter() if child.tag.rsplit('}', 1)[-1] == 'coordinates'), None)
+                if coordinates:
+                    yield None
+                    for entry in coordinates.split():
+                        parts = entry.split(',')
+                        if len(parts) < 2:continue
+                        try:
+                            lon, lat = float(parts[0]), float(parts[1])
+                            altitude = float(parts[2]) if len(parts) > 2 and parts[2] else None
+                            yield lat, lon, None, altitude
+                        except ValueError:continue
+                element.clear()
+            elif tag == 'Track':
+                stamps = [parse_track_timestamp(e.text) for e in element if e.tag.rsplit('}', 1)[-1] == 'when']
+                positions = [e.text for e in element if e.tag.rsplit('}', 1)[-1] == 'coord']
+                if positions:
+                    yield None
+                    for index, position in enumerate(positions):
+                        try:
+                            lon, lat, *alt = (float(x) for x in position.split())
+                            yield lat, lon, stamps[index] if index < len(stamps) else None, alt[0] if alt else None
+                        except (ValueError, AttributeError):continue
+                element.clear()
+    yield from summarize_track_samples(items(), summary)
+
+
+def points_kmz(stream, summary=None):
+    with zipfile.ZipFile(io.BytesIO(BoundedStream(stream, MAP_FORMAT_LIMIT).read())) as archive:
+        options = [m for m in archive.infolist() if not m.is_dir() and m.filename.casefold().endswith('.kml')]
+        if not options:raise ValueError('KMZ contains no KML track')
+        if len(options) > 100:raise ValueError('KMZ contains too many KML files')
+        for member in options:
+            if member.file_size > MAP_FORMAT_LIMIT or (member.file_size > 1024*1024 and member.file_size > 1000*max(1,member.compress_size)):
+                raise ValueError('KMZ member exceeds the safety limit')
+            with archive.open(member) as kml:
+                yield from points_kml(BoundedStream(kml, MAP_FORMAT_LIMIT), summary)
+            yield None
+
+
+def points_geojson(stream, summary=None):
+
+    data = json.loads(BoundedStream(stream, MAP_FORMAT_LIMIT).read().decode('utf-8-sig'))
+    def geometries(node, properties=None):
+        if not isinstance(node, dict):return
+        kind=node.get('type')
+        if kind == 'FeatureCollection':
+            for item in node.get('features', []):yield from geometries(item)
+        elif kind == 'Feature':
+            props=node.get('properties') if isinstance(node.get('properties'), dict) else {}
+            if summary is not None:
+                for key in ('name','title'):
+                    if isinstance(props.get(key),str) and props[key].strip() and not summary.get('name'):
+                        summary['name']=props[key].strip()[:300];break
+                for key in ('sport','activity_type'):
+                    if isinstance(props.get(key),str) and props[key].strip() and not summary.get('sport'):
+                        summary['sport']=props[key].strip()[:80];break
+            yield from geometries(node.get('geometry'),props)
+        elif kind == 'GeometryCollection':
+            for item in node.get('geometries',[]):yield from geometries(item,properties)
+        elif kind in ('LineString','MultiLineString'):
+            routes=[node.get('coordinates')] if kind == 'LineString' else node.get('coordinates',[])
+            if not isinstance(routes,list):raise ValueError('Invalid GeoJSON coordinates')
+            for route in routes:
+                if not isinstance(route,list):continue
+                yield None
+                for point in route:
+                    if not isinstance(point,list) or len(point)<2:continue
+                    try:
+                        lon, lat = float(point[0]), float(point[1])
+                        altitude=float(point[2]) if len(point)>2 and point[2] is not None else None
+                    except (ValueError,TypeError):continue
+                    yield lat,lon,None,altitude
+    yield from summarize_track_samples(geometries(data),summary)
+
+
+GPS_CSV_LAT = ('latitude','lat','latitude_deg','latitudedegrees')
+GPS_CSV_LON = ('longitude','lon','lng','long','longitude_deg','longitudedegrees')
+GPS_CSV_TIME = ('timestamp','time','datetime','date_time','utc_time')
+GPS_CSV_ALT = ('altitude','altitude_m','elevation','elevation_m')
+
+def gps_csv_headers(stream):
+    position=stream.tell()
+    try:
+        header=stream.read(8192).decode('utf-8-sig').splitlines()
+        if not header:return False
+        fields={f.strip().casefold() for f in next(csv.reader([header[0]]))}
+        return any(key in fields for key in GPS_CSV_LAT) and any(key in fields for key in GPS_CSV_LON)
+    except (UnicodeDecodeError,csv.Error):return False
+    finally:stream.seek(position)
+
+
+def points_gps_csv(stream, summary=None):
+    def items():
+        text=io.StringIO(BoundedStream(stream, MAP_FORMAT_LIMIT).read().decode('utf-8-sig'),newline='')
+        rows=csv.DictReader(text)
+        columns={name.strip().casefold():name for name in (rows.fieldnames or []) if name}
+        def col(keys):return next((columns[key] for key in keys if key in columns),None)
+        lat_key,lon_key=col(GPS_CSV_LAT),col(GPS_CSV_LON)
+        if not lat_key or not lon_key:raise ValueError('GPS CSV requires latitude and longitude columns')
+        time_key,alt_key=col(GPS_CSV_TIME),col(GPS_CSV_ALT)
+        yield None
+        for row in rows:
+            try:
+                lat,lon=float(row[lat_key]),float(row[lon_key])
+                alt=float(row[alt_key]) if alt_key and row.get(alt_key) else None
+                stamp=parse_track_timestamp(row.get(time_key)) if time_key else None
+                yield lat,lon,stamp,alt
+            except (ValueError,TypeError,KeyError):continue
+    yield from summarize_track_samples(items(),summary)
+
 
 def haversine(a, b):
     lat1, lon1 = a
@@ -498,8 +632,18 @@ def decode_track(stream, filename, summary=None):
         iterator = points_fit(stream, summary)
     elif lower.endswith((".gpx", ".gpx.gz")):
         iterator = points_gpx(stream, summary)
-    else:
+    elif lower.endswith(('.tcx','.tcx.gz')):
         iterator = points_tcx(stream, summary)
+    elif lower.endswith(('.kml','.kml.gz')):
+        iterator = points_kml(stream, summary)
+    elif lower.endswith('.kmz'):
+        iterator = points_kmz(stream, summary)
+    elif lower.endswith(('.geojson','.geojson.gz')):
+        iterator = points_geojson(stream, summary)
+    elif lower.endswith('.csv'):
+        iterator = points_gps_csv(stream, summary)
+    else:
+        raise ValueError('Unsupported GPS track format')
     packed = bytearray()
     prev = None
     remaining = 25.0
@@ -805,6 +949,7 @@ def apply_metadata(con, lookup):
         info = get_metadata(filename, lookup)
         if not info:
             continue
+        restore_global_baseline(con,ident)
         con.execute("""UPDATE activities SET name=COALESCE(NULLIF(?,''),name), sport=COALESCE(NULLIF(?,''),sport),
             day=COALESCE(?,day), recorded_distance_m=COALESCE(?,recorded_distance_m),
             moving_seconds=COALESCE(?,moving_seconds), elapsed_seconds=COALESCE(?,elapsed_seconds),
@@ -820,7 +965,17 @@ def apply_metadata(con, lookup):
             info.get("moving_seconds"), info.get("elevation_m"), ident))
         extra_update=[info.get(field) for field in ADV_NUM_FIELDS]
         extra_update.append((info.get("weather_condition") or None))
-        con.execute("UPDATE activities SET "+", ".join(field+"=COALESCE(?,"+field+")" for field in ADV_NUM_FIELDS+("weather_condition",))+" WHERE id=?",extra_update+[ident])
+        con.execute("UPDATE activities SET "+", ".join(field+"=COALESCE(?,"+field+")" for field in ADV_NUM_FIELDS+("weather_condition",)) + " WHERE id=?",extra_update+[ident])
+         
+         
+        seed_source_version(con,ident)
+        strava_id=strava_activity_id(filename)
+        if strava_id:
+            record_source_version(con,ident,'strava-archive-csv:'+strava_id,'strava-archive/activities.csv',info)
+        apply_source_choices(con,ident)
+        if con.execute('SELECT 1 FROM activity_source_baselines WHERE activity_id=?',(ident,)).fetchone():capture_global_baseline(con,ident,replace=True)
+        apply_global_source_preferences(con,ident)
+        reapply_activity_override(con,ident)
         updates += 1
     con.commit()
     clear_render_caches()
@@ -890,13 +1045,17 @@ def init_db():
         con.execute("CREATE TABLE IF NOT EXISTS archived_duplicates (archive_id INTEGER PRIMARY KEY AUTOINCREMENT, original_id INTEGER NOT NULL, kept_id INTEGER NOT NULL, archived_at TEXT NOT NULL, metadata TEXT NOT NULL, coordinates BLOB NOT NULL, telemetry BLOB, telemetry_samples INTEGER, speed_exception INTEGER)")
         con.execute("CREATE TABLE IF NOT EXISTS activity_overrides (activity_id INTEGER PRIMARY KEY, originals TEXT NOT NULL, values_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
         con.execute("CREATE TABLE IF NOT EXISTS activity_edit_log (id INTEGER PRIMARY KEY, activity_id INTEGER NOT NULL, changed_at TEXT NOT NULL, previous TEXT NOT NULL, updated TEXT NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS activity_source_versions (id INTEGER PRIMARY KEY, activity_id INTEGER NOT NULL, source_key TEXT NOT NULL, label TEXT NOT NULL, provider TEXT NOT NULL, fields_json TEXT NOT NULL, coordinates BLOB, route_stats TEXT, telemetry BLOB, sample_count INTEGER, UNIQUE(activity_id,source_key))")
+        con.execute("CREATE INDEX IF NOT EXISTS source_version_activity_idx ON activity_source_versions(activity_id)")
+        con.execute("CREATE TABLE IF NOT EXISTS activity_source_choices (activity_id INTEGER PRIMARY KEY, choices_json TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS activity_source_baselines (activity_id INTEGER PRIMARY KEY, fields_json TEXT NOT NULL, coordinates BLOB, route_stats TEXT, telemetry BLOB, sample_count INTEGER)")
         con.execute("CREATE TABLE IF NOT EXISTS activity_route_repairs (activity_id INTEGER PRIMARY KEY, original_coordinates BLOB NOT NULL, original_point_count INTEGER NOT NULL, original_distance_m REAL NOT NULL, original_bbox TEXT NOT NULL, original_telemetry BLOB, original_telemetry_count INTEGER, edits TEXT NOT NULL, applied_at TEXT NOT NULL)")
         con.execute("CREATE TABLE IF NOT EXISTS heatmap_track_cache (activity_id INTEGER PRIMARY KEY, source_digest TEXT NOT NULL, payload BLOB NOT NULL)")
         con.execute("CREATE TABLE IF NOT EXISTS heatmap_view_cache (key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, digest TEXT NOT NULL, payload BLOB NOT NULL, used INTEGER NOT NULL DEFAULT 0)")
 
 
 
-DEFAULT_APPEARANCE = {"mode":"dark","online":True,"palette":"classic","routes":True,"heat":True,"radius":5,"definition":78,"intensity":120,"opacity":84,"bike_routes":False,"bike_tint_color":"#54dc96"}
+DEFAULT_APPEARANCE = {"mode":"dark","online":True,"palette":"classic","routes":True,"heat":True,"radius":5,"definition":78,"intensity":120,"opacity":84,"bike_routes":True,"bike_tint_color":"#54dc96"}
 
 
 def normalize_appearance(value):
@@ -939,8 +1098,8 @@ def load_appearance():
         if not result:
             return None
         saved = json.loads(result[0])
-        # Existing v1.2.2 users may have configured a dedicated path color.
-        # Carry that color into the replacement whole-overlay tint on first load.
+         
+         
         if isinstance(saved, dict) and 'bike_tint_color' not in saved:
             legacy_color = saved.get('bike_path_color')
             if isinstance(legacy_color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', legacy_color):
@@ -1015,6 +1174,321 @@ def recover_xml_telemetry(stream, filename):
     parser=points_gpx if filename.lower().endswith(('.gpx','.gpx.gz')) else points_tcx
     for _ in parser(source,summary):pass
     return {'_telemetry':summary.get('_telemetry',[])}
+
+
+ 
+ 
+SOURCE_CHOICE_FIELDS = ('name','sport','day','bike','gear_id','recorded_distance_m',
+    'moving_seconds','elapsed_seconds','elevation_m','avg_speed','max_speed',
+    'avg_heart_rate','avg_power')+ADV_NUM_FIELDS+('weather_condition',)
+
+
+def source_provider(label):
+    path=str(label).replace('\\','/').lower()
+    if path.startswith('garmin/') or path.startswith('garmin-') or 'garmin' in path:
+        return 'Garmin'
+    if path.startswith(('activities/','strava/','strava-archive/')) or re.search(r'(?:^|/)(?:[0-9]{7,}|strava)[^/]*\.(?:gpx|fit|tcx)',path):
+        return 'Strava'
+    return 'Imported file'
+
+
+def source_version_fields(info):
+    result={}
+    for key in SOURCE_CHOICE_FIELDS:
+        value=info.get(key)
+        if value is None or value=='':continue
+        if isinstance(value,(int,float)) and not math.isfinite(value):continue
+        if isinstance(value,(str,int,float)) and not isinstance(value,bool):result[key]=value
+    return result
+
+
+def seed_source_version(con,activity_id):
+    if con.execute('SELECT 1 FROM activity_source_versions WHERE activity_id=? LIMIT 1',(activity_id,)).fetchone():return
+    previous_factory=con.row_factory
+    try:
+        con.row_factory=sqlite3.Row
+        row=con.execute('SELECT * FROM activities WHERE id=?',(activity_id,)).fetchone()
+    finally:
+        con.row_factory=previous_factory
+    if row is None:return
+    record=dict(row)
+    telemetry=con.execute('SELECT payload,sample_count FROM activity_telemetry WHERE activity_id=?',(activity_id,)).fetchone()
+    stats={key:record[key] for key in ('point_count','distance_m','west','south','east','north')}
+    con.execute('INSERT OR IGNORE INTO activity_source_versions(activity_id,source_key,label,provider,fields_json,coordinates,route_stats,telemetry,sample_count) VALUES(?,?,?,?,?,?,?,?,?)',
+        (activity_id,record['unique_key'],'Original library record: '+Path(record['filename']).name[:100],
+         source_provider(record['filename']),json.dumps(source_version_fields(record),separators=(',',':')),
+         record['coordinates'],json.dumps(stats),telemetry[0] if telemetry else None,telemetry[1] if telemetry else None))
+
+
+def record_source_version(con,activity_id,source_key,filename,info,geometry=None):
+    fields=source_version_fields(info)
+    telemetry=info.get('_telemetry')
+    payload=None
+    if isinstance(telemetry,list) and telemetry:
+        try:
+            payload=zlib.compress(json.dumps(telemetry,separators=(',',':'),allow_nan=False).encode(),6)
+            if len(payload)>4*1024*1024:payload=None
+        except (ValueError,TypeError,OverflowError):payload=None
+    coords,stats=(None,None)
+    if geometry is not None:
+        compressed,count,bbox,day,distance=geometry
+        coords=compressed
+        stats=json.dumps(dict(point_count=count,distance_m=distance,west=bbox[1],south=bbox[0],east=bbox[3],north=bbox[2]))
+    if not fields and coords is None and payload is None:return
+    con.execute("""INSERT INTO activity_source_versions(activity_id,source_key,label,provider,fields_json,coordinates,route_stats,telemetry,sample_count)
+        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(activity_id,source_key) DO UPDATE SET
+        fields_json=excluded.fields_json,coordinates=COALESCE(excluded.coordinates,activity_source_versions.coordinates),
+        route_stats=COALESCE(excluded.route_stats,activity_source_versions.route_stats),
+        telemetry=COALESCE(excluded.telemetry,activity_source_versions.telemetry),
+        sample_count=COALESCE(excluded.sample_count,activity_source_versions.sample_count)""",
+        (activity_id,source_key,Path(filename).name[:110],source_provider(filename),json.dumps(fields,separators=(',',':')),
+         coords,stats,payload,len(telemetry) if payload is not None else None))
+
+
+def apply_source_choices(con,activity_id):
+    row=con.execute('SELECT choices_json FROM activity_source_choices WHERE activity_id=?',(activity_id,)).fetchone()
+    if not row:return
+    choices=json.loads(row[0])
+    fields={}
+    for key,source_id in choices.items():
+        if key not in SOURCE_CHOICE_FIELDS or type(source_id)!=int:continue
+        data=con.execute('SELECT fields_json FROM activity_source_versions WHERE activity_id=? AND id=?',(activity_id,source_id)).fetchone()
+        if not data:continue
+        value=json.loads(data[0]).get(key)
+        if value is not None:fields[key]=value
+        if key in ('moving_seconds','elevation_m') and value is not None:
+            provider=con.execute('SELECT provider FROM activity_source_versions WHERE id=? AND activity_id=?',(source_id,activity_id)).fetchone()
+            if provider and provider[0] in ('Garmin','Strava'):
+                fields['moving_source' if key=='moving_seconds' else 'elevation_source']=provider[0].lower()
+    if fields:
+        con.execute('UPDATE activities SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',tuple(fields.values())+(activity_id,))
+    if type(choices.get('route'))==int:
+        source=con.execute('SELECT coordinates,route_stats FROM activity_source_versions WHERE activity_id=? AND id=?',
+                           (activity_id,choices['route'])).fetchone()
+        if source and source[0] and source[1] and not con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone():
+            stats=json.loads(source[1]);columns=('point_count','distance_m','west','south','east','north')
+            if all(k in stats for k in columns):
+                con.execute('UPDATE activities SET coordinates=?,'+','.join(k+'=?' for k in columns)+' WHERE id=?',
+                            (source[0],)+(tuple(stats[k] for k in columns))+(activity_id,))
+    if type(choices.get('telemetry'))==int:
+        source=con.execute('SELECT telemetry,sample_count FROM activity_source_versions WHERE activity_id=? AND id=?',
+                           (activity_id,choices['telemetry'])).fetchone()
+        if source and source[0] and source[1] and not con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone():
+            con.execute('INSERT INTO activity_telemetry(activity_id,payload,sample_count) VALUES(?,?,?) ON CONFLICT(activity_id) DO UPDATE SET payload=excluded.payload,sample_count=excluded.sample_count',
+                        (activity_id,source[0],source[1]))
+
+
+ 
+ 
+SOURCE_PREFERENCE_FIELDS = SOURCE_CHOICE_FIELDS + ('route','telemetry')
+SOURCE_PREFERENCE_PROVIDERS = ('Auto','Garmin','Strava','Imported file')
+SOURCE_BASELINE_FIELDS = SOURCE_CHOICE_FIELDS + ('moving_source','elevation_source')
+
+
+def load_source_preferences(con=None):
+    def from_db(db):
+        record=db.execute("SELECT value FROM app_settings WHERE key='source_preferences'").fetchone()
+        try: stored=json.loads(record[0]) if record else {}
+        except (ValueError,TypeError):stored={}
+        if not isinstance(stored,dict):stored={}
+        return {name:stored.get(name,'Auto') if stored.get(name) in SOURCE_PREFERENCE_PROVIDERS else 'Auto'
+                for name in SOURCE_PREFERENCE_FIELDS}
+    if con is not None:return from_db(con)
+    with db_connect() as db:return from_db(db)
+
+
+def source_preference_review(con):
+    prefs=load_source_preferences(con)
+    multi=con.execute('SELECT COUNT(*) FROM (SELECT activity_id FROM activity_source_versions GROUP BY activity_id HAVING COUNT(*)>1)').fetchone()[0]
+    counts={name:{provider:0 for provider in SOURCE_PREFERENCE_PROVIDERS[1:]} for name in SOURCE_PREFERENCE_FIELDS}
+    for provider,fields_json,route,telemetry in con.execute('SELECT provider,fields_json,coordinates IS NOT NULL,telemetry IS NOT NULL FROM activity_source_versions WHERE activity_id IN (SELECT activity_id FROM activity_source_versions GROUP BY activity_id HAVING COUNT(*)>1)'):
+        if provider not in SOURCE_PREFERENCE_PROVIDERS[1:]:continue
+        data=json.loads(fields_json)
+        for name in SOURCE_CHOICE_FIELDS:
+            if name in data and data[name] is not None:counts[name][provider]+=1
+        if route is not None:counts['route'][provider]+=1
+        if telemetry is not None:counts['telemetry'][provider]+=1
+    return {'preferences':prefs,'providers':list(SOURCE_PREFERENCE_PROVIDERS),
+            'fields':list(SOURCE_PREFERENCE_FIELDS),'availability':counts,'multi_source_activities':multi,
+            'fallback':'When your preferred source lacks a field, the previously imported value is retained. Manually edited values and repaired routes are protected.'}
+
+
+def capture_global_baseline(con,activity_id,replace=False):
+    old=con.execute('SELECT coordinates,telemetry FROM activity_source_baselines WHERE activity_id=?',(activity_id,)).fetchone()
+    if not replace and old:return
+     
+     
+     
+    fields=','.join(SOURCE_BASELINE_FIELDS)
+    values=con.execute('SELECT '+fields+' FROM activities WHERE id=?',(activity_id,)).fetchone()
+    if values is None:return
+    metadata=dict(zip(SOURCE_BASELINE_FIELDS,values))
+    route=None;coords=None;telemetry=None
+    if old and old[0] is not None:
+        row=con.execute('SELECT coordinates,point_count,distance_m,west,south,east,north FROM activities WHERE id=?',(activity_id,)).fetchone()
+        coords=row[0];route=json.dumps(dict(zip(('point_count','distance_m','west','south','east','north'),row[1:])))
+    if old and old[1] is not None:
+        telemetry=con.execute('SELECT payload,sample_count FROM activity_telemetry WHERE activity_id=?',(activity_id,)).fetchone()
+    con.execute("""INSERT INTO activity_source_baselines(activity_id,fields_json,coordinates,route_stats,telemetry,sample_count)
+        VALUES(?,?,?,?,?,?) ON CONFLICT(activity_id) DO UPDATE SET
+        fields_json=excluded.fields_json,coordinates=excluded.coordinates,route_stats=excluded.route_stats,
+        telemetry=excluded.telemetry,sample_count=excluded.sample_count""",
+        (activity_id,json.dumps(metadata,separators=(',',':')),coords,route,
+         telemetry[0] if telemetry else None,telemetry[1] if telemetry else None))
+
+
+def backup_global_media_once(con,activity_id,prefs):
+    baseline=con.execute('SELECT coordinates,telemetry FROM activity_source_baselines WHERE activity_id=?',(activity_id,)).fetchone()
+    if baseline is None:return
+    if prefs.get('route')!='Auto' and baseline[0] is None:
+        row=con.execute('SELECT coordinates,point_count,distance_m,west,south,east,north FROM activities WHERE id=?',(activity_id,)).fetchone()
+        if row and row[0] is not None:
+            stats=dict(zip(('point_count','distance_m','west','south','east','north'),row[1:]))
+            con.execute('UPDATE activity_source_baselines SET coordinates=?,route_stats=? WHERE activity_id=?',(row[0],json.dumps(stats),activity_id))
+    if prefs.get('telemetry')!='Auto' and baseline[1] is None:
+        row=con.execute('SELECT payload,sample_count FROM activity_telemetry WHERE activity_id=?',(activity_id,)).fetchone()
+        if row:con.execute('UPDATE activity_source_baselines SET telemetry=?,sample_count=? WHERE activity_id=?',(row[0],row[1],activity_id))
+
+
+def restore_global_baseline(con,activity_id):
+    baseline=con.execute('SELECT fields_json,coordinates,route_stats,telemetry,sample_count FROM activity_source_baselines WHERE activity_id=?',(activity_id,)).fetchone()
+    if baseline is None:return False
+    data=json.loads(baseline[0]);names=[name for name in SOURCE_BASELINE_FIELDS if name in data]
+    if names:con.execute('UPDATE activities SET '+','.join(name+'=?' for name in names)+' WHERE id=?',tuple(data[name] for name in names)+(activity_id,))
+    repaired=con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone()
+    if not repaired and baseline[1] is not None and baseline[2]:
+        route=json.loads(baseline[2]);keys=('point_count','distance_m','west','south','east','north')
+        if all(k in route for k in keys):
+            con.execute('UPDATE activities SET coordinates=?,'+','.join(k+'=?' for k in keys)+' WHERE id=?',
+                        (baseline[1],)+tuple(route[k] for k in keys)+(activity_id,))
+    if not repaired and baseline[3] is not None and baseline[4] is not None:
+         
+         
+        con.execute('INSERT INTO activity_telemetry(activity_id,payload,sample_count) VALUES(?,?,?) ON CONFLICT(activity_id) DO UPDATE SET payload=excluded.payload,sample_count=excluded.sample_count',
+                    (activity_id,baseline[3],baseline[4]))
+    return True
+
+
+def apply_global_source_preferences(con,activity_id,preferences=None):
+    prefs=preferences if preferences is not None else load_source_preferences(con)
+    baseline=con.execute('SELECT 1 FROM activity_source_baselines WHERE activity_id=?',(activity_id,)).fetchone()
+    if not baseline and not any(v!='Auto' for v in prefs.values()):return False
+    versions=con.execute('SELECT id,provider,fields_json,coordinates IS NOT NULL,route_stats,telemetry IS NOT NULL,sample_count FROM activity_source_versions WHERE activity_id=? ORDER BY id DESC',(activity_id,)).fetchall()
+    if len(versions)<2 and not baseline:return False
+    if not baseline:capture_global_baseline(con,activity_id)
+    else:restore_global_baseline(con,activity_id)
+    backup_global_media_once(con,activity_id,prefs)
+    updates={}
+    selected_media={}
+    for name,preferred in prefs.items():
+        if preferred=='Auto':continue
+        for sid,provider,json_fields,coords,route_stats,telemetry,count in versions:
+            if provider!=preferred:continue
+            if name=='route':
+                if coords and route_stats:
+                    selected_media[name]=(con.execute('SELECT coordinates FROM activity_source_versions WHERE id=?',(sid,)).fetchone()[0],json.loads(route_stats));break
+            elif name=='telemetry':
+                if telemetry and count is not None:
+                    selected_media[name]=(con.execute('SELECT telemetry FROM activity_source_versions WHERE id=?',(sid,)).fetchone()[0],count);break
+            else:
+                val=json.loads(json_fields).get(name)
+                if val is not None:
+                    updates[name]=val
+                    if name in ('moving_seconds','elevation_m') and preferred in ('Garmin','Strava'):
+                        updates['moving_source' if name=='moving_seconds' else 'elevation_source']=preferred.lower()
+                    break
+    if updates:
+        con.execute('UPDATE activities SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',tuple(updates.values())+(activity_id,))
+    repaired=con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone()
+    if not repaired and 'route' in selected_media:
+        coords,route=selected_media['route'];keys=('point_count','distance_m','west','south','east','north')
+        if all(k in route for k in keys):
+            con.execute('UPDATE activities SET coordinates=?,'+','.join(k+'=?' for k in keys)+' WHERE id=?',
+                        (coords,)+tuple(route[k] for k in keys)+(activity_id,))
+    if not repaired and 'telemetry' in selected_media:
+        trace,count=selected_media['telemetry']
+        con.execute('INSERT INTO activity_telemetry(activity_id,payload,sample_count) VALUES(?,?,?) ON CONFLICT(activity_id) DO UPDATE SET payload=excluded.payload,sample_count=excluded.sample_count',
+                    (activity_id,trace,count))
+    reapply_activity_override(con,activity_id)
+    return bool(updates or selected_media or baseline)
+
+
+def save_source_preferences(payload):
+    if not isinstance(payload,dict) or set(payload)!={'preferences'} or not isinstance(payload['preferences'],dict):
+        raise ValueError('Invalid global data source preferences')
+    values=payload['preferences']
+    if set(values)!=set(SOURCE_PREFERENCE_FIELDS) or any(type(v)!=str or v not in SOURCE_PREFERENCE_PROVIDERS for v in values.values()):
+        raise ValueError('Choose Auto, Garmin, Strava or Imported file for each known field')
+    with STATE_LOCK:
+        if JOB['status']=='running':raise ValueError('Finish the current import before applying source rules')
+        with db_connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            con.execute("INSERT INTO app_settings(key,value) VALUES('source_preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (json.dumps(values,separators=(',',':')),))
+            ids={r[0] for r in con.execute('SELECT activity_id FROM activity_source_versions GROUP BY activity_id HAVING COUNT(*)>1')}
+            ids.update(r[0] for r in con.execute('SELECT activity_id FROM activity_source_baselines'))
+            for activity_id in sorted(ids):apply_global_source_preferences(con,activity_id,values)
+    clear_render_caches(include_tracks=True)
+    start_heat_warmup()
+    return {'ok':True,'preferences':values,'activities_reviewed':len(ids)}
+
+
+def choose_activity_sources(payload):
+    if not isinstance(payload,dict) or set(payload)!={'action','activity_id','choices'} or payload['action']!='choose_sources':
+        raise ValueError('Invalid source selection')
+    activity_id=payload['activity_id'];choices=payload['choices']
+    if type(activity_id)!=int or not 0<activity_id<10**12 or not isinstance(choices,dict) or len(choices)>len(SOURCE_CHOICE_FIELDS)+2:
+        raise ValueError('Invalid activity or source selection')
+    if any(k not in SOURCE_CHOICE_FIELDS+('route','telemetry') or type(v)!=int or v<=0 for k,v in choices.items()):
+        raise ValueError('Invalid source field')
+    with STATE_LOCK:
+        if JOB['status']=='running':raise ValueError('Finish the current import before changing activity sources')
+        with db_connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            if not con.execute('SELECT 1 FROM activities WHERE id=?',(activity_id,)).fetchone():raise ValueError('Activity no longer exists')
+            override=con.execute('SELECT originals,values_json FROM activity_overrides WHERE activity_id=?',(activity_id,)).fetchone()
+            manually_edited=set()
+            if override:
+                old=json.loads(override[0]); new=json.loads(override[1])
+                manually_edited={k for k in EDITABLE_ACTIVITY_FIELDS if new.get(k)!=old.get(k)}
+            if any(k in manually_edited for k in choices):
+                raise ValueError('Restore the manually edited field before selecting its import source')
+            for key,source_id in choices.items():
+                row=con.execute('SELECT fields_json FROM activity_source_versions WHERE activity_id=? AND id=?',(activity_id,source_id)).fetchone()
+                if key in SOURCE_CHOICE_FIELDS:
+                    if not row or json.loads(row[0]).get(key) is None:raise ValueError('Selected source does not supply '+key)
+                else:
+                    option=con.execute('SELECT coordinates,route_stats,telemetry,sample_count FROM activity_source_versions WHERE activity_id=? AND id=?',
+                                       (activity_id,source_id)).fetchone()
+                    if not option or (key=='route' and not (option[0] and option[1])) or (key=='telemetry' and not (option[2] and option[3])):
+                        raise ValueError('Selected source does not contain the '+key+' recording')
+                    if con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(activity_id,)).fetchone():
+                        raise ValueError('Restore any manual GPS route repairs before choosing a different track or sensor trace')
+            con.execute('INSERT INTO activity_source_choices(activity_id,choices_json,updated_at) VALUES(?,?,?) ON CONFLICT(activity_id) DO UPDATE SET choices_json=excluded.choices_json,updated_at=excluded.updated_at',
+                (activity_id,json.dumps(choices,separators=(',',':')),dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')))
+            apply_source_choices(con,activity_id)
+    clear_render_caches(include_tracks=True)
+    start_heat_warmup()
+    return {'ok':True,'activity_id':activity_id,'fields_selected':len(choices)}
+
+
+def source_version_review(con, activity_id=None):
+    if activity_id is None:
+        rows=con.execute('SELECT activity_id,COUNT(*) FROM activity_source_versions GROUP BY activity_id HAVING COUNT(*)>1 ORDER BY activity_id DESC LIMIT 250').fetchall()
+    else:
+        rows=con.execute('SELECT activity_id,COUNT(*) FROM activity_source_versions WHERE activity_id=? GROUP BY activity_id HAVING COUNT(*)>1',(activity_id,)).fetchall()
+    results=[]
+    for activity_id,_ in rows:
+        activity=con.execute('SELECT name,day FROM activities WHERE id=?',(activity_id,)).fetchone()
+        if not activity:continue
+        versions=[]
+        for row in con.execute('SELECT id,label,provider,fields_json,coordinates,telemetry FROM activity_source_versions WHERE activity_id=? ORDER BY id',(activity_id,)):
+            versions.append({'id':row[0],'label':row[1],'provider':row[2], 'fields':json.loads(row[3]),
+                             'has_route':row[4] is not None,'has_telemetry':row[5] is not None})
+        preferences=con.execute('SELECT choices_json FROM activity_source_choices WHERE activity_id=?',(activity_id,)).fetchone()
+        results.append({'activity_id':activity_id,'name':activity[0],'day':activity[1],
+                        'sources':versions,'choices':json.loads(preferences[0]) if preferences else {}})
+    return results
 
 
 def _telemetry_near(a, b, distance_limit=80):
@@ -1127,33 +1601,34 @@ def insert_activity(con, source, source_key, stream, info, garmin_index=None):
     if not existing:
         existing = con.execute("SELECT id,moving_seconds,elapsed_seconds,elevation_m,recorded_distance_m,day,avg_speed,max_speed,avg_power FROM activities WHERE filename=? ORDER BY id LIMIT 1", (filename,)).fetchone()
     if existing:
-        checked=con.execute("SELECT fit_extended_checked FROM activities WHERE id=?",(existing[0],)).fetchone()[0]
-        missing_telemetry=con.execute("SELECT 1 FROM activity_telemetry WHERE activity_id=?",(existing[0],)).fetchone() is None
-        if filename.lower().endswith((".fit", ".fit.gz")) and (not checked or garmin_index or missing_telemetry):
-            try:
-                recovered = recover_fit_summary(stream, filename)
-                match = matching_garmin_summary(garmin_index, recovered.get("_fit_start_utc"), recovered.get("recorded_distance_m"))
-                info = {**recovered, **match, **{k: v for k, v in info.items() if v is not None and v != ""}}
-            except (ValueError, OSError, EOFError, gzip.BadGzipFile) as exc:
-                print("[LibreHeatmaps] FIT summary unavailable for {}: {}".format(Path(filename).name, exc), flush=True)
-        if missing_telemetry and filename.lower().endswith(('.gpx','.gpx.gz','.tcx','.tcx.gz')):
-            try:
-                recovered=recover_xml_telemetry(stream,filename)
-                if recovered['_telemetry']:
-                    info={**info,**recovered}
-            except (ValueError,OSError,EOFError,gzip.BadGzipFile,SyntaxError) as exc:
-                print('[LibreHeatmaps] XML telemetry unavailable for {}: {}'.format(Path(filename).name,exc),flush=True)
-        if info:
-            store_telemetry(con,existing[0],info)
-            con.execute("""UPDATE activities SET name=COALESCE(NULLIF(?,''),name),sport=COALESCE(NULLIF(?,''),sport),day=COALESCE(?,day),recorded_distance_m=COALESCE(?,recorded_distance_m),moving_seconds=COALESCE(?,moving_seconds),elapsed_seconds=COALESCE(?,elapsed_seconds),elevation_m=COALESCE(?,elevation_m),avg_heart_rate=COALESCE(?,avg_heart_rate),avg_speed=COALESCE(?,avg_speed),max_speed=COALESCE(?,max_speed),avg_power=COALESCE(?,avg_power),bike=COALESCE(NULLIF(?,''),bike),gear_id=COALESCE(NULLIF(?,''),gear_id),moving_source=COALESCE(?,moving_source),elevation_source=COALESCE(?,elevation_source) WHERE id=?""", ((info.get("name") or "")[:300],(info.get("sport") or "")[:80],info.get("day"),info.get("recorded_distance_m"),info.get("moving_seconds"),info.get("elapsed_seconds"),info.get("elevation_m"),info.get("avg_heart_rate"),info.get("avg_speed"),info.get("max_speed"),info.get("avg_power"),(info.get("bike") or "")[:160],(info.get("gear_id") or "")[:120],info.get("moving_source"),info.get("elevation_source"),existing[0]))
-            values=[info.get(field) for field in ADV_NUM_FIELDS]+[(info.get("weather_condition") or None),existing[0]]
-            con.execute("UPDATE activities SET "+", ".join(field+"=COALESCE(?,"+field+")" for field in ADV_NUM_FIELDS+("weather_condition",))+" WHERE id=?",values)
-            if filename.lower().endswith((".fit", ".fit.gz")):
-                con.execute("UPDATE activities SET fit_extended_checked=1 WHERE id=?",(existing[0],))
-            reapply_activity_override(con,existing[0])
-            con.commit()
-            clear_render_caches()
-        return "skipped"
+         
+         
+         
+         
+        row_id=existing[0]
+        seed_source_version(con,row_id)
+        restore_global_baseline(con,row_id)
+        embedded={}
+        geometry=decode_track(stream,filename,embedded)
+        if geometry is not None and filename.lower().endswith(('.fit','.fit.gz')):
+            match=matching_garmin_summary(garmin_index,embedded.get('_fit_start_utc'),geometry[-1])
+        else:
+            match={}
+        imported={**embedded,**match,**{k:v for k,v in info.items() if v is not None and v!=''}}
+         
+         
+        record_source_version(con,row_id,source_key,filename,imported,geometry)
+        if imported:
+            enrich_matching_recording(con,row_id,imported,activity_id)
+        if filename.lower().endswith(('.fit','.fit.gz')):
+            con.execute('UPDATE activities SET fit_extended_checked=1 WHERE id=?',(row_id,))
+        apply_source_choices(con,row_id)
+        if con.execute('SELECT 1 FROM activity_source_baselines WHERE activity_id=?',(row_id,)).fetchone():capture_global_baseline(con,row_id,replace=True)
+        apply_global_source_preferences(con,row_id)
+        reapply_activity_override(con,row_id)  
+        con.commit()
+        clear_render_caches()
+        return 'enriched'
     embedded = {}
     result = decode_track(stream, filename, embedded)
     info = {**embedded, **{k: v for k, v in info.items() if v is not None and v != ""}}
@@ -1164,15 +1639,30 @@ def insert_activity(con, source, source_key, stream, info, garmin_index=None):
     info = {**embedded, **match, **{k: v for k, v in info.items() if v is not None and v != ""}}
     duplicate=matching_existing_recording(con,info,info.get('day') or day,distance)
     if duplicate is not None:
+        seed_source_version(con,duplicate)
+        restore_global_baseline(con,duplicate)
         enrich_matching_recording(con,duplicate,info,activity_id)
-        return 'skipped'
+        record_source_version(con,duplicate,source_key,filename,info,result)
+        apply_source_choices(con,duplicate)
+        if con.execute('SELECT 1 FROM activity_source_baselines WHERE activity_id=?',(duplicate,)).fetchone():capture_global_baseline(con,duplicate,replace=True)
+        apply_global_source_preferences(con,duplicate)
+        con.commit()
+        return 'skipped' 
     name = info.get("name") or Path(filename).name.split(".")[0]
     sport = info.get("sport") or "Unknown"
+    info.setdefault('name',name)
+    info.setdefault('sport',sport)
+    info.setdefault('day',day)
     con.execute("INSERT OR IGNORE INTO activities (unique_key,filename,name,sport,day,distance_m,point_count,west,south,east,north,coordinates,recorded_distance_m,moving_seconds,elapsed_seconds,elevation_m,avg_heart_rate,avg_speed,max_speed,avg_power,bike,gear_id,moving_source,elevation_source,activity_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (source_key, filename, name[:300], sport[:80], info.get("day") or day, distance, count, bbox[1], bbox[0], bbox[3], bbox[2], compressed, info.get("recorded_distance_m"), info.get("moving_seconds"), info.get("elapsed_seconds"), info.get("elevation_m"), info.get("avg_heart_rate"), info.get("avg_speed"), info.get("max_speed"), info.get("avg_power"), (info.get("bike") or "")[:160], (info.get("gear_id") or "")[:120], info.get("moving_source"), info.get("elevation_source"), activity_id))
     activity_row=con.execute("SELECT id FROM activities WHERE unique_key=?",(source_key,)).fetchone()
-    if activity_row:store_telemetry(con,activity_row[0],info)
+    if activity_row:
+        store_telemetry(con,activity_row[0],info)
+        record_source_version(con,activity_row[0],source_key,filename,info,result)
     values=[info.get(field) for field in ADV_NUM_FIELDS]+[(info.get("weather_condition") or None)]
     con.execute("UPDATE activities SET "+", ".join(field+"=?" for field in ADV_NUM_FIELDS+("weather_condition",))+", fit_extended_checked=? WHERE id=(SELECT id FROM activities WHERE unique_key=?)",values+[1 if filename.lower().endswith((".fit", ".fit.gz")) else 0,source_key])
+    if activity_row:
+        apply_source_choices(con,activity_row[0])
+        apply_global_source_preferences(con,activity_row[0])
     con.commit()
     clear_render_caches()
     return "added"
@@ -1186,20 +1676,34 @@ def set_job(**changes):
 
 
 def import_job(path, display_name):
-    added = skipped = failed = 0
+    added = skipped = failed = enriched = 0
     no_gps = 0
     try:
         with db_connect() as con:
             if display_name.lower().endswith(".csv"):
                 with open(path, "rb") as file:
-                    lookup = metadata_from_csv(file)
-                set_job(total=1, message="Updating existing activity statistics")
-                updated = apply_metadata(con, lookup)
-                set_job(processed=1, added=0, skipped=0, failed=0, updated=updated)
+                    is_track = gps_csv_headers(file)
+                if is_track:
+                    set_job(total=1,message='Reading GPS CSV track')
+                    size=os.stat(path).st_size
+                    if size>MAP_FORMAT_LIMIT:raise ValueError('GPS CSV exceeds the safety limit')
+                    key=hashlib.sha256((display_name.casefold()+':'+str(size)+':'+hashlib.sha256(Path(path).read_bytes()).hexdigest()).encode()).hexdigest()
+                    with open(path,'rb') as file:outcome=insert_activity(con,display_name,key,file,{})
+                    added=int(outcome=='added');enriched=int(outcome=='enriched');no_gps=int(outcome=='no-gps');skipped=int(outcome=='skipped')
+                    set_job(total=1,processed=1,added=added,skipped=skipped,no_gps=no_gps,updated=enriched)
+                else:
+                    with open(path, "rb") as file:lookup=metadata_from_csv(file)
+                    set_job(total=1, message="Updating existing activity statistics")
+                    updated=apply_metadata(con,lookup)
+                    set_job(processed=1, added=0, skipped=0, failed=0, updated=updated)
             elif display_name.lower().endswith(".zip"):
                 with ExitStack() as stack:
                     archive = stack.enter_context(zipfile.ZipFile(path))
                     entries = [(archive, member, False) for member in archive.infolist() if not member.is_dir() and member.filename.lower().endswith(FORMATS)]
+                    for member in archive.infolist():
+                        if member.is_dir() or not member.filename.lower().endswith('.csv') or Path(member.filename).name.casefold()=='activities.csv' or member.file_size>MAP_FORMAT_LIMIT:continue
+                        with archive.open(member) as candidate:
+                            if gps_csv_headers(io.BytesIO(candidate.read(8192))):entries.append((archive,member,False))
                     nested = [member for member in archive.infolist() if not member.is_dir() and member.filename.lower().endswith(".zip")]
                     if len(nested) > 64:
                         raise ValueError("Too many nested archives")
@@ -1219,6 +1723,9 @@ def import_job(path, display_name):
                         for member in inner.infolist():
                             if not member.is_dir() and member.filename.lower().endswith(FORMATS):
                                 entries.append((inner, member, True))
+                            elif not member.is_dir() and member.filename.lower().endswith('.csv') and Path(member.filename).name.casefold()!='activities.csv' and member.file_size<=MAP_FORMAT_LIMIT:
+                                with inner.open(member) as candidate:
+                                    if gps_csv_headers(io.BytesIO(candidate.read(8192))):entries.append((inner,member,True))
                     if len(entries) > 30000:
                         raise ValueError("Too many activity files in one archive")
                     if sum(member.file_size for _, member, _ in entries) > 12 * 1024 * 1024 * 1024:
@@ -1241,6 +1748,8 @@ def import_job(path, display_name):
                                 outcome = insert_activity(con, safe_name, key, file, get_metadata(member.filename, lookup), garmin_index if is_nested else None)
                             if outcome == "added":
                                 added += 1
+                            elif outcome == "enriched":
+                                enriched += 1
                             elif outcome == "no-gps":
                                 no_gps += 1
                             else:
@@ -1250,9 +1759,9 @@ def import_job(path, display_name):
                             print("[LibreHeatmaps] Could not import {}: {}".format(Path(safe_name).name, exc), flush=True)
                         set_job(processed=index, added=added, skipped=skipped, failed=failed, no_gps=no_gps)
                     if lookup:
-                        set_job(updated=apply_metadata(con, lookup))
+                        set_job(updated=enriched+apply_metadata(con, lookup))
                     else:
-                        set_job(updated=0)
+                        set_job(updated=enriched)
             else:
                 set_job(total=1, message="Reading activity")
                 size = os.stat(path).st_size
@@ -1261,11 +1770,13 @@ def import_job(path, display_name):
                     outcome = insert_activity(con, display_name, key, file, {})
                 if outcome == "added":
                     added = 1
+                elif outcome == "enriched":
+                    enriched = 1
                 elif outcome == "no-gps":
                     no_gps = 1
                 else:
                     skipped = 1
-                set_job(processed=1, added=added, skipped=skipped, no_gps=no_gps)
+                set_job(processed=1, added=added, skipped=skipped, no_gps=no_gps, updated=enriched)
         with db_connect() as record_con:
             record_con.execute("INSERT INTO import_history(imported_at,label,added,skipped,no_gps,failed,updated) VALUES(?,?,?,?,?,?,?)",(dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),Path(display_name).name[:160],added,skipped,no_gps,failed,JOB.get('updated',0)))
             record_con.execute("DELETE FROM import_history WHERE id NOT IN (SELECT id FROM import_history ORDER BY id DESC LIMIT 30)")
@@ -1291,7 +1802,9 @@ def sniff_gps_name(original, path):
     if len(head)>=12 and head[8:12]==b'.FIT':return original+'.fit'
     if b'<gpx' in cleaned:return original+'.gpx'
     if b'<trainingcenterdatabase' in cleaned:return original+'.tcx'
-    raise ValueError('Unrecognized .gps encoding; supported file contents are FIT, GPX and TCX')
+    if b'<kml' in cleaned:return original+'.kml'
+    if b'"featurecollection"' in cleaned or b'"linestring"' in cleaned:return original+'.geojson'
+    raise ValueError('Unrecognized .gps encoding; supported file contents are FIT, GPX, TCX, KML or GeoJSON')
 
 def garmin_usb_archive_directory():
     return DB_PATH.parent / "Garmin-FIT-Archive"
@@ -1384,12 +1897,12 @@ def garmin_usb_copy(source, archive):
 
 
 
-# Optional watched folder: only scans direct children and never moves or deletes originals.
+ 
 WATCH_LOCK = threading.Lock()
 WATCH_PICK_LOCK = threading.Lock()
 WATCH_SEEN = {}
 WATCH_STATUS = {'message':'Automatic import is off until you select a folder.', 'added':0, 'skipped':0, 'failed':0, 'last_scan':None}
-WATCH_SUFFIXES = ('.fit','.fit.gz','.gpx','.gpx.gz','.tcx','.tcx.gz','.gps')
+WATCH_SUFFIXES = FORMATS + ('.gps','.csv')
 
 def watch_seen_key(folder_name, source):
     return 'watch_seen:'+hashlib.sha256((folder_name+'\x00'+str(source)).encode('utf-8')).hexdigest()
@@ -1460,6 +1973,9 @@ def watch_folder_scan():
             if not source.is_file() or source.is_symlink() or not source.name.lower().endswith(WATCH_SUFFIXES):continue
             stat=source.stat()
             if stat.st_size<12 or stat.st_size>128*1024*1024 or time.time()-stat.st_mtime<5:continue
+            if source.name.lower().endswith('.csv'):
+                with source.open('rb') as candidate:
+                    if not gps_csv_headers(candidate):continue
             fingerprint=(stat.st_size,stat.st_mtime_ns)
             with WATCH_LOCK:
                 if WATCH_SEEN.get((folder_name,str(source)))==fingerprint:continue
@@ -1486,7 +2002,9 @@ def watch_folder_scan():
                             if len(header)>=12 and header[8:12]==b'.FIT':display=source.name+'.fit'
                             elif b'<gpx' in stripped.lower():display=source.name+'.gpx'
                             elif b'<trainingcenterdatabase' in stripped.lower():display=source.name+'.tcx'
-                            else:raise ValueError('Unrecognized .gps encoding; supported file contents are FIT, GPX or TCX')
+                            elif b'<kml' in stripped.lower():display=source.name+'.kml'
+                            elif b'"featurecollection"' in stripped.lower() or b'"linestring"' in stripped.lower():display=source.name+'.geojson'
+                            else:raise ValueError('Unrecognized .gps encoding; supported file contents are FIT, GPX, TCX, KML or GeoJSON')
                         with source.open('rb') as stream:
                             hasher=hashlib.sha256()
                             while True:
@@ -1528,8 +2046,8 @@ def watch_folder_loop():
         time.sleep(15)
 
 
-# Optional Garmin Connect Personal API sync. The key stays in the user's local data
-# directory, never the SQLite database, library backups, ZIPs, or application logs.
+ 
+ 
 GARMIN_PERSONAL_BASE = 'https://personal.connectapi.garmin.com'
 GARMIN_PERSONAL_KEY_NAME = 'garmin-personal-api.key'
 GARMIN_SYNC_LOCK = threading.Lock()
@@ -1539,8 +2057,8 @@ GARMIN_LAST_ATTEMPT_MONO = 0.0
 GARMIN_TOKEN_LOCK = threading.Lock()
 GARMIN_TOKEN_CACHE = {'key_fingerprint': None, 'bearer': '', 'expires_at': 0}
 GARMIN_HISTORY_PAGE_SIZE = 100
-# No artificial pause between pages: full-history import continues until complete.
-# HTTP 429 and network failures still preserve the cursor and schedule a safe retry.
+ 
+ 
 GARMIN_HISTORY_RETRY_SECONDS = 900
 GARMIN_HISTORY_RATE_LIMIT_SECONDS = 3600
 GARMIN_HISTORY_REQUEST_DELAY_SECONDS = 1.0
@@ -1571,15 +2089,15 @@ def garmin_personal_key():
 
 
 def garmin_history_state():
-    # Only LibreHeatmaps-created progress markers are stored here. Original
-    # recordings and Garmin credentials are never moved or altered.
+     
+     
     with db_connect() as con:
         rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key LIKE 'garmin_history_%'"))
     def nonnegative(key, default=0):
         try:return max(0,int(rows.get(key,str(default))))
         except (TypeError,ValueError):return default
-    # Older 1.2.2 candidates scheduled an artificial 10-minute pause after each
-    # 50-recording page. Ignore that obsolete timer, never a real HTTP 429 wait.
+     
+     
     last_message = rows.get('garmin_history_message', '')
     resume_at = nonnegative('garmin_history_next_after')
     if 'Next batch scheduled' in last_message:
@@ -1614,7 +2132,7 @@ def garmin_history_start():
     state=garmin_history_state()
     if state['completed']:
         garmin_history_write(cursor=0,reviewed=0,imported=0,completed=0)
-    # Never bypass a scheduled retry after Garmin rate-limits the connection.
+     
     due=state['next_after'] if state['next_after']>time.time() else 0
     garmin_history_write(active=1,next_after=due,message='Importing full Garmin account history continuously…' if not due else 'Garmin requested a cooldown. Full history will resume after the retry window.')
     return garmin_history_state()
@@ -1656,13 +2174,13 @@ def garmin_personal_store_key(value):
         if os.path.exists(temp):
             os.unlink(temp)
     garmin_clear_token()
-    # A replacement key may reference a different Garmin account. Never mix
-    # its historical cursor with the old account's progress.
+     
+     
     if previous_key != value:
         garmin_history_write(active=0,completed=0,cursor=0,reviewed=0,imported=0,next_after=0,message='Not started for this Garmin connection.')
     global GARMIN_LAST_ATTEMPT_MONO
     with GARMIN_SCHEDULE_LOCK:
-        GARMIN_LAST_ATTEMPT_MONO = 0.0  # newly connected: check automatically soon
+        GARMIN_LAST_ATTEMPT_MONO = 0.0   
     with GARMIN_STATUS_LOCK:
         GARMIN_STATUS.update(message='Garmin key saved locally but not yet verified. Select Sync now to test access.', last_sync=None, last_attempt=None, authenticated=False, first_error='')
     return garmin_personal_status()
@@ -1670,8 +2188,8 @@ def garmin_personal_store_key(value):
 
 def garmin_personal_disconnect():
     garmin_history_write(active=0,next_after=0,message='Historical import paused because Garmin was disconnected.')
-    # Stop future API requests even while an earlier request is winding down.
-    # Avoid holding the HTTP handler behind a long-running sync's download lock.
+     
+     
     garmin_personal_key_path().unlink(missing_ok=True)
     garmin_clear_token()
     global GARMIN_LAST_ATTEMPT_MONO
@@ -1710,7 +2228,7 @@ def garmin_personal_http(method, route, token, *, limit=8*1024*1024, accept="*/*
 
 
 def garmin_personal_access_token(api_key, force_refresh=False):
-    # Keep the bearer only in process memory; never store it in the library or logs.
+     
     fingerprint = hashlib.sha256(api_key.encode('ascii')).hexdigest()
     with GARMIN_TOKEN_LOCK:
         if (not force_refresh and GARMIN_TOKEN_CACHE['key_fingerprint'] == fingerprint
@@ -1736,11 +2254,14 @@ def garmin_personal_access_token(api_key, force_refresh=False):
     return bearer
 
 
-def garmin_personal_activity_ids(bearer, max_items=500):
+def garmin_personal_activity_ids(bearer, max_items=25):
+    if type(max_items) is not int or not 1 <= max_items <= 100:
+        raise ValueError("Garmin recent activity count must be from 1 to 100")
     found=[]
     for start in range(0,max_items,100):
-        route='/activitylist-service/activities/search/activities?start={}&limit=100'.format(start)
-        # Garmin's reference client explicitly requests JSON on data endpoints.
+        page_size=min(100,max_items-start)
+        route='/activitylist-service/activities/search/activities?start={}&limit={}'.format(start,page_size)
+         
         data=json.loads(garmin_personal_http('GET',route,bearer,limit=8*1024*1024,accept='application/json'))
         if not isinstance(data,list):
             raise ValueError('Unexpected Garmin activity list response')
@@ -1749,9 +2270,9 @@ def garmin_personal_activity_ids(bearer, max_items=500):
                 aid=item.get('activityId') or item.get('activity_id')
                 if isinstance(aid,int) and 0 < aid < 10**18:
                     found.append(aid)
-        if len(data)<100:
+        if len(data)<page_size:
             break
-    return list(dict.fromkeys(found))
+    return list(dict.fromkeys(found))[:max_items]
 
 
 
@@ -1770,7 +2291,7 @@ def garmin_personal_activity_page(bearer, start, limit=GARMIN_HISTORY_PAGE_SIZE)
 
 
 def garmin_retry_auth_request(callback, api_key, bearer):
-    # A bearer can be invalidated before its JWT expiry; exchange the API key once.
+     
     try:
         return callback(bearer),bearer
     except GarminPersonalHTTPError as exc:
@@ -1781,8 +2302,8 @@ def garmin_retry_auth_request(callback, api_key, bearer):
 
 
 def garmin_personal_save_fit(folder_name, activity_id, source_name, raw):
-    # User-designated watched folder is the optional destination for original FITs.
-    # No Garmin folder is selected or created on the user's behalf.
+     
+     
     folder=Path(folder_name)
     if not folder.is_dir() or folder.is_symlink():
         raise ValueError('The selected activity folder is no longer available')
@@ -1843,14 +2364,14 @@ def garmin_personal_import_zip(con, content, activity_id, destination=None):
                     con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",(watch_seen_key(destination,target),'{}:{}'.format(*seen)))
                     with WATCH_LOCK:WATCH_SEEN[(destination,str(target))]=seen
                 except (OSError,ValueError):
-                    # A full/read-only optional folder cannot invalidate a good library import.
+                     
                     save_failures+=1
     return added,skipped,no_gps,stored,save_failures
 
 
 def garmin_local_activity_ids(con):
-    # An API download marker is not proof that a ride still exists in the library.
-    # Include recordings re-imported from the user's Garmin-named original FIT files.
+     
+     
     present=set()
     for (filename,) in con.execute("SELECT filename FROM activities WHERE filename LIKE 'Garmin/%' OR filename LIKE 'Garmin-%'"):
         match=re.match(r"(?i)^garmin[/\-]([0-9]{1,18})-",filename)
@@ -1882,25 +2403,24 @@ def garmin_personal_sync_job():
         try:
             folder_name=load_watch_folder()
             if folder_name and (not Path(folder_name).is_dir() or Path(folder_name).is_symlink()):
-                # The library sync is independent of the optional local original-file destination.
+                 
                 folder_warning=' Selected activity folder unavailable; originals were not saved there.'
                 folder_name=''
             folder_id=hashlib.sha256(folder_name.encode('utf-8')).hexdigest() if folder_name else ''
             bearer=garmin_personal_access_token(key)
             stage='activity discovery'
-            ids,bearer=garmin_retry_auth_request(garmin_personal_activity_ids,key,bearer)
+            ids,bearer=garmin_retry_auth_request(lambda active: garmin_personal_activity_ids(active,load_garmin_recent_count()),key,bearer)
             discovered=len(ids)
             with GARMIN_STATUS_LOCK:
                 GARMIN_STATUS.update(authenticated=True,discovered=discovered,message='Garmin access verified; comparing {} recent activities…'.format(discovered))
             with db_connect() as con:
-                # Reconcile against actual imported tracks, not obsolete download history.
-                # Clearing activities intentionally keeps API keys and original FIT files.
+                 
+                 
                 local_ids=garmin_local_activity_ids(con)
                 stored=dict(con.execute("SELECT key,value FROM app_settings WHERE key LIKE 'garmin_personal_saved:%' OR key LIKE 'garmin_personal_nogps:%'"))
                 pending=[aid for aid in reversed(ids) if
                     (aid not in local_ids and 'garmin_personal_nogps:'+str(aid) not in stored)
                     or (folder_name and stored.get('garmin_personal_saved:'+str(aid))!=folder_id)]
-                pending=pending[-60:]
                 set_job(total=len(pending),message='Downloading missing Garmin activity recordings')
                 stage='activity download'
                 first_error=''
@@ -1914,8 +2434,8 @@ def garmin_personal_sync_job():
                         content,bearer=garmin_retry_auth_request(callback,key,bearer)
                         a,s,n,stored_count,save_error_count=garmin_personal_import_zip(con,content,aid,folder_name or None)
                         added+=a;skipped+=s;no_gps+=n;saved+=stored_count;save_failures+=save_error_count
-                        # This marker is informational; the next sync always verifies the
-                        # local library. No-GPS activities need a separate explicit marker.
+                         
+                         
                         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",('garmin_personal_synced:'+str(aid),dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')))
                         if n and not a and not s:
                             con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)",('garmin_personal_nogps:'+str(aid),'1'))
@@ -1930,7 +2450,7 @@ def garmin_personal_sync_job():
                             first_error='Activity {}: {}'.format(aid,str(exc)[:115])
                         con.rollback()
                         if isinstance(exc,GarminPersonalHTTPError) and exc.status_code==429:
-                            # Abort further downloads instead of continuing to hammer the endpoint.
+                             
                             break
                     set_job(processed=index,added=added,skipped=skipped,failed=failed,no_gps=no_gps)
                 if pending:
@@ -1951,7 +2471,7 @@ def garmin_personal_sync_job():
                 GARMIN_STATUS.update(running=False,last_sync=dt.datetime.now().isoformat(timespec='seconds'),message=message,added=added,skipped=skipped,failed=failed,checked=checked,discovered=discovered,stored=saved,first_error=first_error,authenticated=True)
             if added:start_heat_warmup()
         except Exception as exc:
-            # Never display the key, bearer, or raw Garmin response body.
+             
             message='Garmin '+stage+' failed: '+str(exc)[:160]
             set_job(status='error',message=message)
             with GARMIN_STATUS_LOCK:
@@ -1967,9 +2487,9 @@ def garmin_personal_sync_job():
 
 def garmin_personal_history_job():
     global GARMIN_LAST_ATTEMPT_MONO
-    # Scan every historical page in one operation, rather than stopping at an
-    # arbitrary 50-activity boundary. Progress is durable after each activity.
-    # Stop only at the end, an explicit pause/disconnect, or a real API failure.
+     
+     
+     
     if not GARMIN_SYNC_LOCK.acquire(blocking=False):
         return
     try:
@@ -2047,7 +2567,7 @@ def garmin_personal_history_job():
                                 accept='application/zip, application/x-zip-compressed, application/octet-stream')
                             content, bearer = garmin_retry_auth_request(callback, key, bearer)
                         except (ValueError, OSError, EOFError) as exc:
-                            # Keep cursor ON the failed activity so it is retried.
+                             
                             delay = (GARMIN_HISTORY_RATE_LIMIT_SECONDS if isinstance(exc, GarminPersonalHTTPError)
                                      and exc.status_code == 429 else GARMIN_HISTORY_RETRY_SECONDS)
                             unauthorized = isinstance(exc, GarminPersonalHTTPError) and exc.status_code in (401, 403)
@@ -2112,7 +2632,7 @@ def garmin_personal_history_job():
                     if needs and GARMIN_HISTORY_REQUEST_DELAY_SECONDS:
                         time.sleep(GARMIN_HISTORY_REQUEST_DELAY_SECONDS)
                 if len(ids) < GARMIN_HISTORY_PAGE_SIZE and garmin_history_state()['active']:
-                    # A short page is the last page. Finish without an additional API call.
+                     
                     final_state = garmin_history_state()
                     final = 'Full Garmin history complete: {} activities reviewed; {} new rides imported. Original files untouched.'.format(
                         final_state['reviewed'], final_state['imported'])
@@ -2126,7 +2646,7 @@ def garmin_personal_history_job():
                     if added_session:
                         start_heat_warmup()
                     return
-                # Continue directly to the next page. Never impose a batch cooldown.
+                 
                 if GARMIN_HISTORY_REQUEST_DELAY_SECONDS:
                     time.sleep(GARMIN_HISTORY_REQUEST_DELAY_SECONDS)
         except Exception as exc:
@@ -2155,8 +2675,8 @@ def garmin_auto_sync_due(now=None):
 
 
 def garmin_personal_loop():
-    # The first check occurs when the app starts with a key. Subsequently,
-    # check only after the user-selected interval since the last actual sync.
+     
+     
     while True:
         delay = 15
         try:
@@ -2172,7 +2692,7 @@ def garmin_personal_loop():
                         elif garmin_auto_sync_due():
                             garmin_personal_sync_job()
                 elif garmin_auto_sync_due():
-                    delay = 12  # local job busy; does not call Garmin
+                    delay = 12   
         except Exception as exc:
             print('[LibreHeatmaps] Garmin sync loop: {}'.format(type(exc).__name__),flush=True)
             delay = 60
@@ -2285,10 +2805,14 @@ def edit_activity_details(activity_id, action=None, changes=None):
 
 
 def reapply_activity_override(con, activity_id):
-    record=con.execute('SELECT values_json FROM activity_overrides WHERE activity_id=?',(activity_id,)).fetchone()
+    record=con.execute('SELECT originals,values_json FROM activity_overrides WHERE activity_id=?',(activity_id,)).fetchone()
     if record:
-        values=json.loads(record[0])
-        con.execute('UPDATE activities SET '+','.join(k+'=?' for k in EDITABLE_ACTIVITY_FIELDS if k in values)+' WHERE id=?',tuple(values[k] for k in EDITABLE_ACTIVITY_FIELDS if k in values)+(activity_id,))
+        originals=json.loads(record[0]);values=json.loads(record[1])
+         
+         
+        updated=[k for k in EDITABLE_ACTIVITY_FIELDS if k in values and values[k]!=originals.get(k)]
+        if updated:
+            con.execute('UPDATE activities SET '+','.join(k+'=?' for k in updated)+' WHERE id=?',tuple(values[k] for k in updated)+(activity_id,))
 
 
 
@@ -2506,6 +3030,12 @@ def set_anomaly_filter(enabled):
     return bool(enabled)
 
 
+def load_activity_focus():
+    with db_connect() as con:
+        row=con.execute("SELECT value FROM app_settings WHERE key='activity_focus'").fetchone()
+    return row[0] if row and row[0] in ('cycling','foot','all') else 'cycling'
+
+
 def load_display_units():
     with db_connect() as con:
         row = con.execute("SELECT value FROM app_settings WHERE key='display_units'").fetchone()
@@ -2546,22 +3076,45 @@ def load_garmin_sync_minutes():
     return garmin_sync_minutes({'garmin_sync_minutes': row[0]}) if row else 60
 
 
+def garmin_recent_count(rows=None):
+    if rows is None:
+        with db_connect() as con:
+            row=con.execute("SELECT value FROM app_settings WHERE key='garmin_recent_count'").fetchone()
+        rows={'garmin_recent_count':row[0]} if row else {}
+    try:
+        raw=str(rows.get('garmin_recent_count','25'))
+        if raw.isdecimal() and 1 <= int(raw) <= 100:
+            return int(raw)
+    except (ValueError,TypeError):
+        pass
+    return 25
+
+
+def load_garmin_recent_count():
+    return garmin_recent_count()
+
+
 def statistics_preferences():
     with db_connect() as con:
-        rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key IN ('filter_speed_anomalies','filter_speed_smart','advanced_data','speed_threshold_mph','garmin_sync_minutes','strava_sync_minutes','strava_recent_count')"))
+        rows=dict(con.execute("SELECT key,value FROM app_settings WHERE key IN ('filter_speed_anomalies','filter_speed_smart','advanced_data','speed_threshold_mph','garmin_sync_minutes','garmin_recent_count','strava_sync_minutes','strava_recent_count')"))
     return {'filter_speed_anomalies':rows.get('filter_speed_anomalies')=='1',
             'filter_speed_smart':rows.get('filter_speed_smart')=='1',
             'advanced_data':rows.get('advanced_data')=='1',
             'speed_threshold_mph':speed_threshold_mph(rows),
             'garmin_sync_minutes':garmin_sync_minutes(rows),
+            'garmin_recent_count':garmin_recent_count(rows),
             'strava_sync_minutes':strava_sync_interval(), 'strava_recent_count':strava_recent_count()}
 
 
 def store_all_settings(payload):
-    if not isinstance(payload,dict) or set(payload) not in ({'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data','display_units','watch_folder','speed_threshold_mph','garmin_sync_minutes','strava_sync_minutes','strava_recent_count'}, {'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data','display_units','watch_folder','speed_threshold_mph','garmin_sync_minutes','strava_sync_minutes'}):
+    allowed={'appearance','filter_speed_anomalies','filter_speed_smart','advanced_data','display_units','watch_folder','speed_threshold_mph','garmin_sync_minutes','garmin_recent_count','strava_sync_minutes','strava_recent_count','activity_focus'}
+    mandatory=allowed-{'garmin_recent_count','strava_recent_count','activity_focus'}
+    if not isinstance(payload,dict) or not mandatory <= set(payload) or set(payload)-allowed:
         raise ValueError('Invalid settings fields')
     if type(payload['filter_speed_anomalies']) is not bool or type(payload['filter_speed_smart']) is not bool or type(payload['advanced_data']) is not bool:
         raise ValueError('Invalid statistics toggles')
+    activity_focus=payload.get('activity_focus',load_activity_focus())
+    if activity_focus not in ('cycling','foot','all') or type(activity_focus) is not str:raise ValueError('Invalid activity focus')
     appearance=normalize_appearance(payload['appearance'])
     if payload['display_units'] not in ('mi','km') or type(payload['display_units']) is not str:
         raise ValueError('Invalid display units')
@@ -2575,33 +3128,38 @@ def store_all_settings(payload):
     strava_interval=payload['strava_sync_minutes']
     if type(strava_interval) is not int or not 15 <= strava_interval <= 1440:
         raise ValueError('Strava automatic sync interval must be from 15 to 1440 minutes')
+    garmin_count=payload.get('garmin_recent_count',load_garmin_recent_count())
+    if type(garmin_count) is not int or not 1 <= garmin_count <= 100:
+        raise ValueError("Garmin recent activity count must be from 1 to 100")
     recent_count=payload.get('strava_recent_count',strava_recent_count())
     if type(recent_count) is not int or not 1 <= recent_count <= 50:
         raise ValueError('Strava recent activity count must be from 1 to 50')
     watch_folder=normalize_watch_folder(payload['watch_folder'])
     with db_connect() as con:
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('appearance',?)", (json.dumps(appearance,separators=(',',':')),))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('activity_focus',?)",(activity_focus,))
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('display_units',?)",(payload['display_units'],))
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('watch_folder',?)",(watch_folder,))
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('speed_threshold_mph',?)",(str(threshold),))
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('garmin_sync_minutes',?)",(str(interval),))
+        con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('garmin_recent_count',?)",(str(garmin_count),))
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('strava_sync_minutes',?)",(str(strava_interval),))
         con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('strava_recent_count',?)",(str(recent_count),))
         for name in ('filter_speed_anomalies','filter_speed_smart','advanced_data'):
             con.execute('INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)',(name,'1' if payload[name] else '0'))
-    return {'appearance':appearance,**{k:payload[k] for k in ('filter_speed_anomalies','filter_speed_smart','advanced_data')},'speed_threshold_mph':threshold,'garmin_sync_minutes':interval,'strava_sync_minutes':strava_interval,'strava_recent_count':recent_count,'display_units':payload['display_units'],'watch_folder':watch_folder}
+    return {'appearance':appearance,**{k:payload[k] for k in ('filter_speed_anomalies','filter_speed_smart','advanced_data')},'speed_threshold_mph':threshold,'garmin_sync_minutes':interval,'garmin_recent_count':garmin_count,'strava_sync_minutes':strava_interval,'strava_recent_count':recent_count,'display_units':payload['display_units'],'watch_folder':watch_folder,'activity_focus':activity_focus}
 
 
-# Optional Strava desktop GPX connection. This uses the user's own isolated
-# Chromium/Edge profile, not a Strava developer API or the user's normal browser
-# profile. Browser automation is unofficial and may conflict with Strava's terms.
-# Never read or export browser cookies/passwords; disconnect deletes this profile.
+ 
+ 
+ 
+ 
 STRAVA_PROFILE_NAME = 'Strava-Browser-Session'
 STRAVA_RECONNECT_KEY = 'strava_browser_reconnect_required'
 
 
 class StravaReauthenticationRequired(ValueError):
-    """Only a confirmed Strava sign-in page triggers this state."""
+    pass
 
 STRAVA_SYNC_LOCK = threading.Lock()
 STRAVA_STATUS_LOCK = threading.RLock()
@@ -2635,8 +3193,8 @@ def strava_connected():
 
 
 def strava_require_reconnect():
-    # Pause subsequent automatic checks across restarts, without deleting cookies,
-    # the local browser profile, imported rides, or the user's consent to reconnect.
+     
+     
     if STRAVA_STOP.is_set():return
     with db_connect() as con:
         still_connected=con.execute("SELECT value FROM app_settings WHERE key='strava_browser_connected'").fetchone()
@@ -2684,7 +3242,7 @@ def strava_status():
 
 
 def strava_browser_executable():
-    # Search standard desktop installation locations without installing software.
+     
     guesses = []
     if os.name == 'nt':
         for base in (os.environ.get('PROGRAMFILES'), os.environ.get('PROGRAMFILES(X86)'), os.environ.get('LOCALAPPDATA')):
@@ -2716,12 +3274,12 @@ def strava_start_browser(*, visible):
     startup = None
     if not visible:
         if os.name == 'nt':
-            # Keep the real desktop browser engine that preserves the verified
-            # sign-in session. Hide only LibreHeatmaps' dedicated browser.
+             
+             
             command += ['--start-minimized', '--window-position=-32000,-32000']
             startup = subprocess.STARTUPINFO()
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startup.wShowWindow = 0  # SW_HIDE
+            startup.wShowWindow = 0   
         else:
             command += ['--headless=new', '--disable-gpu']
     command.append(STRAVA_TRAINING_URL)
@@ -2755,16 +3313,16 @@ def strava_start_browser(*, visible):
             raise ValueError('Could not start the dedicated Strava browser. Close other LibreHeatmaps Strava windows and try again')
         return proc, port
     except Exception:
-        # A browser startup failure must not leave a session/profile lock behind.
+         
         strava_end_browser(proc)
         raise
 
 
 
 def strava_hide_sync_browser(proc):
-    # The normal Chrome/Edge rendering engine keeps the working Strava session,
-    # but can ignore --start-minimized on navigation. Only hide HWNDs owned by
-    # our dedicated browser PID; never change the user's usual browser windows.
+     
+     
+     
     if os.name != 'nt':
         return
     try:
@@ -2782,22 +3340,22 @@ def strava_hide_sync_browser(proc):
             owner = wintypes.DWORD(0)
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
             if owner.value == proc.pid and user32.IsWindowVisible(hwnd):
-                user32.ShowWindowAsync(hwnd, 0)  # SW_HIDE
+                user32.ShowWindowAsync(hwnd, 0)   
             return 1
         callback = callback_type(hide_window)
         while proc.poll() is None:
             user32.EnumWindows(callback, 0)
             time.sleep(.12)
     except (AttributeError, OSError, TypeError, ValueError):
-        # A failure to hide the background window must not break GPS imports.
+         
         return
 
 def strava_end_browser(proc, *, graceful=False):
     global STRAVA_BROWSER_PROCESS
     if proc is not None and proc.poll() is None:
-        # CDP Browser.close requests a normal shutdown, but can return before
-        # Chromium has flushed its cookie database. On Windows, terminate()
-        # kills the process immediately and can lose the new Strava login.
+         
+         
+         
         if graceful:
             try:
                 proc.wait(timeout=8)
@@ -2815,8 +3373,8 @@ def strava_end_browser(proc, *, graceful=False):
 
 
 def strava_browser_target(port):
-    # Chrome may publish DevToolsActivePort before it creates the first page.
-    # Wait for the app's page rather than selecting an unrelated new-tab target.
+     
+     
     expected = urlparse(STRAVA_TRAINING_URL).hostname or ''
     expected_hosts={expected,'strava.com','www.strava.com'} if expected else set()
     deadline=time.monotonic()+12
@@ -2834,8 +3392,8 @@ def strava_browser_target(port):
                 actual=item.get('url','')
                 parsed=urlparse(actual)
                 if expected and parsed.hostname in expected_hosts:
-                    # Saved profiles can reopen more than one Strava tab. Never
-                    # attach to an older login tab when My Activities is open.
+                     
+                     
                     if parsed.path.rstrip('/')==urlparse(STRAVA_TRAINING_URL).path.rstrip('/'):
                         return url
                     if not strava_target:strava_target=url
@@ -2850,8 +3408,8 @@ def strava_browser_target(port):
 
 
 class StravaDevTools:
-    # Small RFC 6455 WebSocket client for desktop Chromium's local DevTools API.
-    # The application intentionally has no third-party Python dependencies.
+     
+     
     def __init__(self, ws_url):
         parsed = urlparse(ws_url)
         if parsed.scheme != 'ws' or parsed.hostname != '127.0.0.1' or not parsed.port:
@@ -2944,10 +3502,10 @@ def strava_signin_page(state):
 
 
 
-# The activity list is rendered asynchronously and may be paginated. Do not
-# interpret the first small batch of links as the complete newest-ten window.
-# Read only Strava's visible My Activities table, using its ordinary page UI;
-# never make private list/API requests or traverse another athlete's feed.
+ 
+ 
+ 
+ 
 STRAVA_PAGE_SCAN_JS = r'''(function(advance) {
   const table = [...document.querySelectorAll('table')].find(t =>
     t.querySelector('a[href*="/activities/"]'));
@@ -2991,9 +3549,9 @@ def strava_visible_activity_page(cdp, *, advance=False):
 
 
 def strava_extend_recent_activity_ids(cdp, initial_ids, *, target=25):
-    # The first four rows can appear while the table is still hydrating. Allow
-    # a brief settling window before asking Strava's own next-page control for
-    # older rows. Bound pagination to the requested recent 1–50 activity window.
+     
+     
+     
     found=list(dict.fromkeys(initial_ids))[:target]
     if len(found)>=target:return found
     last_change=time.monotonic()
@@ -3038,8 +3596,8 @@ def strava_recent_activity_ids(cdp, *, sign_in=False, target=None):
         target = 10 if sign_in else strava_recent_count()
     if type(target) is not int or not 1 <= target <= 50:
         raise ValueError('Strava recent activity count must be from 1 to 50')
-    # Only activity links visible on the user's own /athlete/training page are
-    # inspected. Do not use private endpoints, bulk crawl or scrape other riders.
+     
+     
     script = r'''JSON.stringify({href:location.href,ids:[...new Set(Array.from(document.querySelectorAll('a[href*="/activities/"]')).map(a=>{let m=a.href.match(/\/activities\/(\d+)/);return m?m[1]:null}).filter(Boolean))].slice(0,50),ready:document.readyState,password:[...document.querySelectorAll('input[type="password"]')].some(el=>el.getClientRects().length>0 && getComputedStyle(el).visibility!=='hidden')})'''
     deadline=time.monotonic()+(240 if sign_in else 35)
     last=None
@@ -3057,11 +3615,11 @@ def strava_recent_activity_ids(cdp, *, sign_in=False, target=None):
             if state.get('ids') and '/athlete/training' in url:
                 first=[int(v) for v in state['ids'] if isinstance(v,str) and v.isdecimal() and len(v)>=7][:target]
                 return first if sign_in or len(first)>=target else strava_extend_recent_activity_ids(cdp,first,target=target)
-            # Signing in and finding rides are separate operations. A user may
-            # have zero activities or Strava may render its activity list in a
-            # format the GPX scanner cannot recognize. Neither means the login
-            # failed. Verify that the account-only page stays loaded, then let
-            # the first sync report any activity-discovery problem separately.
+             
+             
+             
+             
+             
             parsed=urlparse(url) if isinstance(url,str) else urlparse('')
             on_account_page=(parsed.hostname in ('strava.com','www.strava.com')
                 and parsed.path.rstrip('/')=='/athlete/training'
@@ -3079,9 +3637,9 @@ def strava_recent_activity_ids(cdp, *, sign_in=False, target=None):
                     raise StravaReauthenticationRequired('Strava returned a login page even with the saved browser session. Select Reconnect Strava in Settings')
             else:
                 login_since=None
-            # Strava can finish OAuth/password sign-in on /dashboard instead of
-            # returning to /athlete/training. Follow the requested page once,
-            # only after reaching a non-login page on strava.com. Never loop.
+             
+             
+             
             if (sign_in and not returned_to_activities and parsed.hostname in ('strava.com','www.strava.com')
                     and '/athlete/training' not in parsed.path and not strava_signin_page(state)
                     and state.get('ready')=='complete'):
@@ -3092,9 +3650,9 @@ def strava_recent_activity_ids(cdp, *, sign_in=False, target=None):
                     returned_to_activities=True
             else:
                 on_other_strava_since=None
-            # Account sign-in may succeed with no recognizable activity links.
-            # The sync phase must report this separately and must never claim
-            # that new GPS rides were imported as a result of sign-in alone.
+             
+             
+             
         except (socket.timeout,TimeoutError):
             pass
         time.sleep(1.5)
@@ -3105,7 +3663,7 @@ def strava_recent_activity_ids(cdp, *, sign_in=False, target=None):
 
 
 def strava_download_gpx(cdp, activity_id, download_dir):
-    # Use Strava's normal website export. Do not access other athlete pages.
+     
     try:
         cdp.call('Browser.setDownloadBehavior',{'behavior':'allow','downloadPath':str(download_dir)})
     except ValueError:
@@ -3116,8 +3674,8 @@ def strava_download_gpx(cdp, activity_id, download_dir):
     existing={p.name for p in download_dir.iterdir()}
     try:
         result=cdp.call('Page.navigate',{'url':'https://www.strava.com/activities/{}/export_gpx'.format(activity_id)})
-        # Chrome may cancel the page navigation because the response is an
-        # attachment. That cancellation is normal when the GPX is downloading.
+         
+         
         error_text=str(result.get('errorText','')) if isinstance(result,dict) else ''
         if error_text and error_text!='net::ERR_ABORTED':
             raise ValueError('Strava GPX navigation failed: '+error_text[:100])
@@ -3128,8 +3686,8 @@ def strava_download_gpx(cdp, activity_id, download_dir):
     last_auth_probe=time.monotonic()
     while time.monotonic()<deadline:
         if STRAVA_STOP.is_set():raise ValueError('Strava was disconnected during download')
-        # A login redirect can happen between listing activities and exporting.
-        # Check the current page locally; no additional Strava requests are sent.
+         
+         
         if time.monotonic()-last_auth_probe>=3:
             last_auth_probe=time.monotonic()
             try:
@@ -3149,8 +3707,8 @@ def strava_download_gpx(cdp, activity_id, download_dir):
             file.unlink()
             return raw
         time.sleep(.3)
-    # A redirect to a sign-in page during an export means the saved session
-    # expired mid-check. Do not repeat the other downloads on a timer.
+     
+     
     try:
         state = cdp.evaluate("JSON.stringify({href:location.href,password:!!document.querySelector('input[type=\"password\"]')})")
         if isinstance(state, str) and strava_signin_page(json.loads(state)):
@@ -3161,7 +3719,7 @@ def strava_download_gpx(cdp, activity_id, download_dir):
 
 
 def strava_save_original(folder_name, activity_id, raw):
-    # Optional original-file retention only in the folder chosen by the user.
+     
     folder=Path(folder_name)
     if not folder.is_dir() or folder.is_symlink():raise ValueError('Your chosen activity folder is unavailable')
     target=folder/('{}_Strava.gpx'.format(activity_id))
@@ -3197,7 +3755,7 @@ def strava_connect_job():
         with db_connect() as con:
             con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('strava_browser_connected','1')")
             con.execute("DELETE FROM app_settings WHERE key=?", (STRAVA_RECONNECT_KEY,))
-        # Reserve the hourly timer so the scheduler cannot race the immediate check.
+         
         with STRAVA_SCHEDULE_LOCK:STRAVA_LAST_ATTEMPT_MONO=time.monotonic()
         connected_now=True
         with STRAVA_STATUS_LOCK:
@@ -3222,8 +3780,8 @@ def strava_connect_job():
 
 
 def strava_first_sync_after_connect():
-    # Chromium may hold its profile lock briefly after the interactive window
-    # closes. Allow that lock to settle before reopening the same profile.
+     
+     
     time.sleep(2)
     if not STRAVA_STOP.is_set() and strava_connected():
         strava_sync_job()
@@ -3237,11 +3795,11 @@ def strava_disconnect():
     with STRAVA_BROWSER_LOCK:
         proc=STRAVA_BROWSER_PROCESS
     if proc is not None:strava_end_browser(proc)
-    # Synchronize teardown so no ongoing task can reopen or rewrite the profile.
+     
     if not STRAVA_SYNC_LOCK.acquire(timeout=15):
         raise ValueError('Stopped Strava syncing. The browser session is still closing; please select Disconnect again to remove its files')
     try:
-        # Remove any late connection-state writes from a task being stopped.
+         
         with db_connect() as con:
             con.execute("DELETE FROM app_settings WHERE key IN ('strava_browser_connected',?)", (STRAVA_RECONNECT_KEY,))
         profile=strava_profile_path()
@@ -3293,17 +3851,17 @@ def strava_sync_job():
                         key=hashlib.sha256(('strava-gpx:{}:'.format(aid)).encode()+hashlib.sha256(raw).digest()).hexdigest()
                         outcome=insert_activity(con,'{}.gpx'.format(aid),key,io.BytesIO(raw),{})
                         if outcome=='added':added+=1
-                        elif outcome=='skipped':skipped+=1
+                        elif outcome in ('skipped','enriched'):skipped+=1
                         else:
                             failed+=1
                             failure_examples.append('Activity {}: the downloaded GPX has no usable GPS track'.format(aid))
-                        if folder_name and outcome in ('added','skipped'):
+                        if folder_name and outcome in ('added','skipped','enriched'):
                             target,_=strava_save_original(folder_name,aid,raw)
                             stat=target.stat()
                             con.execute('INSERT OR REPLACE INTO app_settings(key,value) VALUES (?,?)',(watch_seen_key(folder_name,target),'{}:{}'.format(stat.st_size,stat.st_mtime_ns)))
                             con.commit()
                     except StravaReauthenticationRequired:
-                        # An expired login is an account state, not a bad GPX.
+                         
                         raise
                     except Exception as exc:
                         failed+=1
@@ -3626,9 +4184,62 @@ def insights(params):
     }
 
 
+ 
+ 
+def calendar_overview(params):
+    year_text=params.get('year', [''])[0]
+    if len(year_text)!=4 or not year_text.isascii() or not year_text.isdecimal():
+        raise ValueError('Invalid calendar year')
+    year=int(year_text)
+    if not 1900 <= year <= 2100:raise ValueError('Calendar year outside supported range')
+    focus=params.get('focus',['cycling'])[0]
+    where,args=filter_query({'focus':[focus]})
+    criteria=(where+' AND ' if where else ' WHERE ')+'day>=? AND day<?'
+    with db_connect() as con:
+        rows=con.execute('SELECT day,COUNT(*),COALESCE(SUM(COALESCE(recorded_distance_m,distance_m)),0),COALESCE(SUM(moving_seconds),0) FROM activities'
+            +criteria+' GROUP BY day ORDER BY day',args+[f'{year:04d}-01-01',f'{year+1:04d}-01-01']).fetchall()
+        latest=con.execute('SELECT MAX(day) FROM activities'+where,args).fetchone()[0]
+    from datetime import date
+    days=[];months={f'{year:04d}-{m:02d}':{'count':0,'distance_m':0.0,'moving_seconds':0,'active_days':0} for m in range(1,13)}
+    for day,count,dist,seconds in rows:
+        if not isinstance(day,str) or len(day)!=10:continue
+        try:
+            if date.fromisoformat(day).isoformat()!=day:continue
+        except ValueError:continue
+        entry={'day':day,'count':int(count),'distance_m':round(float(dist or 0),1),'moving_seconds':int(seconds or 0)}
+        days.append(entry)
+        month=months[day[:7]];month['count']+=entry['count'];month['distance_m']+=entry['distance_m'];month['moving_seconds']+=entry['moving_seconds'];month['active_days']+=1
+    for month in months.values():month['distance_m']=round(month['distance_m'],1)
+    return {'year':year,'focus':focus,'days':days,'months':months,'latest_day':latest,'total_count':sum(m['count'] for m in months.values()),'total_distance_m':round(sum(m['distance_m'] for m in months.values()),1)}
+
+
+def calendar_day(params):
+    from datetime import date
+    day=params.get('day',[''])[0]
+    if not isinstance(day,str) or len(day)!=10:
+        raise ValueError('Invalid calendar day')
+    try:
+        if date.fromisoformat(day).isoformat()!=day:raise ValueError('Invalid calendar day')
+    except ValueError:raise ValueError('Invalid calendar day')
+    focus=params.get('focus',['cycling'])[0]
+    where,args=filter_query({'focus':[focus]})
+    criteria=(where+' AND ' if where else ' WHERE ')+'day=?'
+    with db_connect() as con:
+        total=con.execute('SELECT COUNT(*) FROM activities'+criteria,args+[day]).fetchone()[0]
+        rows=con.execute("SELECT id,name,COALESCE(sport,'Unknown'),COALESCE(recorded_distance_m,distance_m),moving_seconds,bike FROM activities"
+            +criteria+' ORDER BY id DESC LIMIT 120',args+[day]).fetchall()
+    return {'day':day,'focus':focus,'total':total,'truncated':total>len(rows),
+            'activities':[{'id':r[0],'name':r[1],'sport':r[2],'distance_m':r[3] or 0,'moving_seconds':r[4] or 0,'bike':r[5] or ''} for r in rows]}
+
 def filter_query(params, bounds=False):
     clauses = []
     values = []
+    focus=params.get('focus',['all'])[0]
+    if focus not in ('cycling','foot','all'):raise ValueError('Invalid activity focus')
+    if focus=='foot':
+        clauses.append("(lower(sport) LIKE '%run%' OR lower(sport) LIKE '%jog%' OR lower(sport) LIKE '%walk%' OR lower(sport) LIKE '%hik%' OR lower(sport) LIKE '%trek%')")
+    elif focus=='cycling':
+        clauses.append("(lower(sport) LIKE '%rid%' OR lower(sport) LIKE '%bik%' OR lower(sport) LIKE '%cycl%' OR lower(sport) LIKE '%velo%' OR sport IS NULL OR sport IN ('Unknown','Route'))")
     sport = params.get("sport", [""])[0].strip()[:100]
     if sport:
         clauses.append("sport=?")
@@ -3767,8 +4378,24 @@ def activity_preview(params):
         i += 1
     if last is not None and (not points or points[-1] != last):
         points.append(last)
+    peaks={}
+    with db_connect() as con:
+        saved=con.execute('SELECT payload FROM activity_telemetry WHERE activity_id=?',(int(identity),)).fetchone()
+    if saved:
+        try:
+            samples=json.loads(zlib.decompress(saved[0]))
+            for name,index in (('speed',3),('cadence',6)):
+                candidates=[(i,r) for i,r in enumerate(samples)
+                    if len(r)>index and type(r[index]) in (int,float) and math.isfinite(r[index]) and r[index]>=0
+                    and len(r)>2 and all(type(x) in (int,float) and math.isfinite(x) for x in r[:3])
+                    and -90<=r[1]<=90 and -180<=r[2]<=180]
+                if candidates:
+                    i,peak=max(candidates,key=lambda pair:pair[1][index])
+                    peaks[name]={'sample_index':i,'value':peak[index],'timestamp':peak[0],
+                                 'position':[round(peak[1],6),round(peak[2],6)]}
+        except (ValueError,TypeError,IndexError,zlib.error):pass
     flagged, approved, prefs = speed_review_snapshot()
-    return {"speed_review":{"active":bool(prefs['filter_speed_anomalies'] or prefs['filter_speed_smart']),
+    return {"peak_samples":peaks,"speed_review":{"active":bool(prefs['filter_speed_anomalies'] or prefs['filter_speed_smart']),
             "excluded":row[0] in flagged and row[0] not in approved,"approved":row[0] in approved,
             "reasons":flagged.get(row[0], [])},
             "id":row[0],"name":row[1],"sport":row[2],"day":row[3],
@@ -4174,10 +4801,83 @@ def create_view(params,cancelled=lambda:False):
     return encoded
 
 
-def timeline_summary():
+
+ 
+ 
+def place_lens(params):
+    try:
+        lat=float(params.get('lat',[''])[0]);lon=float(params.get('lon',[''])[0]);radius=float(params.get('radius_m',['250'])[0])
+    except (TypeError,ValueError,OverflowError):
+        raise ValueError('Invalid location or search radius')
+    if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(radius)) or not (-85<=lat<=85 and -180<=lon<=180 and 75<=radius<=1000):
+        raise ValueError('Place search requires valid coordinates and a 75–1000 m radius')
+    where,args=filter_query(params)
+     
+    lat_step=radius/110574.0
+    lon_step=radius/max(1000.0,111320.0*math.cos(math.radians(lat)))
+    south,north=lat-lat_step,lat+lat_step
+    if lon-lon_step<-180:
+        box='(east>=? OR west<=?)'; box_args=[lon-lon_step+360,lon+lon_step]
+    elif lon+lon_step>180:
+        box='(east>=? OR west<=?)'; box_args=[lon-lon_step,lon+lon_step-360]
+    else:
+        box='east>=? AND west<=?';box_args=[lon-lon_step,lon+lon_step]
+    where+=(' AND ' if where else ' WHERE ')+'north>=? AND south<=? AND ('+box+')'
+    query_args=args+[south,north]+box_args
+    scan_cap=300; point_cap=1_800_000
     with db_connect() as con:
-        rows=con.execute("SELECT substr(day,1,4),COUNT(*),SUM(COALESCE(recorded_distance_m,distance_m)),SUM(COALESCE(moving_seconds,0)) FROM activities WHERE day IS NOT NULL AND length(day)>=4 GROUP BY substr(day,1,4) ORDER BY 1").fetchall()
-    return {'years':[{'year':int(y),'activities':n,'distance_m':d or 0,'moving_seconds':t or 0} for y,n,d,t in rows if y and y.isdigit()]}
+        candidate_total=con.execute('SELECT COUNT(*) FROM activities'+where,query_args).fetchone()[0]
+        rows=con.execute('SELECT id,name,sport,day,COALESCE(recorded_distance_m,distance_m),coordinates FROM activities'+where+' ORDER BY day DESC,id DESC LIMIT ?',query_args+[scan_cap]).fetchall()
+    cos_lat=math.cos(math.radians(lat));r2=radius*radius
+    matches=[];points_scanned=0;budget_exceeded=False
+    def planar(coord):
+        delta=((coord[1]-lon+180)%360)-180
+        return delta*111320*cos_lat,(coord[0]-lat)*110574
+    for activity_id,name,sport,day,distance,compressed in rows:
+        nearest2=float('inf');previous=None;found=False
+        for coord in iter_coordinates(compressed):
+            points_scanned+=1
+            if points_scanned>point_cap:
+                budget_exceeded=True;break
+            if coord is None:
+                previous=None;continue
+            x,y=planar(coord);d2=x*x+y*y
+            if previous is not None:
+                ax,ay=previous;dx=x-ax;dy=y-ay;length=dx*dx+dy*dy
+                if length>0:
+                    t=max(0.,min(1.,-(ax*dx+ay*dy)/length))
+                    dx=ax+t*dx;dy=ay+t*dy
+                    d2=min(d2,dx*dx+dy*dy)
+            nearest2=min(nearest2,d2)
+            if nearest2<=r2:
+                found=True;break
+            previous=(x,y)
+        if found:
+            matches.append({'id':activity_id,'name':name,'sport':sport or 'Unknown','day':day,
+                            'distance_m':distance,'nearest_m':round(math.sqrt(nearest2))})
+        if budget_exceeded:break
+    dated=[a['day'] for a in matches if a['day']]
+     
+     
+    month_counts=Counter(day[:7] for day in dated
+                         if isinstance(day,str) and re.match(r'^\d{4}-(?:0[1-9]|1[0-2])(?:-|$)',day))
+    limited=(candidate_total>len(rows) or budget_exceeded)
+    return {'latitude':round(lat,6),'longitude':round(lon,6),'radius_m':int(radius),
+            'matched_activities':len(matches),'candidate_activities':candidate_total,
+            'scanned_activities':len(rows) if not budget_exceeded else None,
+            'limited':limited,'first_visit':min(dated) if dated else None,'last_visit':max(dated) if dated else None,
+            'activities':matches[:24], 'year_counts':dict(sorted(Counter(day[:4] for day in dated).items())), 'month_counts':dict(sorted(month_counts.items())), 'point_budget_reached':budget_exceeded,
+            'method':'GPS track proximity, not device-location accuracy'}
+
+def timeline_summary(params=None):
+    where,args=filter_query({'focus':(params or {}).get('focus',['all'])})
+    where+=(' AND ' if where else ' WHERE ')+"day IS NOT NULL AND length(day)>=4"
+    with db_connect() as con:
+        rows=con.execute("SELECT substr(day,1,4),COUNT(*),SUM(COALESCE(recorded_distance_m,distance_m)),SUM(COALESCE(moving_seconds,0)) FROM activities"+where+" GROUP BY substr(day,1,4) ORDER BY 1",args).fetchall()
+    with db_connect() as con:
+        months=con.execute("SELECT substr(day,1,7),COUNT(*) FROM activities"+where+" AND length(day)>=7 GROUP BY substr(day,1,7) ORDER BY 1",args).fetchall()
+    return {'years':[{'year':int(y),'activities':n,'distance_m':d or 0,'moving_seconds':t or 0} for y,n,d,t in rows if y and y.isdigit()],
+            'months':[{'month':m,'activities':n} for m,n in months if len(m)==7 and m[4]=='-' and m[:4].isdigit() and m[5:].isdigit() and 1<=int(m[5:])<=12]}
 
 
 def compare_options(params):
@@ -4191,11 +4891,11 @@ def compare_options(params):
         raise ValueError('Invalid comparison offset')
     if offset<0 or offset>1000000:
         raise ValueError('Invalid comparison offset')
-    where=" WHERE (name LIKE ? ESCAPE '\\' OR day LIKE ? ESCAPE '\\')" if query else ''
-    args=[]
+    where,args=filter_query({'focus':params.get('focus',['all'])})
     if query:
         term='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
-        args=[term,term]
+        where+=(' AND ' if where else ' WHERE ')+"(name LIKE ? ESCAPE '\\' OR day LIKE ? ESCAPE '\\')"
+        args.extend((term,term))
     order='day DESC,id DESC' if direction=='newest' else '(day IS NULL),day ASC,id ASC'
     with db_connect() as con:
         total=con.execute('SELECT COUNT(*) FROM activities'+where,args).fetchone()[0]
@@ -4270,12 +4970,14 @@ def duplicate_library_scan():
                             'median_route_offset_m':round(sorted(distances)[len(distances)//2])})
             if len(matches)>=250:break
         if len(matches)>=250:break
-    return {'pairs':matches,'archived':archived,'activity_count':total,'truncated':len(matches)>=250,
+    with db_connect() as con: combined_sources=source_version_review(con)
+    return {'pairs':matches,'archived':archived,'combined_sources':combined_sources,'activity_count':total,'truncated':len(matches)>=250,
             'compared':len(prepared),'warning':'This scan supports 30,000 activities at a time; archived items remain restorable.' if total>30000 else '',
             'message':'Only very close timestamped GPS recordings are suggested. Inspect each pair before archiving.'}
 
 
 def duplicate_library_action(action):
+    if isinstance(action,dict) and action.get('action')=='choose_sources':return choose_activity_sources(action)
     if not isinstance(action,dict) or action.get('action') not in ('archive','restore'):
         raise ValueError('Invalid duplicate action')
     with STATE_LOCK:
@@ -4297,6 +4999,8 @@ def duplicate_library_action(action):
                 if not original or not retained:raise ValueError('Activity changed; please scan again')
                 if con.execute('SELECT 1 FROM activity_overrides WHERE activity_id=?',(remove,)).fetchone() or con.execute('SELECT 1 FROM activity_route_repairs WHERE activity_id=?',(remove,)).fetchone():
                     raise ValueError('This recording has reviewed edits. Restore the original details and GPS track before archiving it as a duplicate')
+                seed_source_version(con,keep)
+                seed_source_version(con,remove)
                 raw=dict(original)
                 coords=raw.pop('coordinates')
                 telemetry=con.execute('SELECT payload,sample_count FROM activity_telemetry WHERE activity_id=?',(remove,)).fetchone()
@@ -4306,6 +5010,13 @@ def duplicate_library_action(action):
                 con.execute('DELETE FROM activity_telemetry WHERE activity_id=?',(remove,))
                 con.execute('DELETE FROM speed_filter_exceptions WHERE activity_id=?',(remove,))
                 con.execute('DELETE FROM heatmap_track_cache WHERE activity_id=?',(remove,))
+                for row in con.execute('SELECT source_key,label,provider,fields_json,coordinates,route_stats,telemetry,sample_count FROM activity_source_versions WHERE activity_id=?',(remove,)).fetchall():
+                    con.execute('INSERT OR IGNORE INTO activity_source_versions(activity_id,source_key,label,provider,fields_json,coordinates,route_stats,telemetry,sample_count) VALUES(?,?,?,?,?,?,?,?,?)',
+                                (keep,)+tuple(row))
+                con.execute('DELETE FROM activity_source_versions WHERE activity_id=?',(remove,))
+                con.execute('DELETE FROM activity_source_choices WHERE activity_id=?',(remove,))
+                con.execute('DELETE FROM activity_source_baselines WHERE activity_id=?',(remove,))
+                apply_global_source_preferences(con,keep)
                 con.execute('DELETE FROM activities WHERE id=?',(remove,))
                 archive_id=cur.lastrowid
             clear_render_caches()
@@ -4350,8 +5061,11 @@ def ride_telemetry(params):
 def yearly_review(params):
     year=params.get('year',[''])[0]
     if len(year)!=4 or not year.isascii() or not year.isdecimal() or not 1980<=int(year)<=2200:raise ValueError('Select a valid year')
+    where,args=filter_query({'focus':params.get('focus',['all'])})
+    where+=(' AND ' if where else ' WHERE ')+'day>=? AND day<?'
+    args.extend((year,str(int(year)+1)))
     with db_connect() as con:
-        rows=con.execute('SELECT id,name,day,COALESCE(recorded_distance_m,distance_m),moving_seconds,elevation_m,bike,sport FROM activities WHERE day>=? AND day<? ORDER BY day,id',(year, str(int(year)+1))).fetchall()
+        rows=con.execute('SELECT id,name,day,COALESCE(recorded_distance_m,distance_m),moving_seconds,elevation_m,bike,sport FROM activities'+where+' ORDER BY day,id',args).fetchall()
     if not rows:return {'year':int(year),'activities':0}
     from collections import Counter
     bikes=Counter(r[6] for r in rows if r[6]);months=Counter(r[2][:7] for r in rows if r[2]);best=max(rows,key=lambda r:r[3] or 0)
@@ -4444,17 +5158,17 @@ def export_gpx(handler, params):
     handler.wfile.write(b'</gpx>\n')
 
 
-PAGE = '''<!doctype html>
+PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LibreHeatmaps</title>
 <style>
-*{box-sizing:border-box}body{margin:0;overflow:hidden}button,input,select{font:inherit}button{cursor:pointer}select,input[type=date],input[type=search],#settingsDialog input[type=number]{padding:9px;border:1px solid #46345f;color:#f4efff;border-radius:9px;min-width:0}input[type=range]{width:100%;accent-color:#b993ff}label{display:flex;align-items:center;gap:8px}small,.muted{color:#9cadc2}h1{margin:0}h2{margin:0 0 10px}header{border-bottom:1px solid #38264f;display:flex;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center}.workspace{display:flex}aside{flex:none;overflow-y:auto;border-right:1px solid #38264f}section{border-bottom:1px solid #39284f}.field{display:flex;flex-direction:column;gap:7px;margin-top:12px}.field label{justify-content:space-between;font-weight:600;font-size:12px;color:#d7caeb}.field .range{display:flex;gap:12px;align-items:center}.field output{font-variant-numeric:tabular-nums;color:#b993ff;min-width:40px;text-align:right}.row{display:flex;gap:8px}.row>*{flex:1;min-width:0}.primary{font-weight:700}.subtle{background:transparent}.full{width:100%;margin-top:12px}.status{font-size:12px;color:#a8b9cb;line-height:1.5;margin-top:9px;white-space:pre-wrap;overflow-wrap:anywhere}.status.error{color:#ff9d9d}.stats{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.stat{background:#271a3d;border:1px solid #423052;padding:12px;border-radius:10px}.stat strong{display:block;font-size:20px;color:#fafafa;margin-bottom:4px}.stat span{color:#b1a2c7;font-size:11px}.toggle{justify-content:space-between;padding:8px 0;color:#d6e1ee}.toggle input{accent-color:#b993ff}.foot{line-height:1.5;font-size:11px;color:#a793bd}main{flex:1;min-width:0;position:relative;overflow:hidden;background:#110d1d}#tiles{position:absolute;inset:0;overflow:hidden}#tiles img{position:absolute;left:0;top:0;width:256px;height:256px;user-select:none;pointer-events:none}#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}#interaction{position:absolute;inset:0;cursor:grab;touch-action:none}#interaction:active{cursor:grabbing}.maptop{position:absolute;top:17px;left:18px;pointer-events:none;background:#160e27de;color:white}.maptop span{display:block}.tools{position:absolute;display:flex;flex-direction:column}.tools button{font-size:19px}.attribution{position:absolute;bottom:10px;right:12px;padding:5px 8px;border-radius:5px;font-size:11px;background:#180f28e0;color:#e0e8ef}.attribution a{color:#b993ff}.legend{position:absolute;bottom:16px;left:16px;background:#160e27d9;border-radius:11px;border:1px solid #45305b}.legend .bar{border-radius:9px;margin:8px 0}.empty{position:absolute;inset:0;display:flex;justify-content:center;align-items:center;pointer-events:none}.empty .panel{background:#201433ea;color:#ede3ff;border:1px solid #4b3567;border-radius:16px;padding:28px 30px;text-align:center;max-width:460px;box-shadow:0 15px 40px #0005}.empty strong{font-size:20px;display:block;margin-bottom:9px}.empty span{line-height:1.6;color:#c3b0dc}.hidden{display:none!important}#file{display:none}#busy{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#251736;border:1px solid #5b4178;color:#eee;border-radius:9px;padding:11px 15px;z-index:5}#dateRange{font-size:11px;color:#a995c1;margin-top:4px}@media(max-width:750px){.workspace{min-height:calc(100vh - 64px)}aside{border-right:0;border-bottom:1px solid #293749}}
+*{box-sizing:border-box}body{margin:0;overflow:hidden}button,input,select{font:inherit}button{cursor:pointer}select,input[type=date],input[type=search],#settingsDialog input[type=number]{padding:9px;border:1px solid #174C75;color:#E5EBE4;border-radius:9px;min-width:0}input[type=range]{width:100%;accent-color:#E5EBE4}label{display:flex;align-items:center;gap:8px}small,.muted{color:#9cadc2}h1{margin:0}h2{margin:0 0 10px}header{border-bottom:1px solid #174C75;display:flex;align-items:center;justify-content:space-between}header .brand{display:flex;align-items:center}.workspace{display:flex}aside{flex:none;overflow-y:auto;border-right:1px solid #174C75}section{border-bottom:1px solid #174C75}.field{display:flex;flex-direction:column;gap:7px;margin-top:12px}.field label{justify-content:space-between;font-weight:600;font-size:12px;color:#E5EBE4}.field .range{display:flex;gap:12px;align-items:center}.field output{font-variant-numeric:tabular-nums;color:#E5EBE4;min-width:40px;text-align:right}.row{display:flex;gap:8px}.row>*{flex:1;min-width:0}.primary{font-weight:700}.subtle{background:transparent}.full{width:100%;margin-top:12px}.status{font-size:12px;color:#a8b9cb;line-height:1.5;margin-top:9px;white-space:pre-wrap;overflow-wrap:anywhere}.status.error{color:#ff9d9d}.stats{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.stat{background:#092B49;border:1px solid #174C75;padding:12px;border-radius:10px}.stat strong{display:block;font-size:20px;color:#fafafa;margin-bottom:4px}.stat span{color:#A6C0CF;font-size:11px}.toggle{justify-content:space-between;padding:8px 0;color:#d6e1ee}.toggle input{accent-color:#E5EBE4}.foot{line-height:1.5;font-size:11px;color:#A6C0CF}main{flex:1;min-width:0;position:relative;overflow:hidden;background:#092B49}#tiles{position:absolute;inset:0;overflow:hidden}#tiles img{position:absolute;left:0;top:0;width:256px;height:256px;user-select:none;pointer-events:none}#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}#interaction{position:absolute;inset:0;cursor:grab;touch-action:none}#interaction:active{cursor:grabbing}.maptop{position:absolute;top:17px;left:18px;pointer-events:none;background:#092B49de;color:white}.maptop span{display:block}.tools{position:absolute;display:flex;flex-direction:column}.tools button{font-size:19px}.attribution{position:absolute;bottom:10px;right:12px;padding:5px 8px;border-radius:5px;font-size:11px;background:#092B49e0;color:#e0e8ef}.attribution a{color:#E5EBE4}.legend{position:absolute;bottom:16px;left:16px;background:#092B49d9;border-radius:11px;border:1px solid #174C75}.legend .bar{border-radius:9px;margin:8px 0}.empty{position:absolute;inset:0;display:flex;justify-content:center;align-items:center;pointer-events:none}.empty .panel{background:#092B49ea;color:#E5EBE4;border:1px solid #174C75;border-radius:16px;padding:28px 30px;text-align:center;max-width:460px;box-shadow:0 15px 40px #082C4B55}.empty strong{font-size:20px;display:block;margin-bottom:9px}.empty span{line-height:1.6;color:#E5EBE4}.hidden{display:none!important}#file{display:none}#busy{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#092B49;border:1px solid #174C75;color:#eee;border-radius:9px;padding:11px 15px;z-index:5}#dateRange{font-size:11px;color:#A6C0CF;margin-top:4px}@media(max-width:750px){.workspace{min-height:calc(100vh - 64px)}aside{border-right:0;border-bottom:1px solid #293749}}
 
-header .header-actions{display:flex;align-items:center}#shutdown{font-size:12px;padding:7px 10px;background:#20132f}#tileNotice{font-size:11px;line-height:1.45;padding:7px 2px 8px}.privacy-notice{color:#bea8d7}#tiles{pointer-events:none}.logo{filter:drop-shadow(0 0 10px #9c67ff55)}dialog{border:1px solid #604480;border-radius:18px;max-width:min(790px,94vw);max-height:88vh;width:790px;overflow-y:auto;padding:23px;box-shadow:0 20px 80px #080312aa}dialog::backdrop{backdrop-filter:blur(4px)}.dialog-head{display:flex;align-items:start;justify-content:space-between;gap:16px;margin-bottom:18px}.dialog-head h2{letter-spacing:normal;text-transform:none;margin-bottom:4px}.metric-grid{display:grid;gap:9px}.metric{background:#291b3e;border:1px solid #48315f;border-radius:12px;padding:16px 12px}.metric strong{display:block;font-size:21px;color:#ead9ff;letter-spacing:-.5px}.metric span{display:block;font-size:11px;color:#b7a5ce;margin-top:6px}.facts{display:grid;gap:12px}.sport-summary{display:grid;gap:10px}.sport-row{display:flex;justify-content:space-between;gap:12px;font-size:12px}.sport-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sport-row strong{color:#c9a8ff;font-variant-numeric:tabular-nums}#statAccuracy{font-size:11px;line-height:1.6}button:focus-visible{outline:2px solid #b993ff}@media(max-width:680px){.metric-grid{grid-template-columns:repeat(2,1fr)}header .brand small{display:none}header{padding:0 10px}h1{font-size:16px}}header{border-color:#302a43}aside{border-color:#353041}section{border-color:#342e41}button{background:#2a2436;border-color:#4c425b;color:#f4edf8}button:hover{background:#373049}.primary{background:#baa6d1;border-color:#baa6d1;color:#201a2b}.primary:hover{background:#cab6dc}select,input[type=date],input[type=search],#settingsDialog input[type=number]{background:#242031;border-color:#494051}input[type=range],.toggle input{accent-color:#ab91ca}.stat,.metric{background:#242033;border-color:#3e364b}.stat strong,.metric strong{color:#f7f2fc}.field output,.attribution a{color:#c6addf}.maptop,.legend{background:#171523ea;border-color:#4b3c60}.legend .bar{background:linear-gradient(90deg,#a470dc 0%,#e044bb 25%,#f44362 50%,#ff941f 75%,#fff3de 100%)}#tiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}dialog{background:#1d192b;border-color:#59496a}dialog::backdrop{background:#080710c9}.charts{margin-top:0}.stat-chart{display:grid;gap:10px;max-height:235px;overflow-y:auto}.chart-row{display:grid;grid-template-columns:67px 1fr 78px;gap:10px;align-items:center;font-size:11px}.chart-row>span{color:#c0b1d5;white-space:nowrap}.chart-row>strong{font-size:11px;color:#e3d2f6;text-align:right;white-space:nowrap}.chart-track{height:9px;border-radius:10px;background:#42394e;overflow:hidden}.chart-bar{height:100%;border-radius:10px;background:linear-gradient(90deg,#9675c5,#e285a7)}#tileNotice{color:#c6b8d4}#map.offline-dark{background:#11121b}#map.offline-light{background:#e7e5eb}
+header .header-actions{display:flex;align-items:center}#shutdown{font-size:12px;padding:7px 10px;background:#092B49}#tileNotice{font-size:11px;line-height:1.45;padding:7px 2px 8px}.privacy-notice{color:#E5EBE4}#tiles{pointer-events:none}.logo{filter:drop-shadow(0 0 10px #F4D35E55)}dialog{border:1px solid #174C75;border-radius:18px;max-width:min(790px,94vw);max-height:88vh;width:790px;overflow-y:auto;padding:23px;box-shadow:0 20px 80px #092B49aa}dialog::backdrop{backdrop-filter:blur(4px)}.dialog-head{display:flex;align-items:start;justify-content:space-between;gap:16px;margin-bottom:18px}.dialog-head h2{letter-spacing:normal;text-transform:none;margin-bottom:4px}.metric-grid{display:grid;gap:9px}.metric{background:#092B49;border:1px solid #174C75;border-radius:12px;padding:16px 12px}.metric strong{display:block;font-size:21px;color:#E5EBE4;letter-spacing:-.5px}.metric span{display:block;font-size:11px;color:#A6C0CF;margin-top:6px}.facts{display:grid;gap:12px}.sport-summary{display:grid;gap:10px}.sport-row{display:flex;justify-content:space-between;gap:12px;font-size:12px}.sport-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sport-row strong{color:#E5EBE4;font-variant-numeric:tabular-nums}#statAccuracy{font-size:11px;line-height:1.6}button:focus-visible{outline:2px solid #E5EBE4}@media(max-width:680px){.metric-grid{grid-template-columns:repeat(2,1fr)}header .brand small{display:none}header{padding:0 10px}h1{font-size:16px}}header{border-color:#174C75}aside{border-color:#174C75}section{border-color:#174C75}button{background:#092B49;border-color:#174C75;color:#E5EBE4}button:hover{background:#174C75}.primary{background:#E5EBE4;border-color:#E5EBE4;color:#092B49}.primary:hover{background:#E5EBE4}select,input[type=date],input[type=search],#settingsDialog input[type=number]{background:#092B49;border-color:#174C75}input[type=range],.toggle input{accent-color:#A6C0CF}.stat,.metric{background:#092B49;border-color:#174C75}.stat strong,.metric strong{color:#E5EBE4}.field output,.attribution a{color:#E5EBE4}.maptop,.legend{background:#092B49ea;border-color:#174C75}.legend .bar{background:linear-gradient(90deg,#F4D35E 0%,#F4D35E 25%,#F4D35E 50%,#ff941f 75%,#fff3de 100%)}#tiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}dialog{background:#092B49;border-color:#174C75}dialog::backdrop{background:#092B49c9}.charts{margin-top:0}.stat-chart{display:grid;gap:10px;max-height:235px;overflow-y:auto}.chart-row{display:grid;grid-template-columns:67px 1fr 78px;gap:10px;align-items:center;font-size:11px}.chart-row>span{color:#E5EBE4;white-space:nowrap}.chart-row>strong{font-size:11px;color:#E5EBE4;text-align:right;white-space:nowrap}.chart-track{height:9px;border-radius:10px;background:#174C75;overflow:hidden}.chart-bar{height:100%;border-radius:10px;background:linear-gradient(90deg,#A6C0CF,#F4D35E)}#tileNotice{color:#E5EBE4}#map.offline-dark{background:#082C4B}#map.offline-light{background:#E5EBE4}
 @media(max-width:680px){.chart-row{grid-template-columns:58px 1fr 64px}}
-header .logo{clip-path:none;object-fit:contain;background:none;flex:none;filter:none} .stats-cta,.stats-header{background:#8b72b3;color:#fff;border-color:#9a84b8;font-weight:700}.stats-cta:hover,.stats-header:hover{background:#9d87c4}.stats-header{font-size:12px;padding:8px 12px}button.primary:not(.stats-cta):not(.stats-header){background:#b5a3cd}section{padding-bottom:15px;margin-bottom:15px} .metric-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.weekday-chart{display:grid;gap:8px;margin-top:10px}.weekday-row{display:grid;grid-template-columns:55px 1fr 62px;gap:9px;align-items:center;font-size:11px}.weekday-row .chart-track{height:11px}#legendLabel{color:#c7b9d1}select#palette{width:100%}
- .settings-stack{display:grid;gap:5px}.settings-section{margin-bottom:5px;padding-bottom:17px}.settings-section h2{font-size:13px;letter-spacing:.07em}.settings-note{font-size:12px;line-height:1.55;margin:12px 0}.settings-actions{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #3e354b}.settings-actions strong{display:block;font-size:13px;color:#f0e7fc}.settings-actions small{display:block;max-width:460px;line-height:1.5;margin-top:5px;color:#b7a9c4}.settings-actions button{flex:none}.settings-status{min-height:18px;font-size:12px;color:#ccb6e7;white-space:pre-wrap}.settings-status.error{color:#ffa5a5}button.danger{border-color:#994d61;color:#ffc5cf;background:#3c202d}button.danger:hover{background:#532735}#openSettings{padding:8px 12px;font-size:12px}#settingsDialog .field select,#settingsDialog .field input[type=number]{max-width:100%;width:100%}#garminSyncCustom[hidden],#garminSyncCustomLabel[hidden]{display:none!important}@media(max-width:670px){.settings-actions{align-items:stretch;flex-direction:column}.settings-actions button{align-self:flex-start}}
-.bike-row{padding-left:16px;margin-left:9px;border-left:2px solid #655078;font-size:12px;color:#cdbed9}.bike-row strong{font-weight:600}.local-storage{padding:14px 0}.local-storage>strong{display:block;font-size:13px;margin-bottom:8px}.path-label{font-size:11px;color:#b8a9cb;margin-top:10px}.local-storage code{display:block;word-break:break-all;font-size:12px;line-height:1.5;padding:9px 10px;background:#171421;border:1px solid #42374f;border-radius:7px;color:#e2d4f0}#releaseLink{display:inline-block;margin-top:8px;color:#cdb4f0}#updateStatus{margin-top:8px}#settingsDialog .settings-stack{display:block}
-.anomaly-setting{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;font-size:13px;color:#e6d7f3;cursor:pointer}.anomaly-setting input{accent-color:#b779ec;width:19px;height:19px}
+header .logo{clip-path:none;object-fit:contain;background:none;flex:none;filter:none} .stats-cta,.stats-header{background:#A6C0CF;color:#fff;border-color:#A6C0CF;font-weight:700}.stats-cta:hover,.stats-header:hover{background:#A6C0CF}.stats-header{font-size:12px;padding:8px 12px}button.primary:not(.stats-cta):not(.stats-header){background:#A6C0CF}section{padding-bottom:15px;margin-bottom:15px} .metric-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.weekday-chart{display:grid;gap:8px;margin-top:10px}.weekday-row{display:grid;grid-template-columns:55px 1fr 62px;gap:9px;align-items:center;font-size:11px}.weekday-row .chart-track{height:11px}#legendLabel{color:#E5EBE4}select#palette{width:100%}
+ .settings-stack{display:grid;gap:5px}.settings-section{margin-bottom:5px;padding-bottom:17px}.settings-section h2{font-size:13px;letter-spacing:.07em}.settings-note{font-size:12px;line-height:1.55;margin:12px 0}.settings-actions{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #174C75}.settings-actions strong{display:block;font-size:13px;color:#E5EBE4}.settings-actions small{display:block;max-width:460px;line-height:1.5;margin-top:5px;color:#A6C0CF}.settings-actions button{flex:none}.settings-status{min-height:18px;font-size:12px;color:#E5EBE4;white-space:pre-wrap}.settings-status.error{color:#ffa5a5}button.danger{border-color:#507995;color:#E5EBE4;background:#092B49}button.danger:hover{background:#174C75}#openSettings{padding:8px 12px;font-size:12px}#settingsDialog .field select,#settingsDialog .field input[type=number]{max-width:100%;width:100%}#garminSyncCustom[hidden],#garminSyncCustomLabel[hidden]{display:none!important}@media(max-width:670px){.settings-actions{align-items:stretch;flex-direction:column}.settings-actions button{align-self:flex-start}}
+.bike-row{padding-left:16px;margin-left:9px;border-left:2px solid #507995;font-size:12px;color:#E5EBE4}.bike-row strong{font-weight:600}.local-storage{padding:14px 0}.local-storage>strong{display:block;font-size:13px;margin-bottom:8px}.path-label{font-size:11px;color:#A6C0CF;margin-top:10px}.local-storage code{display:block;word-break:break-all;font-size:12px;line-height:1.5;padding:9px 10px;background:#092B49;border:1px solid #174C75;border-radius:7px;color:#E5EBE4}#releaseLink{display:inline-block;margin-top:8px;color:#E5EBE4}#updateStatus{margin-top:8px}#settingsDialog .settings-stack{display:block}
+.anomaly-setting{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;font-size:13px;color:#E5EBE4;cursor:pointer}.anomaly-setting input{accent-color:#F4D35E;width:19px;height:19px}
 .analytics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.analytics-plot{min-height:200px;overflow:hidden}.analytics-plot svg{display:block;width:100%;height:210px}@media(max-width:850px){.analytics-grid{grid-template-columns:minmax(0,1fr)}}
 .palette-preview{height:22px;margin-top:10px;border-radius:6px;border:1px solid #665474;background:linear-gradient(90deg,#a16cdf,#df398f,#f34547,#ff8d23,#fff3dd)}.palette-ends{display:flex;justify-content:space-between;font-size:11px;color:#b9a9cb;margin-top:5px}#releaseLink[hidden]{display:none!important}#settingsDialog{padding:0;overflow:auto;scrollbar-gutter:stable}#settingsDialog>.dialog-head{position:sticky;top:0;z-index:4;align-items:center;margin:0;border-bottom:1px solid #4e3e61;box-shadow:0 3px 10px #09061255}#settingsDialog .settings-close{display:grid;place-items:center;flex:none;border-radius:10px;line-height:1;color:#f5edf8;background:#33263f}#settingsDialog .settings-close:hover{background:#51395b}#settingsDialog .settings-savebar{position:sticky;bottom:0;z-index:4;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #4e3e61;box-shadow:0 -3px 12px #09061255}.settings-save-state{font-size:12px;color:#bcb2c8}.settings-save-state.dirty{color:#ffcb79}.settings-save-state.error{color:#ff9eaa}#saveSettings{min-width:142px;font-weight:750}#saveSettings:disabled{opacity:.55;cursor:default}@media(max-width:560px){#settingsDialog>.dialog-head,#settingsDialog>.settings-stack,#settingsDialog .settings-savebar{padding-left:14px;padding-right:14px}}
 aside .status,aside .foot,#dateRange{font-size:13px}
@@ -4468,16 +5182,16 @@ aside .status,aside .foot,#dateRange{font-size:13px}
 @media(max-width:820px){#statsDialog{padding:18px 16px}#statsDialog .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#statsDialog .chart-row{grid-template-columns:85px minmax(50px,1fr) 73px}}
 @media(max-width:470px){#statsDialog .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#statsDialog .metric strong{font-size:20px}}
 
-:root{font-size:16px;line-height:1.5;font-weight:400;color:#efeaf5;background:#10101c;--lh-text:#efeaf5;--lh-muted:#c2b8d0;--lh-border:#494053;--lh-surface:#242033;--lh-accent:#bca5de}
+:root{font-size:16px;line-height:1.5;font-weight:400;color:#E5EBE4;background:#092B49;--lh-text:#E5EBE4;--lh-muted:#E5EBE4;--lh-border:#174C75;--lh-surface:#092B49;--lh-accent:#E5EBE4}
 body{font-size:16px}
 button,input,select{font-family:inherit;font-size:15px;line-height:1.35}
-button{padding:10px 14px;border:1px solid #554a64;border-radius:10px;font-weight:600;letter-spacing:0}
-button:hover:not(:disabled){border-color:#88739e}
+button{padding:10px 14px;border:1px solid #174C75;border-radius:10px;font-weight:600;letter-spacing:0}
+button:hover:not(:disabled){border-color:#507995}
 button:disabled{cursor:not-allowed;opacity:.56}
 input[type=date],input[type=search],select{min-height:42px;padding:9px 11px;font-size:15px;border-radius:10px}
-button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #c6a1ec;outline-offset:2px}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #E5EBE4;outline-offset:2px}
 h1{font-size:23px;font-weight:700;line-height:1.15;letter-spacing:-.45px}
-h2{font-size:16px;line-height:1.35;font-weight:650;letter-spacing:0;text-transform:none;color:#f2ecfa}
+h2{font-size:16px;line-height:1.35;font-weight:650;letter-spacing:0;text-transform:none;color:#E5EBE4}
 small,.muted,.foot{font-size:14px;line-height:1.55;color:var(--lh-muted)}
 header{min-height:76px;height:76px;padding:0 22px;gap:16px}
 header .brand{gap:14px}
@@ -4485,14 +5199,14 @@ header .logo{width:51px;height:51px}
 header .brand small{display:block;margin-top:4px}
 header .header-actions{flex:0 0 auto;flex-wrap:wrap;justify-content:flex-end}
 header .header-actions button,header .header-actions #openSettings,header .header-actions #shutdown,header .header-actions .stats-header{font-size:15px;line-height:1.2;min-height:42px;padding:10px 15px;font-weight:600;border-radius:10px}
-header .header-actions #shutdown{background:#242033;border-color:#554a64;color:#ddd3e9}
-header .header-actions .stats-header{background:#bca5de;border-color:#c8b4e6;color:#21182e}
-header .header-actions .stats-header:hover{background:#ccb7ea}
+header .header-actions #shutdown{background:#092B49;border-color:#174C75;color:#E5EBE4}
+header .header-actions .stats-header{background:#E5EBE4;border-color:#E5EBE4;color:#092B49}
+header .header-actions .stats-header:hover{background:#E5EBE4}
 .workspace{height:calc(100vh - 76px)}
 aside{width:324px;padding:20px 18px 30px}
 aside section{padding-bottom:22px;margin-bottom:22px}
 aside h2{margin-bottom:10px}
-aside .field label{font-size:14px;font-weight:600;color:#e2d7ef}
+aside .field label{font-size:14px;font-weight:600;color:#E5EBE4}
 aside .field{gap:8px;margin-top:15px}
 aside .status,aside .foot,aside #dateRange,#dateRange,aside .muted,#tileNotice{font-size:14px;line-height:1.55}
 aside .stats{gap:10px}
@@ -4504,7 +5218,7 @@ aside .toggle input{width:18px;height:18px;flex-shrink:0}
 aside .row{gap:9px}
 aside .row button{padding:10px 7px;min-width:0}
 .maptop{padding:13px 16px;font-size:15px;font-weight:650;line-height:1.3;border-radius:12px;max-width:min(500px,calc(100% - 100px))}
-.maptop span{line-height:1.4;color:#d3c9df;font-weight:400;margin-top:5px}
+.maptop span{line-height:1.4;color:#E5EBE4;font-weight:400;margin-top:5px}
 .tools{top:18px;right:18px;z-index:2}
 .tools button{min-width:46px;padding:0;display:flex;align-items:center;justify-content:center;line-height:0}
 .tools button svg{display:block;width:22px;height:22px;flex:none;stroke:currentColor;stroke-width:2.4;fill:none;stroke-linecap:round;stroke-linejoin:round}
@@ -4521,7 +5235,7 @@ dialog h2{font-size:17px;letter-spacing:0;text-transform:none}
 #statsDialog .metric-grid{gap:12px}
 #statsDialog .metric{padding:17px 15px;border-radius:12px}
 #statsDialog .metric strong{font-size:25px;line-height:1.15;letter-spacing:-.35px;overflow-wrap:anywhere}
-#statsDialog .metric span{font-size:14px;font-weight:500;line-height:1.4;margin-top:9px;color:#d0c4dc}
+#statsDialog .metric span{font-size:14px;font-weight:500;line-height:1.4;margin-top:9px;color:#E5EBE4}
 #statsDialog .sport-row,#statsDialog .bike-row{font-size:15px;line-height:1.45;gap:14px}
 #statsDialog .sport-row strong{min-width:0;text-align:right}
 #statsDialog .bike-row{padding-left:15px}
@@ -4544,7 +5258,7 @@ dialog h2{font-size:17px;letter-spacing:0;text-transform:none}
 #settingsDialog .settings-note,#settingsDialog .muted{font-size:14px;line-height:1.6}
 #settingsDialog .settings-actions{gap:20px;padding:17px 0}
 #settingsDialog .settings-actions strong,#settingsDialog .local-storage>strong{font-size:15px;font-weight:650}
-#settingsDialog .settings-actions small{font-size:14px;line-height:1.55;margin-top:6px;color:#c1b6d0}
+#settingsDialog .settings-actions small{font-size:14px;line-height:1.55;margin-top:6px;color:#E5EBE4}
 #settingsDialog .settings-status,#settingsDialog .settings-save-state{font-size:14px;line-height:1.5}
 #settingsDialog .path-label,#settingsDialog .palette-ends{font-size:14px}
 #settingsDialog .local-storage code{line-height:1.55}
@@ -4583,24 +5297,24 @@ dialog h2{font-weight:600}
 button{vertical-align:middle}
 header .header-actions button,aside button,dialog button,#map button{display:inline-flex;align-items:center;justify-content:center;text-align:center}
 button svg{flex-shrink:0;vertical-align:middle}
-#mapCaption .map-caption-title{display:block;font-size:15px;font-weight:650;color:#eee7f9;line-height:1.3}
+#mapCaption .map-caption-title{display:block;font-size:15px;font-weight:650;color:#E5EBE4;line-height:1.3}
 #mapCaption #mapDetail{font-weight:400}
-#mapCaption #clearRide{margin-top:12px;min-height:36px;font-size:13px;font-weight:650;padding:7px 10px;border:1px solid #806e9d;color:#f5ebff;background:#302443;border-radius:9px}
+#mapCaption #clearRide{margin-top:12px;min-height:36px;font-size:13px;font-weight:650;padding:7px 10px;border:1px solid #507995;color:#E5EBE4;background:#174C75;border-radius:9px}
 #statsDialog .ride-list{margin-top:15px}
 #statsDialog .ride-list-item{width:100%;justify-content:center;overflow-wrap:anywhere}
-#statsDialog .ride-list-item strong{color:#f3eafb}
+#statsDialog .ride-list-item strong{color:#E5EBE4}
 #statsDialog .ride-list-item span{font-weight:400}
 #ridePreviewDialog{width:min(760px,96vw);max-width:min(760px,96vw);max-height:calc(100vh - 40px);padding:24px;overflow-y:auto}
 #ridePreviewDialog .dialog-head{display:flex;align-items:center;gap:16px;margin-bottom:15px}
 #ridePreviewDialog .dialog-head h2{letter-spacing:0;text-transform:none;overflow-wrap:anywhere}
 #ridePreviewDialog .dialog-head button{flex:none}
-#ridePreviewDialog .ride-preview-map{height:320px;max-height:42vh;background:#151522;border-radius:13px;border:1px solid #514466;position:relative;overflow:hidden}
+#ridePreviewDialog .ride-preview-map{height:320px;max-height:42vh;background:#092B49;border-radius:13px;border:1px solid #174C75;position:relative;overflow:hidden}
 #ridePreviewCanvas{width:100%;height:100%;display:block}
-#ridePreviewDialog .ride-preview-badge{position:absolute;top:13px;left:13px;font-weight:600;line-height:1.3;background:#272037dc;border:1px solid #574766;border-radius:8px;padding:7px 10px;pointer-events:none}
+#ridePreviewDialog .ride-preview-badge{position:absolute;top:13px;left:13px;font-weight:600;line-height:1.3;background:#092B49dc;border:1px solid #174C75;border-radius:8px;padding:7px 10px;pointer-events:none}
 #ridePreviewDialog .ride-preview-details{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:14px 0}
-#ridePreviewDialog .ride-preview-detail{border:1px solid #493a5b;min-width:0;overflow-wrap:anywhere}
+#ridePreviewDialog .ride-preview-detail{border:1px solid #174C75;min-width:0;overflow-wrap:anywhere}
 #ridePreviewDialog .ride-preview-detail span{display:block;line-height:1.4;margin-bottom:6px}
-#ridePreviewDialog .ride-preview-detail strong{display:block;line-height:1.3;color:#f3ecfa}
+#ridePreviewDialog .ride-preview-detail strong{display:block;line-height:1.3;color:#E5EBE4}
 #ridePreviewDialog .ride-preview-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end;margin:16px 0 8px}
 #ridePreviewDialog #ridePreviewStatus{line-height:1.45}
 @media(max-width:700px){#ridePreviewDialog{padding:16px}#ridePreviewDialog .dialog-head{flex-wrap:wrap}#ridePreviewDialog .ride-preview-map{height:245px}#ridePreviewDialog .ride-preview-details{grid-template-columns:repeat(2,minmax(0,1fr))}#ridePreviewDialog .ride-preview-actions{justify-content:stretch}#ridePreviewDialog .ride-preview-actions button{flex:1}}
@@ -4608,92 +5322,94 @@ button svg{flex-shrink:0;vertical-align:middle}
 #statsDialog .stats-tabs{grid-template-columns:repeat(4,minmax(0,1fr))}
 #statsDialog .stats-tabs button{min-width:0;font-size:15px}
 #statsDialog .stats-tabs button[aria-selected="true"]{color:#fff}
-#statsDialog .stats-tabs button:hover:not([aria-selected="true"]){background:#30283d;color:#fff}
+#statsDialog .stats-tabs button:hover:not([aria-selected="true"]){background:#092B49;color:#fff}
 #statsDialog .stats-panel{min-width:0}
 #statsDialog #metricGrid .metric span{margin-top:8px}
-.stats-panel p.muted{font-size:14px;line-height:1.5;color:#c9bed7;margin:0 0 14px}
+.stats-panel p.muted{font-size:14px;line-height:1.5;color:#E5EBE4;margin:0 0 14px}
 #statsDialog .stats-panel .charts{margin:0 0 18px}
 #statsDialog .stats-footer{padding-top:10px}
-#statsDialog .stats-accuracy summary{color:#d1c5df}
+#statsDialog .stats-accuracy summary{color:#E5EBE4}
 #statsDialog #statAccuracy{background:transparent;border:0;padding:10px 0 0;margin:0}
-#ridePreviewDialog .ride-preview-map #ridePreviewTiles{position:absolute;inset:0;overflow:hidden;z-index:0;background:#161621}
+#ridePreviewDialog .ride-preview-map #ridePreviewTiles{position:absolute;inset:0;overflow:hidden;z-index:0;background:#092B49}
 #ridePreviewDialog .ride-preview-map #ridePreviewTiles img{position:absolute;left:0;top:0;width:256px;height:256px;pointer-events:none;user-select:none;filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}
 #ridePreviewDialog #ridePreviewCanvas{position:absolute;inset:0;z-index:1;pointer-events:none}
+
+.v123-source-card{margin:10px 0}.v123-source-card summary{font-weight:700;cursor:pointer;padding:4px}.v123-source-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:12px 0}.v123-source-field{display:flex;flex-direction:column;gap:5px;font-size:12px}.v123-source-field select{width:100%;min-width:0}.v123-peak-jump{display:block;margin-top:5px;font-size:11px;line-height:1.35;padding:5px 8px;cursor:pointer;border:1px solid #A6C0CF;background:#174C75;color:#E5EBE4;border-radius:7px;text-align:left}.v123-peak-jump:hover,.v123-peak-jump:focus-visible{background:#174C75;outline-offset:2px}
 #ridePreviewDialog #telemetryMarkerCanvas{position:absolute;inset:0;z-index:2;width:100%;height:100%;pointer-events:none}
 #ridePreviewDialog .ride-preview-badge{z-index:2}
-#ridePreviewDialog .ride-preview-attribution{position:absolute;bottom:7px;right:9px;z-index:2;padding:4px 7px;background:#15131fdc;border-radius:5px;color:#e5dbf0;font-size:11px;line-height:1.2;text-decoration:none}
+#ridePreviewDialog .ride-preview-attribution{position:absolute;bottom:7px;right:9px;z-index:2;padding:4px 7px;background:#092B49dc;border-radius:5px;color:#E5EBE4;font-size:11px;line-height:1.2;text-decoration:none}
 #ridePreviewDialog .ride-preview-attribution[hidden]{display:none}
 #welcomeDialog{width:min(530px,94vw);max-width:94vw;max-height:calc(100vh - 30px);padding:29px;border-radius:18px;line-height:1.6}
-#welcomeDialog .welcome-icon{width:49px;height:49px;border:1px solid #8366a3;background:#433257;border-radius:13px;display:grid;place-items:center;font-size:29px;margin-bottom:17px}
+#welcomeDialog .welcome-icon{width:49px;height:49px;border:1px solid #507995;background:#174C75;border-radius:13px;display:grid;place-items:center;font-size:29px;margin-bottom:17px}
 #welcomeDialog h2{font-size:25px;line-height:1.2;font-weight:700;letter-spacing:-.3px;text-transform:none;margin:0 0 10px}
-#welcomeDialog p{font-size:16px;line-height:1.6;color:#d7cbdf;margin:0 0 17px}
-#welcomeDialog .welcome-steps{padding:15px 16px;border:1px solid #534462;border-radius:11px;background:#262034;display:grid;gap:6px;margin:13px 0 15px}
-#welcomeDialog .welcome-steps strong{font-size:15px;color:#f3eaff}
-#welcomeDialog .welcome-steps span{font-size:15px;line-height:1.55;color:#d4c8de}
-#welcomeDialog .welcome-privacy{color:#b6aac4}
+#welcomeDialog p{font-size:16px;line-height:1.6;color:#E5EBE4;margin:0 0 17px}
+#welcomeDialog .welcome-steps{padding:15px 16px;border:1px solid #174C75;border-radius:11px;background:#092B49;display:grid;gap:6px;margin:13px 0 15px}
+#welcomeDialog .welcome-steps strong{font-size:15px;color:#E5EBE4}
+#welcomeDialog .welcome-steps span{font-size:15px;line-height:1.55;color:#E5EBE4}
+#welcomeDialog .welcome-privacy{color:#A6C0CF}
 #welcomeDialog .welcome-actions{display:flex;gap:12px;justify-content:flex-end;flex-wrap:wrap}
 #welcomeDialog .welcome-actions button{min-height:44px;font-size:15px;padding:10px 16px}
 @media(max-width:760px){#statsDialog .stats-tabs{top:88px}#statsDialog #metricGrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:520px){#statsDialog .stats-tabs{gap:3px;top:88px;padding:4px}#statsDialog .stats-tabs button{min-height:43px;padding:8px 3px;font-size:13px}#statsDialog #metricGrid{grid-template-columns:repeat(2,minmax(0,1fr))}#statsDialog #metricGrid .metric{padding:15px 12px;min-height:95px}#statsDialog #metricGrid .metric strong{font-size:24px}#statsDialog #metricGrid .metric span{font-size:14px}#welcomeDialog{padding:22px}#welcomeDialog .welcome-actions{flex-direction:column-reverse}#welcomeDialog .welcome-actions button{width:100%}}
 
-#statsDialog{width:min(1320px,calc(100vw - 36px));max-width:1320px;height:min(870px,calc(100dvh - 34px));max-height:calc(100dvh - 34px);padding:0;overflow:hidden;border:1px solid #51445f;border-radius:18px;background:#181521;color:#f3edf8;scrollbar-gutter:auto}
+#statsDialog{width:min(1320px,calc(100vw - 36px));max-width:1320px;height:min(870px,calc(100dvh - 34px));max-height:calc(100dvh - 34px);padding:0;overflow:hidden;border:1px solid #174C75;border-radius:18px;background:#092B49;color:#E5EBE4;scrollbar-gutter:auto}
 #statsDialog:not([open]){display:none!important}
 #statsDialog[open]{display:flex;flex-direction:column}
 #statsDialog .insights-shell{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}
-#statsDialog .insights-topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex:none;padding:19px 27px;border-bottom:1px solid #463b51}
+#statsDialog .insights-topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex:none;padding:19px 27px;border-bottom:1px solid #174C75}
 #statsDialog .insights-heading{display:flex;align-items:center;gap:15px;min-width:0}
-#statsDialog .insights-heading .insights-mark{width:47px;height:47px;flex:none;display:grid;place-items:center;border:1px solid #725b8d;border-radius:12px}
+#statsDialog .insights-heading .insights-mark{width:47px;height:47px;flex:none;display:grid;place-items:center;border:1px solid #507995;border-radius:12px}
 #statsDialog .insights-mark svg{width:30px;height:30px}
 #statsDialog .insights-heading h2{letter-spacing:-.45px;line-height:1.2;text-transform:none;margin:0}
 #statsDialog .insights-heading p{margin:5px 0 0;line-height:1.4}
 #statsDialog #closeStats{min-width:94px;flex:none;gap:9px;font-size:14px;min-height:42px}
 #statsDialog #closeStats svg{display:block}
 #statsDialog .insights-layout{display:grid;grid-template-columns:214px minmax(0,1fr);min-height:0;flex:1}
-#statsDialog .stats-tabs{position:static;top:auto;display:flex;flex-direction:column;gap:5px;margin:0;padding:24px 12px 17px;border:0;border-right:1px solid #42364d;border-radius:0;min-width:0;z-index:1}
-#statsDialog .stats-tabs button{display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:65px;padding:12px 13px;background:transparent;border:1px solid transparent;border-radius:11px;text-align:left;font-weight:500;color:#d4c8df}
-#statsDialog .stats-tabs button[aria-selected=true]{color:#fefaff;border:1px solid #746087}
-#statsDialog .stats-tabs button:hover:not([aria-selected=true]){background:#2a2235;border-color:#51425e}
+#statsDialog .stats-tabs{position:static;top:auto;display:flex;flex-direction:column;gap:5px;margin:0;padding:24px 12px 17px;border:0;border-right:1px solid #174C75;border-radius:0;min-width:0;z-index:1}
+#statsDialog .stats-tabs button{display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:65px;padding:12px 13px;background:transparent;border:1px solid transparent;border-radius:11px;text-align:left;font-weight:500;color:#E5EBE4}
+#statsDialog .stats-tabs button[aria-selected=true]{color:#E5EBE4;border:1px solid #507995}
+#statsDialog .stats-tabs button:hover:not([aria-selected=true]){background:#092B49;border-color:#174C75}
 #statsDialog .stats-tabs button .insights-nav-symbol{flex:none;font-size:22px;line-height:1;text-align:center;font-weight:500}
 #statsDialog .stats-tabs button strong{display:block;line-height:1.3}
 #statsDialog .stats-tabs button small{display:block;line-height:1.35;font-weight:400;margin-top:2px}
-#statsDialog .insights-nav-privacy{display:flex;align-items:flex-start;gap:9px;margin:auto 13px 3px;line-height:1.55;border-top:1px solid #3e3348;padding-top:17px}
-#statsDialog .insights-nav-privacy svg{flex:none;margin-top:2px;color:#b898cf}
+#statsDialog .insights-nav-privacy{display:flex;align-items:flex-start;gap:9px;margin:auto 13px 3px;line-height:1.55;border-top:1px solid #174C75;padding-top:17px}
+#statsDialog .insights-nav-privacy svg{flex:none;margin-top:2px;color:#A6C0CF}
 #statsDialog .insights-main{overflow-y:auto;overscroll-behavior:contain;min-width:0;min-height:0;padding:25px clamp(20px,3vw,34px) 31px;scrollbar-gutter:stable}
 #statsDialog .insights-intro{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:18px}
 #statsDialog .insights-eyebrow{font-size:12px;line-height:1.4;font-weight:700;letter-spacing:.12em;margin:0 0 6px}
-#statsDialog .insights-intro h3{line-height:1.2;letter-spacing:-.5px;margin:0;color:#f8f3ff}
+#statsDialog .insights-intro h3{line-height:1.2;letter-spacing:-.5px;margin:0;color:#E5EBE4}
 #statsDialog .insights-intro p{margin:7px 0 0;line-height:1.5}
-#statsDialog .insights-units{display:flex;flex-direction:column;align-items:flex-start;gap:5px;color:#c9b9d5;font-weight:650;flex:none}
+#statsDialog .insights-units{display:flex;flex-direction:column;align-items:flex-start;gap:5px;color:#E5EBE4;font-weight:650;flex:none}
 #statsDialog .insights-units select{min-width:108px}
-#statsDialog .insights-filter-drawer{border:1px solid #44394f;border-radius:10px;margin:0 0 20px;overflow:hidden}
-#statsDialog .insights-filter-drawer summary{display:flex;align-items:center;gap:10px;padding:10px 16px;list-style:none;cursor:pointer;color:#e5d9ee}
+#statsDialog .insights-filter-drawer{border:1px solid #174C75;border-radius:10px;margin:0 0 20px;overflow:hidden}
+#statsDialog .insights-filter-drawer summary{display:flex;align-items:center;gap:10px;padding:10px 16px;list-style:none;cursor:pointer;color:#E5EBE4}
 #statsDialog .insights-filter-drawer summary::-webkit-details-marker{display:none}
 #statsDialog .insights-filter-drawer summary strong{font-weight:650}
 #statsDialog .insights-filter-drawer summary span:not(.filter-caret){margin-left:6px;font-weight:400}
-#statsDialog .insights-filter-drawer .filter-caret{font-size:20px;color:#c9b5d9;margin-left:auto;line-height:1}
+#statsDialog .insights-filter-drawer .filter-caret{font-size:20px;color:#E5EBE4;margin-left:auto;line-height:1}
 #statsDialog .insights-filter-drawer[open] .filter-caret{transform:rotate(180deg)}
-#statsDialog .insights-filter-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;padding:15px;border-top:1px solid #44394f}
-#statsDialog .insights-filter-grid label{display:flex;flex-direction:column;align-items:stretch;gap:6px;min-width:0;color:#d4c7df;font-weight:600}
+#statsDialog .insights-filter-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;padding:15px;border-top:1px solid #174C75}
+#statsDialog .insights-filter-grid label{display:flex;flex-direction:column;align-items:stretch;gap:6px;min-width:0;color:#E5EBE4;font-weight:600}
 #statsDialog .insights-filter-grid select{min-width:0;width:100%;font-size:14px}
 #statsDialog .stats-panel{min-height:0;margin:0}
 #statsDialog .stats-panel[hidden]{display:none!important}
 #statsDialog #metricGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))}
-#statsDialog #metricGrid .metric{display:flex;flex-direction:column;justify-content:space-between;min-width:0;padding:19px 17px;border:1px solid #5c4b6b;border-radius:12px;gap:14px}
-#statsDialog #metricGrid .metric strong{font-weight:750;color:#fbf7ff;overflow-wrap:anywhere;margin:0}
+#statsDialog #metricGrid .metric{display:flex;flex-direction:column;justify-content:space-between;min-width:0;padding:19px 17px;border:1px solid #174C75;border-radius:12px;gap:14px}
+#statsDialog #metricGrid .metric strong{font-weight:750;color:#E5EBE4;overflow-wrap:anywhere;margin:0}
 #statsDialog #metricGrid .metric span{line-height:1.4;margin:0}
 #statsDialog #metricGrid button.metric{text-align:left;align-items:stretch;cursor:pointer}
-#statsDialog .insights-content-card h4{font-size:18px;font-weight:700;line-height:1.3;color:#f2e9f8;margin:0}
+#statsDialog .insights-content-card h4{font-size:18px;font-weight:700;line-height:1.3;color:#E5EBE4;margin:0}
 #statsDialog .insights-trends-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:20px}
-#statsDialog .insights-content-card{border:1px solid #453a50;min-width:0;padding:20px}
+#statsDialog .insights-content-card{border:1px solid #174C75;min-width:0;padding:20px}
 #statsDialog .insights-card-title{display:flex;justify-content:space-between;align-items:start;gap:12px;margin-bottom:16px}
 #statsDialog .insights-card-title p{line-height:1.45;margin:5px 0 0}
 #statsDialog .insights-card-title button{flex:none;padding:7px 11px}
 #statsDialog .sport-summary{gap:12px}
-#statsDialog .sport-row{padding:10px 0;border-bottom:1px solid #3b3247;font-size:14px;gap:10px}
-#statsDialog .sport-row strong{color:#e0c6f5;font-size:14px;white-space:nowrap;font-weight:650}
-#statsDialog .bike-row{padding:7px 0 7px 8px;margin-left:8px;border-left:2px solid #7c6796}
+#statsDialog .sport-row{padding:10px 0;border-bottom:1px solid #174C75;font-size:14px;gap:10px}
+#statsDialog .sport-row strong{color:#E5EBE4;font-size:14px;white-space:nowrap;font-weight:650}
+#statsDialog .bike-row{padding:7px 0 7px 8px;margin-left:8px;border-left:2px solid #507995}
 #statsDialog .ride-list{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;margin:0}
-#statsDialog .ride-list-item{display:flex;flex-direction:column;align-items:stretch;text-align:left;gap:5px;min-width:0;border:1px solid #50415e;border-radius:9px}
+#statsDialog .ride-list-item{display:flex;flex-direction:column;align-items:stretch;text-align:left;gap:5px;min-width:0;border:1px solid #174C75;border-radius:9px}
 #statsDialog .ride-list-item strong{line-height:1.35}
 #statsDialog .ride-list-item span{line-height:1.4}
 #statsDialog .facts{gap:0}
@@ -4704,118 +5420,118 @@ button svg{flex-shrink:0;vertical-align:middle}
 #statsDialog .insights-weekday{margin-bottom:20px}
 #statsDialog .weekday-row{font-size:14px;grid-template-columns:64px minmax(0,1fr) 60px}
 #statsDialog .insights-activities-card .ride-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-#statsDialog .stats-footer{border-top:1px solid #43384e;margin-top:25px;padding:20px 0 0}
-#statsDialog .details-repair{background:#211c2b;border:1px solid #45394f;padding:14px 16px;border-radius:11px;display:flex;align-items:center;justify-content:space-between;gap:16px}
-#statsDialog .details-repair strong{font-size:14px;font-weight:650;color:#e9dfef}
-#statsDialog .details-repair span{color:#bcafc9;line-height:1.5;margin-top:3px;display:block}
+#statsDialog .stats-footer{border-top:1px solid #174C75;margin-top:25px;padding:20px 0 0}
+#statsDialog .details-repair{background:#092B49;border:1px solid #174C75;padding:14px 16px;border-radius:11px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+#statsDialog .details-repair strong{font-size:14px;font-weight:650;color:#E5EBE4}
+#statsDialog .details-repair span{color:#E5EBE4;line-height:1.5;margin-top:3px;display:block}
 #statsDialog .details-repair button{flex:none;min-height:40px}
-#statsDialog .stats-accuracy{margin:12px 0 0;border:1px solid #45394f;border-radius:11px;background:#211c2b;padding:11px 14px}
+#statsDialog .stats-accuracy{margin:12px 0 0;border:1px solid #174C75;border-radius:11px;background:#092B49;padding:11px 14px}
 #statsDialog .stats-accuracy summary{font-weight:600;cursor:pointer}
 #statsDialog #statAccuracy{line-height:1.6}
 @media(max-width:980px){#statsDialog .insights-layout{grid-template-columns:172px minmax(0,1fr)}#statsDialog .stats-tabs{padding:19px 9px}#statsDialog .stats-tabs button{gap:7px;padding:10px 8px}#statsDialog .insights-nav-privacy{margin-left:8px;margin-right:8px}#statsDialog .insights-main{padding:22px 20px}#statsDialog #metricGrid{grid-template-columns:repeat(2,minmax(0,1fr))}#statsDialog .insights-trends-grid{grid-template-columns:1fr}#statsDialog .insights-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:620px){#statsDialog{margin:0;width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;border-radius:0}#statsDialog .insights-topbar{padding:13px 16px}#statsDialog .insights-heading{gap:10px}#statsDialog .insights-heading .insights-mark{width:38px;height:38px}#statsDialog .insights-mark svg{width:26px;height:26px}#statsDialog #closeStats{min-width:42px;width:42px;min-height:42px;padding:0}#statsDialog #closeStats span{display:none}#statsDialog .insights-layout{display:flex;flex-direction:column}#statsDialog .stats-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));flex:none;gap:4px;padding:8px 10px;border-right:0;border-bottom:1px solid #42364d}#statsDialog .insights-nav-privacy{display:none}#statsDialog .stats-tabs button{flex-direction:column;justify-content:center;align-items:center;min-height:57px;gap:2px;padding:6px 2px}#statsDialog .stats-tabs button .insights-nav-symbol{font-size:18px;line-height:1.1}#statsDialog .stats-tabs button small{display:none}#statsDialog .insights-main{overflow-y:auto;padding:18px 15px 24px}#statsDialog .insights-filter-drawer summary span:not(.filter-caret){display:none}#statsDialog #metricGrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}#statsDialog #metricGrid .metric{padding:14px 12px;gap:11px}#statsDialog .insights-content-card{padding:15px}#statsDialog .insights-activities-card .ride-list{grid-template-columns:1fr}#statsDialog .details-repair{flex-direction:column;align-items:stretch}#statsDialog .details-repair button{width:100%}}
+@media(max-width:620px){#statsDialog{margin:0;width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;border-radius:0}#statsDialog .insights-topbar{padding:13px 16px}#statsDialog .insights-heading{gap:10px}#statsDialog .insights-heading .insights-mark{width:38px;height:38px}#statsDialog .insights-mark svg{width:26px;height:26px}#statsDialog #closeStats{min-width:42px;width:42px;min-height:42px;padding:0}#statsDialog #closeStats span{display:none}#statsDialog .insights-layout{display:flex;flex-direction:column}#statsDialog .stats-tabs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));flex:none;gap:4px;padding:8px 10px;border-right:0;border-bottom:1px solid #174C75}#statsDialog .insights-nav-privacy{display:none}#statsDialog .stats-tabs button{flex-direction:column;justify-content:center;align-items:center;min-height:57px;gap:2px;padding:6px 2px}#statsDialog .stats-tabs button .insights-nav-symbol{font-size:18px;line-height:1.1}#statsDialog .stats-tabs button small{display:none}#statsDialog .insights-main{overflow-y:auto;padding:18px 15px 24px}#statsDialog .insights-filter-drawer summary span:not(.filter-caret){display:none}#statsDialog #metricGrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}#statsDialog #metricGrid .metric{padding:14px 12px;gap:11px}#statsDialog .insights-content-card{padding:15px}#statsDialog .insights-activities-card .ride-list{grid-template-columns:1fr}#statsDialog .details-repair{flex-direction:column;align-items:stretch}#statsDialog .details-repair button{width:100%}}
 
 header{position:relative}
 header::after{content:"";position:absolute;left:0;right:0;bottom:0;pointer-events:none}
 #statsDialog .insights-topbar{position:relative;isolation:isolate}
-#statsDialog .insights-topbar::after{content:"";position:absolute;left:0;right:0;bottom:0;pointer-events:none;background:linear-gradient(90deg,#8358d6,#b95cb9 37%,#ed6d80 68%,#ffb26a)}
+#statsDialog .insights-topbar::after{content:"";position:absolute;left:0;right:0;bottom:0;pointer-events:none;background:linear-gradient(90deg,#F4D35E,#507995 37%,#F4D35E 68%,#ffb26a)}
 #statsDialog .stats-tabs button{position:relative;overflow:hidden;transition:background-color .14s,border-color .14s}
-#statsDialog .stats-tabs button[aria-selected=true]{border-color:#886b9e;background:linear-gradient(110deg,#4b315b,#382b46);box-shadow:inset 0 1px #ffffff12}
-#statsDialog .stats-tabs button[aria-selected=true]::before{content:"";position:absolute;top:10px;bottom:10px;left:0;width:3px;border-radius:0 4px 4px 0;background:linear-gradient(#ce8eea,#f19a9c)}
-#statsDialog .stats-tabs button[aria-selected=true] .insights-nav-symbol{color:#f1c5ff}
-#statsDialog #metricGrid .metric{--flare:#b58be9;--flare-wash:#b58be91a}
-#statsDialog #metricGrid .metric:nth-child(2){--flare:#d681cf;--flare-wash:#d681cf18}
+#statsDialog .stats-tabs button[aria-selected=true]{border-color:#507995;background:linear-gradient(110deg,#174C75,#174C75);box-shadow:inset 0 1px #ffffff12}
+#statsDialog .stats-tabs button[aria-selected=true]::before{content:"";position:absolute;top:10px;bottom:10px;left:0;width:3px;border-radius:0 4px 4px 0;background:linear-gradient(#F4D35E,#f19a9c)}
+#statsDialog .stats-tabs button[aria-selected=true] .insights-nav-symbol{color:#E5EBE4}
+#statsDialog #metricGrid .metric{--flare:#F4D35E;--flare-wash:#F4D35E1a}
+#statsDialog #metricGrid .metric:nth-child(2){--flare:#A6C0CF;--flare-wash:#A6C0CF18}
 #statsDialog #metricGrid .metric:nth-child(3){--flare:#f38a92;--flare-wash:#f38a9219}
 #statsDialog #metricGrid .metric:nth-child(4){--flare:#ffc078;--flare-wash:#ffc07818}
 #statsDialog #metricGrid .metric::before{top:0;left:0;right:0;opacity:.95}
-#statsDialog #metricGrid button.metric:focus-visible,#statsDialog .stats-tabs button:focus-visible,#statsDialog .ride-list-item:focus-visible{outline:2px solid #efb9ff;outline-offset:2px}
-#statsDialog .insights-content-card:hover{border-color:#604b68}
-#statsDialog .ride-list-item:hover{border-color:#d9a2e5;box-shadow:0 0 0 1px #a95ec022}
-#statsDialog .insights-filter-drawer:focus-within{border-color:#886c9f}
-#statsDialog .chart-track{background:#3d3249}
+#statsDialog #metricGrid button.metric:focus-visible,#statsDialog .stats-tabs button:focus-visible,#statsDialog .ride-list-item:focus-visible{outline:2px solid #E5EBE4;outline-offset:2px}
+#statsDialog .insights-content-card:hover{border-color:#174C75}
+#statsDialog .ride-list-item:hover{border-color:#E5EBE4;box-shadow:0 0 0 1px #50799522}
+#statsDialog .insights-filter-drawer:focus-within{border-color:#507995}
+#statsDialog .chart-track{background:#174C75}
 #statsDialog .chart-bar{border-radius:99px}
 #statsDialog .insights-topbar button,#statsDialog .insights-card-title button,#statsDialog .details-repair button{display:inline-flex;align-items:center;justify-content:center;text-align:center}
 @media(max-width:620px){
   #statsDialog{border:0;box-shadow:none}
   #statsDialog .stats-tabs button strong{letter-spacing:-.15px}
-  #statsDialog .stats-tabs button[aria-selected=true]::before{top:auto;bottom:0;left:15px;right:15px;width:auto;height:3px;border-radius:3px 3px 0 0;background:linear-gradient(90deg,#b685eb,#f19a9c)}
+  #statsDialog .stats-tabs button[aria-selected=true]::before{top:auto;bottom:0;left:15px;right:15px;width:auto;height:3px;border-radius:3px 3px 0 0;background:linear-gradient(90deg,#F4D35E,#f19a9c)}
 }
 @media(prefers-reduced-motion:reduce){#statsDialog .stats-tabs button{transition:none}}
 
-:root{--lh-ink:#f6f0fb;--lh-subtle:#ccc0d8;--lh-stroke:#59475f;--lh-violet:#b98af0;--lh-pink:#f078aa;--lh-coral:#ff987b;--lh-amber:#ffcf88}
+:root{--lh-ink:#E5EBE4;--lh-subtle:#E5EBE4;--lh-stroke:#174C75;--lh-violet:#F4D35E;--lh-pink:#F4D35E;--lh-coral:#ff987b;--lh-amber:#ffcf88}
 button{display:inline-flex;align-items:center;justify-content:center;gap:8px;text-align:center;line-height:1.25;min-height:40px;transition:background-color .15s ease,border-color .15s ease,box-shadow .15s ease}
 button svg{display:block;flex:none}
 #plus,#minus,#fit{display:grid;place-items:center;padding:0;line-height:1}
-header{background:linear-gradient(115deg,#20162f 0%,#20192c 56%,#261a31 100%)}
+header{background:linear-gradient(115deg,#092B49 0%,#092B49 56%,#092B49 100%)}
 header .brand{min-width:0}
 header .brand h1{font-weight:750;letter-spacing:-.6px}
-header .brand small{font-size:13px;line-height:1.35;letter-spacing:0;color:#d0bfdc}
+header .brand small{font-size:13px;line-height:1.35;letter-spacing:0;color:#E5EBE4}
 header .header-actions{gap:9px}
-header .header-actions button{font-weight:650;font-size:14px;min-height:42px;padding:10px 15px;white-space:nowrap;border-color:#5e4b6d}
-header #statsTop{background:linear-gradient(120deg,#8159b0 0%,#a16cb4 68%,#b878ab 100%);border-color:#b88bc5;box-shadow:inset 0 1px #fff2,0 0 18px #af62b51c}
-header #statsTop:hover{background:linear-gradient(120deg,#9568c7,#b680c2)}
-header #openSettings,header #shutdown{background:#30243c}
-header #openSettings:hover,header #shutdown:hover{background:#463151}
-header::after{height:2px;opacity:1;background:linear-gradient(90deg,#8959d7 0%,#c65fbb 35%,#f76a82 67%,#ffb876 98%)}
-aside{background:linear-gradient(180deg,#1c1728,#17131f);font-size:14px}
-aside h2{font-size:14px;font-weight:700;letter-spacing:.035em;text-transform:uppercase;color:#e8d6f5}
-aside .muted,aside .status,aside .foot,aside #tileNotice{font-size:13px;line-height:1.55;color:#c2b4ce}
-aside .field label,aside .toggle{font-size:14px;line-height:1.4;color:#e1d5eb}
+header .header-actions button{font-weight:650;font-size:14px;min-height:42px;padding:10px 15px;white-space:nowrap;border-color:#174C75}
+header #statsTop{background:linear-gradient(120deg,#507995 0%,#507995 68%,#A6C0CF 100%);border-color:#A6C0CF;box-shadow:inset 0 1px #fff2,0 0 18px #5079951c}
+header #statsTop:hover{background:linear-gradient(120deg,#A6C0CF,#A6C0CF)}
+header #openSettings,header #shutdown{background:#092B49}
+header #openSettings:hover,header #shutdown:hover{background:#174C75}
+header::after{height:2px;opacity:1;background:linear-gradient(90deg,#F4D35E 0%,#A6C0CF 35%,#F4D35E 67%,#ffb876 98%)}
+aside{background:linear-gradient(180deg,#092B49,#092B49);font-size:14px}
+aside h2{font-size:14px;font-weight:700;letter-spacing:.035em;text-transform:uppercase;color:#E5EBE4}
+aside .muted,aside .status,aside .foot,aside #tileNotice{font-size:13px;line-height:1.55;color:#E5EBE4}
+aside .field label,aside .toggle{font-size:14px;line-height:1.4;color:#E5EBE4}
 aside .stat span,aside #dateRange{font-size:13px}
 aside button,aside select,aside input{font-size:14px}
-.maptop{backdrop-filter:blur(13px);border:1px solid #765785;box-shadow:0 8px 26px #0e081872}
+.maptop{backdrop-filter:blur(13px);border:1px solid #507995;box-shadow:0 8px 26px #092B4972}
 .tools{gap:8px}
-.tools button{width:44px;height:44px;min-height:44px;border-radius:12px;background:#2c203edc;border-color:#7d668d;box-shadow:0 5px 17px #130c2299,inset 0 1px #fff1}
-.tools button:hover{background:#533663;border-color:#c397d4}
+.tools button{width:44px;height:44px;min-height:44px;border-radius:12px;background:#092B49dc;border-color:#507995;box-shadow:0 5px 17px #092B4999,inset 0 1px #fff1}
+.tools button:hover{background:#174C75;border-color:#A6C0CF}
 .legend{backdrop-filter:blur(12px);font-size:12px}
-#statsDialog{border-color:#66546c;box-shadow:0 25px 90px #090512d9,0 0 32px #ba69b520}
-#statsDialog .insights-topbar{background:radial-gradient(ellipse 55% 180% at 6% -75%,#6b3d75 0%,transparent 73%),linear-gradient(100deg,#2a2034,#21192d);border-color:#61466b;padding-block:20px}
+#statsDialog{border-color:#174C75;box-shadow:0 25px 90px #092B49d9,0 0 32px #A6C0CF20}
+#statsDialog .insights-topbar{background:radial-gradient(ellipse 55% 180% at 6% -75%,#174C75 0%,transparent 73%),linear-gradient(100deg,#092B49,#092B49);border-color:#174C75;padding-block:20px}
 #statsDialog .insights-topbar::after{height:2px}
-#statsDialog .insights-heading .insights-mark{background:linear-gradient(145deg,#673b75,#402951);border-color:#976eaa;color:#f7d7fc;box-shadow:inset 0 1px #fff3,0 0 24px #ad68d840}
+#statsDialog .insights-heading .insights-mark{background:linear-gradient(145deg,#174C75,#174C75);border-color:#507995;color:#E5EBE4;box-shadow:inset 0 1px #fff3,0 0 24px #F4D35E40}
 #statsDialog .insights-heading h2{font-size:23px;font-weight:750}
-#statsDialog .insights-heading p{font-size:14px;color:#d5c4df}
-#statsDialog .stats-tabs{background:linear-gradient(180deg,#201929,#1a1623)}
+#statsDialog .insights-heading p{font-size:14px;color:#E5EBE4}
+#statsDialog .stats-tabs{background:linear-gradient(180deg,#092B49,#092B49)}
 #statsDialog .stats-tabs button{gap:14px}
-#statsDialog .stats-tabs button .insights-nav-symbol{width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#c5a9da}
+#statsDialog .stats-tabs button .insights-nav-symbol{width:26px;height:26px;display:flex;align-items:center;justify-content:center;color:#E5EBE4}
 #statsDialog .stats-tabs button .insights-nav-symbol svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-#statsDialog .stats-tabs button[aria-selected="true"]{background:linear-gradient(105deg,#523361,#392a48);border-color:#9673a4;box-shadow:0 0 19px #9d60c01f,inset 0 1px #fff1}
-#statsDialog .stats-tabs button[aria-selected="true"] .insights-nav-symbol{color:#e8baf8}
+#statsDialog .stats-tabs button[aria-selected="true"]{background:linear-gradient(105deg,#174C75,#174C75);border-color:#507995;box-shadow:0 0 19px #5079951f,inset 0 1px #fff1}
+#statsDialog .stats-tabs button[aria-selected="true"] .insights-nav-symbol{color:#E5EBE4}
 #statsDialog .stats-tabs button strong{font-size:15px;font-weight:650}
-#statsDialog .stats-tabs button small{font-size:13px;color:#c3b4d0}
-#statsDialog .insights-nav-privacy{color:#c7b9d5;font-size:13px}
-#statsDialog .insights-main{background:radial-gradient(ellipse 40% 12% at 99% 0%,#39213c55,transparent 100%),#181421}
-#statsDialog .insights-eyebrow{color:#dcaae4}
+#statsDialog .stats-tabs button small{font-size:13px;color:#E5EBE4}
+#statsDialog .insights-nav-privacy{color:#E5EBE4;font-size:13px}
+#statsDialog .insights-main{background:radial-gradient(ellipse 40% 12% at 99% 0%,#092B4955,transparent 100%),#092B49}
+#statsDialog .insights-eyebrow{color:#E5EBE4}
 #statsDialog .insights-intro h3{font-weight:750;font-size:27px}
-#statsDialog .insights-intro p{color:#d1c2dc;font-size:15px}
+#statsDialog .insights-intro p{color:#E5EBE4;font-size:15px}
 #statsDialog .insights-units{font-size:14px}
-#statsDialog .insights-filter-drawer{border-color:#5d4867;background:#241c2e}
+#statsDialog .insights-filter-drawer{border-color:#174C75;background:#092B49}
 #statsDialog .insights-filter-drawer summary{min-height:50px}
 #statsDialog .insights-filter-drawer summary strong{font-size:15px}
-#statsDialog .insights-filter-drawer summary span:not(.filter-caret){font-size:14px;color:#cbbad6}
+#statsDialog .insights-filter-drawer summary span:not(.filter-caret){font-size:14px;color:#E5EBE4}
 #statsDialog .insights-filter-grid label{font-size:14px}
 #statsDialog #metricGrid{gap:13px}
-#statsDialog #metricGrid .metric{position:relative;isolation:isolate;overflow:hidden;min-height:139px;background:linear-gradient(145deg,#372742,#2c2238);border-color:#75567c;box-shadow:inset 0 1px #fff1;--lh-accent:var(--lh-violet);--lh-wash:#bb8bfb20}
-#statsDialog #metricGrid .metric:nth-child(2){--lh-accent:var(--lh-pink);--lh-wash:#df7ccf20}
+#statsDialog #metricGrid .metric{position:relative;isolation:isolate;overflow:hidden;min-height:139px;background:linear-gradient(145deg,#174C75,#092B49);border-color:#507995;box-shadow:inset 0 1px #fff1;--lh-accent:var(--lh-violet);--lh-wash:#E5EBE420}
+#statsDialog #metricGrid .metric:nth-child(2){--lh-accent:var(--lh-pink);--lh-wash:#F4D35E20}
 #statsDialog #metricGrid .metric:nth-child(3){--lh-accent:var(--lh-coral);--lh-wash:#f2878220}
 #statsDialog #metricGrid .metric:nth-child(4){--lh-accent:var(--lh-amber);--lh-wash:#ffd18820}
 #statsDialog #metricGrid .metric::before{content:"";position:absolute;inset:0 auto auto 0;width:100%;height:3px;background:linear-gradient(90deg,var(--lh-accent),transparent 88%);pointer-events:none;z-index:0}
 #statsDialog #metricGrid .metric::after{content:"";position:absolute;width:175px;height:175px;top:-73px;right:-70px;border-radius:50%;background:radial-gradient(circle,var(--lh-wash) 0%,transparent 70%);pointer-events:none;z-index:0}
 #statsDialog #metricGrid .metric strong,#statsDialog #metricGrid .metric span{position:relative;z-index:1}
 #statsDialog #metricGrid .metric strong{font-size:clamp(23px,2.05vw,31px);font-variant-numeric:tabular-nums;letter-spacing:-.85px;line-height:1.2}
-#statsDialog #metricGrid .metric span{font-size:15px;font-weight:550;color:#e8dbed}
-#statsDialog #metricGrid button.metric:hover{border-color:var(--lh-accent);background:linear-gradient(140deg,#4d3055,#37243f);box-shadow:0 0 20px var(--lh-wash)}
+#statsDialog #metricGrid .metric span{font-size:15px;font-weight:550;color:#E5EBE4}
+#statsDialog #metricGrid button.metric:hover{border-color:var(--lh-accent);background:linear-gradient(140deg,#174C75,#092B49);box-shadow:0 0 20px var(--lh-wash)}
 #statsDialog .insights-trends-grid{gap:17px}
-#statsDialog .insights-content-card{background:linear-gradient(145deg,#2c2335,#241e2d);border-color:#5c4763;border-radius:14px}
+#statsDialog .insights-content-card{background:linear-gradient(145deg,#092B49,#092B49);border-color:#174C75;border-radius:14px}
 #statsDialog .insights-card-title h4{font-size:19px;font-weight:700}
-#statsDialog .insights-card-title p{font-size:14px;color:#d0bed7}
+#statsDialog .insights-card-title p{font-size:14px;color:#E5EBE4}
 #statsDialog .insights-card-title button{font-size:14px;min-height:39px}
 #statsDialog .sport-row,#statsDialog .sport-row strong{font-size:14px}
-#statsDialog .ride-list-item{min-height:68px;padding:12px 14px;background:#332740;border-color:#5f4b6b;transition:background-color .15s,border-color .15s,transform .15s}
-#statsDialog .ride-list-item:hover{background:#47314c;border-color:#c08bc9;box-shadow:0 0 0 1px #ba72bc26;transform:translateY(-1px)}
+#statsDialog .ride-list-item{min-height:68px;padding:12px 14px;background:#174C75;border-color:#174C75;transition:background-color .15s,border-color .15s,transform .15s}
+#statsDialog .ride-list-item:hover{background:#174C75;border-color:#A6C0CF;box-shadow:0 0 0 1px #A6C0CF26;transform:translateY(-1px)}
 #statsDialog .ride-list-item strong{font-size:15px;font-weight:650}
-#statsDialog .ride-list-item span{font-size:14px;color:#d1c1dc}
+#statsDialog .ride-list-item span{font-size:14px;color:#E5EBE4}
 #statsDialog .chart-row>span,#statsDialog .chart-row>strong{font-size:14px}
-#statsDialog .chart-bar{background:linear-gradient(90deg,#9568d4 0%,#dd68ba 49%,#fa9b75 95%)}
+#statsDialog .chart-bar{background:linear-gradient(90deg,#F4D35E 0%,#F4D35E 49%,#fa9b75 95%)}
 #statsDialog .stats-accuracy summary{font-size:14px}
 #statsDialog #statAccuracy{font-size:14px}
 #statsDialog .details-repair span{font-size:14px}
@@ -4838,65 +5554,65 @@ header .header-actions{gap:6px}
 @media(prefers-reduced-motion:reduce){button,#statsDialog .ride-list-item{transition:none}#statsDialog .ride-list-item:hover{transform:none}}
 
 
-#ridePreviewDialog,#settingsDialog,#welcomeDialog{border-color:#72567b;box-shadow:0 25px 88px #080513d0,0 0 25px #a55e9a17}
-#ridePreviewDialog{background:radial-gradient(ellipse at 5% 0%,#47294d66,transparent 36%),#211a2a}
+#ridePreviewDialog,#settingsDialog,#welcomeDialog{border-color:#507995;box-shadow:0 25px 88px #092B49d0,0 0 25px #50799517}
+#ridePreviewDialog{background:radial-gradient(ellipse at 5% 0%,#174C7566,transparent 36%),#092B49}
 #ridePreviewDialog .dialog-head h2{font-size:24px;font-weight:750}
-#ridePreviewDialog .dialog-head .muted{color:#d0c0de;font-size:15px}
-#ridePreviewDialog .ride-preview-map{border-color:#74547e;box-shadow:inset 0 0 27px #6d2f7821}
-#ridePreviewDialog .ride-preview-badge{border-color:#80618d;color:#f6dffb;font-size:14px}
+#ridePreviewDialog .dialog-head .muted{color:#E5EBE4;font-size:15px}
+#ridePreviewDialog .ride-preview-map{border-color:#507995;box-shadow:inset 0 0 27px #174C7521}
+#ridePreviewDialog .ride-preview-badge{border-color:#507995;color:#E5EBE4;font-size:14px}
 #ridePreviewDialog .ride-preview-details{gap:11px}
-#ridePreviewDialog .ride-preview-detail{position:relative;overflow:hidden;background:linear-gradient(145deg,#31243b,#272031);border-color:#654c70;border-radius:11px;padding:14px}
-#ridePreviewDialog .ride-preview-detail::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#b77cda,#e582ad55,transparent)}
-#ridePreviewDialog .ride-preview-detail span{color:#d2c1da;font-size:14px}
+#ridePreviewDialog .ride-preview-detail{position:relative;overflow:hidden;background:linear-gradient(145deg,#092B49,#092B49);border-color:#174C75;border-radius:11px;padding:14px}
+#ridePreviewDialog .ride-preview-detail::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#F4D35E,#F4D35E55,transparent)}
+#ridePreviewDialog .ride-preview-detail span{color:#E5EBE4;font-size:14px}
 #ridePreviewDialog .ride-preview-detail strong{font-size:17px;font-weight:650}
 #ridePreviewDialog .ride-preview-actions button{min-height:43px;font-size:14px;font-weight:650}
-#ridePreviewDialog #showRideMap{background:linear-gradient(110deg,#9875bb,#c494b7);border-color:#c8a0ce;color:#21162c}
+#ridePreviewDialog #showRideMap{background:linear-gradient(110deg,#A6C0CF,#A6C0CF);border-color:#A6C0CF;color:#092B49}
 #ridePreviewDialog #showRideMap:disabled{opacity:.5}
-#ridePreviewDialog #ridePreviewStatus{font-size:14px;color:#d0c1dd}
-#settingsDialog>.dialog-head{background:linear-gradient(95deg,#32243e,#241c30);border-color:#624d6e}
-#settingsDialog>.dialog-head::after{content:"";position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#9b67d4,#d86aaf,#f4ac79)}
-#settingsDialog .settings-section h2{font-size:18px;font-weight:700;color:#f0e6f5}
-#settingsDialog .settings-savebar{background:#292033;border-color:#6a5178}#settingsDialog .settings-watch{padding:15px 0;border-top:1px solid #44364e;border-bottom:1px solid #44364e}#settingsDialog .settings-watch h3{margin:0 0 6px}#settingsDialog .settings-watch>label{display:block;margin:12px 0 7px;font-size:14px;font-weight:650}#settingsDialog .settings-watch input{width:100%;background:#242031;border:1px solid #675878;border-radius:9px;padding:12px;color:#fff;font:inherit}#settingsDialog .settings-watch .settings-actions{margin-top:10px}#watchStatus{overflow-wrap:anywhere}
+#ridePreviewDialog #ridePreviewStatus{font-size:14px;color:#E5EBE4}
+#settingsDialog>.dialog-head{background:linear-gradient(95deg,#092B49,#092B49);border-color:#174C75}
+#settingsDialog>.dialog-head::after{content:"";position:absolute;bottom:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#F4D35E,#F4D35E,#f4ac79)}
+#settingsDialog .settings-section h2{font-size:18px;font-weight:700;color:#E5EBE4}
+#settingsDialog .settings-savebar{background:#092B49;border-color:#507995}#settingsDialog .settings-watch{padding:15px 0;border-top:1px solid #174C75;border-bottom:1px solid #174C75}#settingsDialog .settings-watch h3{margin:0 0 6px}#settingsDialog .settings-watch>label{display:block;margin:12px 0 7px;font-size:14px;font-weight:650}#settingsDialog .settings-watch input{width:100%;background:#092B49;border:1px solid #507995;border-radius:9px;padding:12px;color:#fff;font:inherit}#settingsDialog .settings-watch .settings-actions{margin-top:10px}#watchStatus{overflow-wrap:anywhere}
 #settingsDialog #saveSettings{font-weight:700}
-#welcomeDialog .welcome-icon{color:#dfb1f1;text-shadow:0 0 23px #dc87ef6a}
+#welcomeDialog .welcome-icon{color:#E5EBE4;text-shadow:0 0 23px #F4D35E6a}
 #welcomeDialog .welcome-privacy{font-size:14px;line-height:1.5}
 @media(max-width:700px){#ridePreviewDialog .ride-preview-detail{padding:12px}#ridePreviewDialog .ride-preview-detail strong{font-size:16px}}
 
 
 #statsDialog #metricGrid{gap:12px;margin-bottom:25px}
 #statsDialog #metricGrid .metric{min-height:128px;gap:13px}
-#statsDialog #metricGrid .metric:nth-child(4n+1){--lh-accent:#b98af0;--lh-wash:#bb8bfb20}
-#statsDialog #metricGrid .metric:nth-child(4n+2){--lh-accent:#f078aa;--lh-wash:#df7ccf20}
+#statsDialog #metricGrid .metric:nth-child(4n+1){--lh-accent:#F4D35E;--lh-wash:#E5EBE420}
+#statsDialog #metricGrid .metric:nth-child(4n+2){--lh-accent:#F4D35E;--lh-wash:#F4D35E20}
 #statsDialog #metricGrid .metric:nth-child(4n+3){--lh-accent:#ff987b;--lh-wash:#f2878220}
 #statsDialog #metricGrid .metric:nth-child(4n+4){--lh-accent:#ffcf88;--lh-wash:#ffd18820}
 #statsDialog #facts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-#statsDialog #facts .record-metric{position:relative;isolation:isolate;display:flex;flex-direction:column;align-items:stretch;justify-content:space-between;gap:8px;overflow:hidden;min-height:138px;min-width:0;padding:19px 17px;text-align:left;border:1px solid #75567c;border-radius:12px;background:linear-gradient(145deg,#372742,#2c2238);box-shadow:inset 0 1px #fff1}
-#statsDialog #facts .record-metric::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--record-accent,#b98af0),transparent 88%)}
-#statsDialog #facts .record-metric:nth-child(4n+2){--record-accent:#f078aa}
+#statsDialog #facts .record-metric{position:relative;isolation:isolate;display:flex;flex-direction:column;align-items:stretch;justify-content:space-between;gap:8px;overflow:hidden;min-height:138px;min-width:0;padding:19px 17px;text-align:left;border:1px solid #507995;border-radius:12px;background:linear-gradient(145deg,#174C75,#092B49);box-shadow:inset 0 1px #fff1}
+#statsDialog #facts .record-metric::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--record-accent,#F4D35E),transparent 88%)}
+#statsDialog #facts .record-metric:nth-child(4n+2){--record-accent:#F4D35E}
 #statsDialog #facts .record-metric:nth-child(4n+3){--record-accent:#ff987b}
 #statsDialog #facts .record-metric:nth-child(4n+4){--record-accent:#ffcf88}
-#statsDialog #facts .record-metric strong{order:0;font-weight:750;color:#fbf7ff;font-size:clamp(21px,2vw,28px);line-height:1.15;letter-spacing:-.5px;overflow-wrap:anywhere}
-#statsDialog #facts .record-metric span{order:0;font-size:14px;color:#eee0f2;font-weight:600;line-height:1.4}
-#statsDialog #facts .record-metric small{font-size:13px;color:#c9b6d3;line-height:1.35;overflow-wrap:anywhere}
+#statsDialog #facts .record-metric strong{order:0;font-weight:750;color:#E5EBE4;font-size:clamp(21px,2vw,28px);line-height:1.15;letter-spacing:-.5px;overflow-wrap:anywhere}
+#statsDialog #facts .record-metric span{order:0;font-size:14px;color:#E5EBE4;font-weight:600;line-height:1.4}
+#statsDialog #facts .record-metric small{font-size:13px;color:#E5EBE4;line-height:1.35;overflow-wrap:anywhere}
 #statsDialog #facts .record-metric-link{cursor:pointer}
-#statsDialog #facts .record-metric-link:hover{background:linear-gradient(145deg,#48304f,#31253c);border-color:#e5a9e8;box-shadow:0 0 19px #c16bd02b}
-#statsDialog #facts .record-metric-link small::after{content:'  ↗';color:#f2bde9;font-weight:700}
+#statsDialog #facts .record-metric-link:hover{background:linear-gradient(145deg,#174C75,#092B49);border-color:#E5EBE4;box-shadow:0 0 19px #A6C0CF2b}
+#statsDialog #facts .record-metric-link small::after{content:'  ↗';color:#E5EBE4;font-weight:700}
 #statsDialog #topRoutes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}
-#statsDialog #topRoutes .ride-list-item{background:linear-gradient(145deg,#32253b,#292035);min-height:83px;padding:14px 16px;border-color:#654e73}
-#statsDialog #topRoutes .ride-list-item:hover{background:#3e2c48;border-color:#dd9ade}
+#statsDialog #topRoutes .ride-list-item{background:linear-gradient(145deg,#092B49,#092B49);min-height:83px;padding:14px 16px;border-color:#174C75}
+#statsDialog #topRoutes .ride-list-item:hover{background:#174C75;border-color:#E5EBE4}
 #statsDialog #topRoutes .ride-list-item strong{font-size:15px}
 #statsDialog #topRoutes .ride-list-item span{font-size:13px}
 #ridePreviewDialog .ride-preview-details{grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
 #ridePreviewDialog .ride-preview-detail{min-height:85px;padding:15px}
 #ridePreviewDialog .ride-preview-detail strong{font-size:18px;font-weight:700}
 #ridePreviewDialog .ride-preview-detail span{font-size:13px;margin:0 0 10px}
-#ridePreviewDialog .ride-preview-source{margin:12px 0 15px;padding:10px 12px;border:1px solid #493b57;border-radius:10px;background:#241c30;color:#cbbbd7;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+#ridePreviewDialog .ride-preview-source{margin:12px 0 15px;padding:10px 12px;border:1px solid #174C75;border-radius:10px;background:#092B49;color:#E5EBE4;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
 #ridePreviewDialog .ride-preview-source:empty{display:none}
 .legend{padding:12px 14px;min-width:235px;backdrop-filter:blur(12px);z-index:2}
 .legend .bar{height:9px}
-.legend-select{margin-top:11px;padding-top:10px;border-top:1px solid #594568;display:flex;justify-content:space-between;gap:11px;align-items:center}
-.legend-select span{font-size:12px;font-weight:600;color:#d7c5e4;white-space:nowrap}
-.legend-select select{font-size:13px;font-weight:600;padding:7px 8px;min-width:0;max-width:137px;background:#31233e;border-color:#785d8a;color:#f6e9fb}
+.legend-select{margin-top:11px;padding-top:10px;border-top:1px solid #174C75;display:flex;justify-content:space-between;gap:11px;align-items:center}
+.legend-select span{font-size:12px;font-weight:600;color:#E5EBE4;white-space:nowrap}
+.legend-select select{font-size:13px;font-weight:600;padding:7px 8px;min-width:0;max-width:137px;background:#092B49;border-color:#507995;color:#E5EBE4}
 @media(max-width:980px){#statsDialog #facts{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:700px){#ridePreviewDialog .ride-preview-details{grid-template-columns:repeat(2,minmax(0,1fr))}#statsDialog #topRoutes{grid-template-columns:1fr}}
 @media(max-width:520px){#statsDialog #facts{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}#statsDialog #facts .record-metric{min-height:125px;padding:13px}#statsDialog #facts .record-metric strong{font-size:20px}#statsDialog #metricGrid .metric{min-height:105px}#statsDialog #metricGrid{margin-bottom:20px}.legend{left:10px;bottom:10px;max-width:calc(100% - 96px);min-width:215px}}
@@ -4905,27 +5621,27 @@ header .header-actions{gap:6px}
 #statsDialog .stats-tabs{padding-top:22px}
 #statsDialog .stats-story-section{min-width:0;margin:0 0 31px}
 #statsDialog .stats-story-heading{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:0 0 17px}
-#statsDialog .stats-story-kicker{display:block;color:#d6a4df;letter-spacing:.11em;font-size:11px;font-weight:750;line-height:1.4;margin:0 0 6px}
-#statsDialog .stats-story-heading h4{margin:0;font-size:21px;font-weight:750;letter-spacing:-.3px;line-height:1.25;color:#f5ecfa}
-#statsDialog .stats-story-heading p{margin:5px 0 0;color:#cbbcd5;font-size:14px;line-height:1.48}
+#statsDialog .stats-story-kicker{display:block;color:#E5EBE4;letter-spacing:.11em;font-size:11px;font-weight:750;line-height:1.4;margin:0 0 6px}
+#statsDialog .stats-story-heading h4{margin:0;font-size:21px;font-weight:750;letter-spacing:-.3px;line-height:1.25;color:#E5EBE4}
+#statsDialog .stats-story-heading p{margin:5px 0 0;color:#E5EBE4;font-size:14px;line-height:1.48}
 #statsDialog #metricGrid{display:flex;flex-wrap:wrap;align-items:flex-start;column-gap:14px;row-gap:19px;margin:0}
 #statsDialog #metricGrid .stats-metric-group{min-width:0;flex:0 0 100%}
-#statsDialog #metricGrid .stats-metric-group-label{font-weight:700;color:#e7d5ef;font-size:14px;line-height:1.35;margin:0 0 10px}
+#statsDialog #metricGrid .stats-metric-group-label{font-weight:700;color:#E5EBE4;font-size:14px;line-height:1.35;margin:0 0 10px}
 #statsDialog #metricGrid .stats-metric-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
 #statsDialog #metricGrid .metric{min-height:118px;padding:18px 16px;gap:11px}
 #statsDialog #metricGrid .metric strong{font-size:clamp(22px,2vw,30px);line-height:1.12}
 #statsDialog #metricGrid .metric span{font-size:14px;line-height:1.35}
 #statsDialog .facts,#statsDialog #facts,#statsDialog #milestones{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-#statsDialog #facts .record-metric,#statsDialog #milestones .record-metric{position:relative;isolation:isolate;display:flex;flex-direction:column;align-items:stretch;justify-content:space-between;gap:8px;overflow:hidden;min-width:0;min-height:130px;padding:17px 16px;text-align:left;border:1px solid #75567c;border-radius:12px;background:linear-gradient(145deg,#372742,#2c2238);box-shadow:inset 0 1px #fff1}
-#statsDialog #facts .record-metric::before,#statsDialog #milestones .record-metric::before{content:"";position:absolute;inset:0 0 auto;height:3px;background:linear-gradient(90deg,var(--record-accent,#b98af0),transparent 88%)}
-#statsDialog #facts .record-metric:nth-child(4n+2),#statsDialog #milestones .record-metric:nth-child(4n+2){--record-accent:#f078aa}
+#statsDialog #facts .record-metric,#statsDialog #milestones .record-metric{position:relative;isolation:isolate;display:flex;flex-direction:column;align-items:stretch;justify-content:space-between;gap:8px;overflow:hidden;min-width:0;min-height:130px;padding:17px 16px;text-align:left;border:1px solid #507995;border-radius:12px;background:linear-gradient(145deg,#174C75,#092B49);box-shadow:inset 0 1px #fff1}
+#statsDialog #facts .record-metric::before,#statsDialog #milestones .record-metric::before{content:"";position:absolute;inset:0 0 auto;height:3px;background:linear-gradient(90deg,var(--record-accent,#F4D35E),transparent 88%)}
+#statsDialog #facts .record-metric:nth-child(4n+2),#statsDialog #milestones .record-metric:nth-child(4n+2){--record-accent:#F4D35E}
 #statsDialog #facts .record-metric:nth-child(4n+3),#statsDialog #milestones .record-metric:nth-child(4n+3){--record-accent:#ff987b}
 #statsDialog #facts .record-metric:nth-child(4n+4),#statsDialog #milestones .record-metric:nth-child(4n+4){--record-accent:#ffcf88}
-#statsDialog #facts .record-metric strong,#statsDialog #milestones .record-metric strong{order:0;font-size:clamp(21px,2vw,28px);line-height:1.2;font-weight:750;letter-spacing:-.5px;color:#fbf7ff;overflow-wrap:anywhere}
-#statsDialog #facts .record-metric span,#statsDialog #milestones .record-metric span{order:0;font-size:14px;color:#eee0f2;line-height:1.35;font-weight:600}
-#statsDialog #facts .record-metric small,#statsDialog #milestones .record-metric small{font-size:13px;color:#c9b6d3;line-height:1.4;overflow-wrap:anywhere}
-#statsDialog #facts button.record-metric:hover,#statsDialog #milestones button.record-metric:hover{background:linear-gradient(145deg,#48304f,#31253c);border-color:#e5a9e8;box-shadow:0 0 19px #c16bd02b}
-#statsDialog #facts .record-metric-link:focus-visible,#statsDialog #milestones .record-metric-link:focus-visible{outline:2px solid #efb9ff;outline-offset:2px}
+#statsDialog #facts .record-metric strong,#statsDialog #milestones .record-metric strong{order:0;font-size:clamp(21px,2vw,28px);line-height:1.2;font-weight:750;letter-spacing:-.5px;color:#E5EBE4;overflow-wrap:anywhere}
+#statsDialog #facts .record-metric span,#statsDialog #milestones .record-metric span{order:0;font-size:14px;color:#E5EBE4;line-height:1.35;font-weight:600}
+#statsDialog #facts .record-metric small,#statsDialog #milestones .record-metric small{font-size:13px;color:#E5EBE4;line-height:1.4;overflow-wrap:anywhere}
+#statsDialog #facts button.record-metric:hover,#statsDialog #milestones button.record-metric:hover{background:linear-gradient(145deg,#174C75,#092B49);border-color:#E5EBE4;box-shadow:0 0 19px #A6C0CF2b}
+#statsDialog #facts .record-metric-link:focus-visible,#statsDialog #milestones .record-metric-link:focus-visible{outline:2px solid #E5EBE4;outline-offset:2px}
 #statsDialog .insights-weekday{margin:0}
 #statsDialog .insights-trends-grid{margin-bottom:15px}
 #statsDialog .stats-sport-card{padding:18px 21px}
@@ -4951,12 +5667,12 @@ header .header-actions{gap:6px}
 }
 @media(max-width:375px){#statsDialog #facts,#statsDialog #milestones{grid-template-columns:1fr}}
 
-.lh-help-trigger{display:inline-flex;flex:none;align-items:center;justify-content:center;width:19px;height:19px;min-width:19px;min-height:19px;padding:0;border:1px solid #8a719d;border-radius:50%;background:#30263c;color:#e2c9f4;font:700 12px/1 system-ui,sans-serif;cursor:help;vertical-align:middle;box-shadow:0 0 0 1px #100c18aa;z-index:3}
-.lh-help-trigger:hover,.lh-help-trigger:focus-visible{color:#1b1324;background:#e7c2ff;border-color:#efceff;outline:2px solid #d19eeb;outline-offset:2px}
-#lhHelpPopover{position:fixed;z-index:2147483647;max-width:350px;padding:14px 16px 15px;border:1px solid #aa87bf;border-radius:12px;background:#221a2e;color:#f6effa;box-shadow:0 14px 42px #000b;pointer-events:none;font-size:13px;line-height:1.55;white-space:normal;overflow-wrap:break-word}
+.lh-help-trigger{display:inline-flex;flex:none;align-items:center;justify-content:center;width:19px;height:19px;min-width:19px;min-height:19px;padding:0;border:1px solid #507995;border-radius:50%;background:#092B49;color:#E5EBE4;font:700 12px/1 system-ui,sans-serif;cursor:help;vertical-align:middle;box-shadow:0 0 0 1px #092B49aa;z-index:3}
+.lh-help-trigger:hover,.lh-help-trigger:focus-visible{color:#092B49;background:#E5EBE4;border-color:#E5EBE4;outline:2px solid #E5EBE4;outline-offset:2px}
+#lhHelpPopover{position:fixed;z-index:2147483647;max-width:350px;padding:14px 16px 15px;border:1px solid #A6C0CF;border-radius:12px;background:#092B49;color:#E5EBE4;box-shadow:0 14px 42px #082C4Bbb;pointer-events:none;font-size:13px;line-height:1.55;white-space:normal;overflow-wrap:break-word}
 #lhHelpPopover[hidden]{display:none!important}
-#lhHelpPopover strong{display:block;margin-bottom:5px;font-size:14px;color:#f0ceff;font-weight:750}
-#lhHelpPopover span{display:block;color:#e7daee}
+#lhHelpPopover strong{display:block;margin-bottom:5px;font-size:14px;color:#E5EBE4;font-weight:750}
+#lhHelpPopover span{display:block;color:#E5EBE4}
 .tools .lh-help-trigger{width:18px!important;min-width:18px!important;height:18px!important;min-height:18px!important;padding:0!important;font-size:12px!important}
 .lh-help-card{position:relative;min-width:0;padding-right:max(25px,1em)}
 .lh-help-card>.lh-help-trigger{position:absolute;right:9px;top:9px}
@@ -4997,9 +5713,9 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 #statsDialog .insights-content-card.lh-help-card>.lh-help-trigger{top:13px;right:12px}
 
 #statsDialog .insights-heading .insights-mark{width:50px;height:50px;display:grid;place-items:center;padding:0;border:0;background:none;box-shadow:none}
-#statsDialog .insights-mark img{display:block;width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 0 9px #db72e750)}
+#statsDialog .insights-mark img{display:block;width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 0 9px #F4D35E50)}
 #settingsDialog .settings-dialog-brand{display:flex;align-items:center;gap:13px;min-width:0}
-#settingsDialog .settings-dialog-brand img{display:block;width:46px;height:46px;flex:none;object-fit:contain;filter:drop-shadow(0 0 9px #db72e750)}
+#settingsDialog .settings-dialog-brand img{display:block;width:46px;height:46px;flex:none;object-fit:contain;filter:drop-shadow(0 0 9px #F4D35E50)}
 #settingsDialog .settings-dialog-brand>div{min-width:0}
 #settingsDialog>.dialog-head{gap:20px}
 #settingsDialog>.dialog-head .muted{max-width:525px}
@@ -5043,53 +5759,53 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 #statsDialog .analytics-studio{padding:0;border:0}
 #statsDialog .analytics-studio-header{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-bottom:16px}
 #statsDialog .analytics-studio-header h4{margin:4px 0 5px;font-size:22px;letter-spacing:-.35px;line-height:1.25}
-#statsDialog .analytics-studio-header p{max-width:590px;margin:0;font-size:14px;line-height:1.5;color:#d0bfdb}
-#statsDialog .analytics-count{flex:none;font-size:12px;line-height:1.5;color:#eacbf0;border:1px solid #574366;border-radius:10px;padding:9px 12px;background:#2a2034}
-#statsDialog .analytics-toolbar{display:flex;align-items:end;flex-wrap:wrap;gap:11px 12px;padding:15px;border:1px solid #4c3b5a;border-radius:13px;background:#211b2d}
-#statsDialog .analytics-toolbar label{display:flex;flex:1 1 135px;flex-direction:column;gap:6px;min-width:105px;max-width:220px;font-size:12px;font-weight:650;line-height:1.35;color:#d3c4df}
-#statsDialog .analytics-toolbar select{min-width:0;width:100%;font-size:13px;min-height:39px;border-radius:8px;background:#30283c;color:#f5eefe}
+#statsDialog .analytics-studio-header p{max-width:590px;margin:0;font-size:14px;line-height:1.5;color:#E5EBE4}
+#statsDialog .analytics-count{flex:none;font-size:12px;line-height:1.5;color:#E5EBE4;border:1px solid #174C75;border-radius:10px;padding:9px 12px;background:#092B49}
+#statsDialog .analytics-toolbar{display:flex;align-items:end;flex-wrap:wrap;gap:11px 12px;padding:15px;border:1px solid #174C75;border-radius:13px;background:#092B49}
+#statsDialog .analytics-toolbar label{display:flex;flex:1 1 135px;flex-direction:column;gap:6px;min-width:105px;max-width:220px;font-size:12px;font-weight:650;line-height:1.35;color:#E5EBE4}
+#statsDialog .analytics-toolbar select{min-width:0;width:100%;font-size:13px;min-height:39px;border-radius:8px;background:#092B49;color:#E5EBE4}
 #statsDialog .analytics-toolbar .analytics-reset{min-height:39px;white-space:nowrap;font-size:13px;padding:8px 12px;border-radius:8px}
 #statsDialog .analytics-categories{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 10px}
-#statsDialog .analytics-categories button{font-size:13px;font-weight:650;border-radius:999px;border:1px solid #564667;padding:9px 15px;background:#251f31;min-height:37px}
-#statsDialog .analytics-categories button[aria-pressed=true]{background:#a987c7;color:#1c1127;border-color:#c4a5e3}
-#statsDialog .analytics-guidance{margin:0 0 17px;font-size:13px;line-height:1.55;color:#c8b7d5;max-width:870px}
+#statsDialog .analytics-categories button{font-size:13px;font-weight:650;border-radius:999px;border:1px solid #174C75;padding:9px 15px;background:#092B49;min-height:37px}
+#statsDialog .analytics-categories button[aria-pressed=true]{background:#A6C0CF;color:#092B49;border-color:#E5EBE4}
+#statsDialog .analytics-guidance{margin:0 0 17px;font-size:13px;line-height:1.55;color:#E5EBE4;max-width:870px}
 #statsDialog .analytics-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:18px;align-items:start}
 #statsDialog .analytics-grid.layout-double{grid-template-columns:repeat(2,minmax(0,1fr))}
-#statsDialog .analytics-card{position:relative;display:flex;flex-direction:column;gap:0;min-width:0;border-radius:15px;padding:22px!important;background:linear-gradient(155deg,#292137,#201c2c);border:1px solid #554264;box-shadow:0 8px 22px #0a061325}
+#statsDialog .analytics-card{position:relative;display:flex;flex-direction:column;gap:0;min-width:0;border-radius:15px;padding:22px!important;background:linear-gradient(155deg,#092B49,#092B49);border:1px solid #174C75;box-shadow:0 8px 22px #092B4925}
 #statsDialog .analytics-card[hidden]{display:none!important}
 #statsDialog .analytics-card.expanded{grid-column:1/-1}
 #statsDialog .analytics-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-right:28px;min-height:51px}
-#statsDialog .analytics-card-head h5{margin:0;font-size:18px;font-weight:750;color:#f7eefa;line-height:1.3}
-#statsDialog .analytics-card-head p{font-size:13px;line-height:1.45;color:#c7b7d4;margin:4px 0 0}
+#statsDialog .analytics-card-head h5{margin:0;font-size:18px;font-weight:750;color:#E5EBE4;line-height:1.3}
+#statsDialog .analytics-card-head p{font-size:13px;line-height:1.45;color:#E5EBE4;margin:4px 0 0}
 #statsDialog .analytics-card .lh-help-trigger{position:absolute;top:18px;right:17px}
 #statsDialog .analytics-card-tools{display:flex;align-items:center;flex-wrap:wrap;justify-content:space-between;gap:8px;margin:16px 0 0}
-#statsDialog .analytics-card-tools label{display:flex;align-items:center;gap:8px;font-size:12px;color:#cbbbd9;font-weight:650}
+#statsDialog .analytics-card-tools label{display:flex;align-items:center;gap:8px;font-size:12px;color:#E5EBE4;font-weight:650}
 #statsDialog .analytics-card-tools select{min-width:115px;max-width:160px;border-radius:8px;padding:7px 10px;min-height:37px;font-size:13px}
 #statsDialog .analytics-card-buttons{display:flex;align-items:center;flex-wrap:wrap;gap:7px}
 #statsDialog .analytics-card-buttons button{min-height:34px;font-size:12px;padding:7px 10px;border-radius:8px}
 #statsDialog .analytics-card .analytics-plot{position:relative;min-height:250px;overflow:visible;width:100%;margin-top:12px}
 #statsDialog .analytics-card .analytics-plot svg{width:100%;height:auto;max-height:none;display:block;overflow:visible}
-#statsDialog .analytics-plot .plot-grid{stroke:#665470;stroke-width:1;opacity:.48;stroke-dasharray:3 5}
-#statsDialog .analytics-plot .plot-axis{stroke:#776282;stroke-width:1;opacity:.8}
-#statsDialog .analytics-plot .plot-label{fill:#d5c5e0;font:12px Inter,system-ui,sans-serif}
-#statsDialog .analytics-plot .plot-tick{fill:#bfaecf;font:12px Inter,system-ui,sans-serif}
-#statsDialog .analytics-plot .plot-line-new{stroke:#e18bc7;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;fill:none}
-#statsDialog .analytics-plot .plot-area-new{fill:#ca7dc7;opacity:.22;stroke:none}
-#statsDialog .analytics-plot .plot-dot-new{fill:#eda6cf;stroke:#21192c;stroke-width:1.1}
+#statsDialog .analytics-plot .plot-grid{stroke:#174C75;stroke-width:1;opacity:.48;stroke-dasharray:3 5}
+#statsDialog .analytics-plot .plot-axis{stroke:#507995;stroke-width:1;opacity:.8}
+#statsDialog .analytics-plot .plot-label{fill:#E5EBE4;font:12px Inter,system-ui,sans-serif}
+#statsDialog .analytics-plot .plot-tick{fill:#E5EBE4;font:12px Inter,system-ui,sans-serif}
+#statsDialog .analytics-plot .plot-line-new{stroke:#F4D35E;stroke-width:3;stroke-linecap:round;stroke-linejoin:round;fill:none}
+#statsDialog .analytics-plot .plot-area-new{fill:#A6C0CF;opacity:.22;stroke:none}
+#statsDialog .analytics-plot .plot-dot-new{fill:#E5EBE4;stroke:#092B49;stroke-width:1.1}
 #statsDialog .analytics-plot .plot-hit{cursor:crosshair;outline:none}
 #statsDialog .analytics-plot .plot-hit:focus{stroke:#fff;stroke-width:2;outline:none}
-#statsDialog .analytics-tooltip{position:absolute;z-index:8;max-width:230px;min-width:125px;padding:9px 11px;border:1px solid #ba92d0;border-radius:9px;background:#15111feb;box-shadow:0 8px 22px #0008;color:#f8edff;font-size:12px;line-height:1.5;pointer-events:none;white-space:normal}
+#statsDialog .analytics-tooltip{position:absolute;z-index:8;max-width:230px;min-width:125px;padding:9px 11px;border:1px solid #A6C0CF;border-radius:9px;background:#092B49eb;box-shadow:0 8px 22px #082C4B88;color:#E5EBE4;font-size:12px;line-height:1.5;pointer-events:none;white-space:normal}
 #statsDialog .analytics-tooltip[hidden]{display:none!important}
-#statsDialog .analytics-card-summary{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:8px;color:#cab9d7;font-size:12px;line-height:1.5}
-#statsDialog .analytics-card-summary strong{color:#efd5f7;font-weight:700}
-#statsDialog .analytics-table{margin-top:11px;border-top:1px solid #4d3c58;padding-top:10px}
-#statsDialog .analytics-table summary{cursor:pointer;list-style:auto;color:#dbbceb;font-size:13px;font-weight:650;padding:6px 0}
+#statsDialog .analytics-card-summary{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:8px;color:#E5EBE4;font-size:12px;line-height:1.5}
+#statsDialog .analytics-card-summary strong{color:#E5EBE4;font-weight:700}
+#statsDialog .analytics-table{margin-top:11px;border-top:1px solid #174C75;padding-top:10px}
+#statsDialog .analytics-table summary{cursor:pointer;list-style:auto;color:#E5EBE4;font-size:13px;font-weight:650;padding:6px 0}
 #statsDialog .analytics-table table{border-collapse:collapse;width:100%;font-size:12px;line-height:1.4;margin-top:10px}
-#statsDialog .analytics-table th,#statsDialog .analytics-table td{text-align:left;padding:8px 9px;border-bottom:1px solid #43384d}
-#statsDialog .analytics-table th{color:#ebd8f4;background:#30253b}
-#statsDialog .analytics-table td{color:#d4c4dc;font-variant-numeric:tabular-nums}
-#statsDialog .analytics-table-note{font-size:12px;color:#bcb0ca;margin:8px 0 0}
-#statsDialog .analytics-empty{border:1px dashed #60516b;padding:45px 12px;border-radius:10px;text-align:center;color:#c4b2d5;font-size:14px}
+#statsDialog .analytics-table th,#statsDialog .analytics-table td{text-align:left;padding:8px 9px;border-bottom:1px solid #174C75}
+#statsDialog .analytics-table th{color:#E5EBE4;background:#092B49}
+#statsDialog .analytics-table td{color:#E5EBE4;font-variant-numeric:tabular-nums}
+#statsDialog .analytics-table-note{font-size:12px;color:#E5EBE4;margin:8px 0 0}
+#statsDialog .analytics-empty{border:1px dashed #174C75;padding:45px 12px;border-radius:10px;text-align:center;color:#E5EBE4;font-size:14px}
 @media(max-width:1100px){#statsDialog .analytics-grid.layout-double{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:720px){#statsDialog .analytics-studio-header{align-items:flex-start;flex-direction:column}#statsDialog .analytics-count{flex:none}#statsDialog .analytics-toolbar label{max-width:none;flex-basis:calc(50% - 12px)}#statsDialog .analytics-card{padding:15px!important}#statsDialog .analytics-card-head{padding-right:26px}#statsDialog .analytics-card-tools{align-items:flex-start}#statsDialog .analytics-card-buttons button{min-height:38px}}
 @media(max-width:420px){#statsDialog .analytics-toolbar label{flex-basis:calc(50% - 8px)}#statsDialog .analytics-toolbar .analytics-reset{width:100%}#statsDialog .analytics-card-tools label{flex:1;width:100%;justify-content:space-between}#statsDialog .analytics-card-tools select{flex:1;max-width:none}#statsDialog .analytics-card-buttons{width:100%}#statsDialog .analytics-card-buttons button{flex:1}#statsDialog .analytics-count{max-width:100%}}
@@ -5098,145 +5814,145 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 #statsDialog .data-studio{min-width:0}
 #statsDialog .data-header{display:flex;justify-content:space-between;gap:15px;align-items:center;margin-bottom:17px}
 #statsDialog .data-header h4{font-size:22px;margin:5px 0 7px}
-#statsDialog .data-header p{font-size:13px;color:#c8b8d5;line-height:1.5;margin:0}
+#statsDialog .data-header p{font-size:13px;color:#E5EBE4;line-height:1.5;margin:0}
 #statsDialog .data-header button{flex:none;min-height:38px}
-#statsDialog .data-filters{display:flex;flex-wrap:wrap;gap:12px;align-items:end;padding:16px;border-radius:13px;border:1px solid #554565;background:#251e30}
-#statsDialog .data-filters label{display:flex;flex:1 1 140px;flex-direction:column;gap:5px;min-width:125px;color:#d4c5e0;font-size:12px;font-weight:650}
-#statsDialog .data-filters input,#statsDialog .data-filters select{max-width:100%;min-width:0;width:100%;min-height:38px;background:#342b40;color:#f5effa;border-radius:8px;font-size:13px}
+#statsDialog .data-filters{display:flex;flex-wrap:wrap;gap:12px;align-items:end;padding:16px;border-radius:13px;border:1px solid #174C75;background:#092B49}
+#statsDialog .data-filters label{display:flex;flex:1 1 140px;flex-direction:column;gap:5px;min-width:125px;color:#E5EBE4;font-size:12px;font-weight:650}
+#statsDialog .data-filters input,#statsDialog .data-filters select{max-width:100%;min-width:0;width:100%;min-height:38px;background:#174C75;color:#E5EBE4;border-radius:8px;font-size:13px}
 #statsDialog .data-filters button{min-height:38px}
-#statsDialog .data-columns{margin:15px 0;border:1px solid #574666;border-radius:12px;padding:13px 16px;background:#24202f}
+#statsDialog .data-columns{margin:15px 0;border:1px solid #174C75;border-radius:12px;padding:13px 16px;background:#092B49}
 #statsDialog .data-columns summary{cursor:pointer;font-weight:700;font-size:13px}
 #statsDialog .data-column-choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:9px;margin:14px 0}
-#statsDialog .data-column-choices label{display:flex;gap:8px;align-items:center;color:#e2d4ec;font-size:13px}
-#statsDialog .data-column-choices input{accent-color:#ad82d5;width:16px;height:16px}
-#statsDialog .data-summary{font-size:13px;color:#d6c3e3;margin:15px 0 10px;min-height:18px}
-#statsDialog .data-scroll{max-width:100%;max-height:490px;overflow:auto;border:1px solid #60506f;border-radius:13px;background:#201a2b;scrollbar-color:#786186 #241e30}
-#statsDialog .data-scroll:focus-visible{outline:2px solid #c99deb;outline-offset:2px}
+#statsDialog .data-column-choices label{display:flex;gap:8px;align-items:center;color:#E5EBE4;font-size:13px}
+#statsDialog .data-column-choices input{accent-color:#A6C0CF;width:16px;height:16px}
+#statsDialog .data-summary{font-size:13px;color:#E5EBE4;margin:15px 0 10px;min-height:18px}
+#statsDialog .data-scroll{max-width:100%;max-height:490px;overflow:auto;border:1px solid #174C75;border-radius:13px;background:#092B49;scrollbar-color:#507995 #092B49}
+#statsDialog .data-scroll:focus-visible{outline:2px solid #E5EBE4;outline-offset:2px}
 #statsDialog #dataTable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
-#statsDialog #dataTable th{position:sticky;top:0;z-index:1;text-align:left;padding:0;background:#342840;border-bottom:1px solid #6f5979}
-#statsDialog #dataTable th button{font:inherit;color:#f3e7fa;background:none;border:0;padding:13px 11px;white-space:nowrap;cursor:pointer;font-weight:700}
-#statsDialog #dataTable th button:focus-visible{outline:2px solid #f0b4e9;outline-offset:-3px}
-#statsDialog #dataTable td{padding:11px 12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #453850;color:#ddcfe8}
-#statsDialog #dataTable tr:nth-child(even) td{background:#271f32}
-#statsDialog #dataTable tr:hover td{background:#3b2b48}
-#statsDialog #dataTable td.data-name{font-weight:750;color:#eac3f1}
-#statsDialog #dataTable td.data-name button{color:inherit;background:none;border:0;padding:0;text-align:left;font:inherit;cursor:pointer;text-decoration:underline;text-decoration-color:#8b7095;text-underline-offset:4px}
+#statsDialog #dataTable th{position:sticky;top:0;z-index:1;text-align:left;padding:0;background:#174C75;border-bottom:1px solid #507995}
+#statsDialog #dataTable th button{font:inherit;color:#E5EBE4;background:none;border:0;padding:13px 11px;white-space:nowrap;cursor:pointer;font-weight:700}
+#statsDialog #dataTable th button:focus-visible{outline:2px solid #E5EBE4;outline-offset:-3px}
+#statsDialog #dataTable td{padding:11px 12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #174C75;color:#E5EBE4}
+#statsDialog #dataTable tr:nth-child(even) td{background:#092B49}
+#statsDialog #dataTable tr:hover td{background:#174C75}
+#statsDialog #dataTable td.data-name{font-weight:750;color:#E5EBE4}
+#statsDialog #dataTable td.data-name button{color:inherit;background:none;border:0;padding:0;text-align:left;font:inherit;cursor:pointer;text-decoration:underline;text-decoration-color:#507995;text-underline-offset:4px}
 #statsDialog #dataTable .data-excluded{margin-left:6px;color:#ffcb93;font-size:11px}
-#statsDialog .data-pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-top:13px;color:#d4c5e3;font-size:13px}
+#statsDialog .data-pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin-top:13px;color:#E5EBE4;font-size:13px}
 #statsDialog .data-pagination button{min-width:90px}
-#statsDialog .data-note{color:#bfadd0;font-size:12px;line-height:1.65;margin:12px 0}
+#statsDialog .data-note{color:#E5EBE4;font-size:12px;line-height:1.65;margin:12px 0}
 #statsDialog #statsData .insights-content-card.lh-help-card>.lh-help-trigger{top:14px;right:13px}
-#settingsDialog .smart-filter-row{border-top:1px solid #4e3d5a;padding-top:17px;margin-top:14px}
+#settingsDialog .smart-filter-row{border-top:1px solid #174C75;padding-top:17px;margin-top:14px}
 #settingsDialog .settings-save-state.saved{color:#bce7bb}
-#settingsDialog .anomaly-review-count{display:block;margin-top:7px;color:#e6c4f4;font-weight:750;font-size:13px;line-height:1.45}
+#settingsDialog .anomaly-review-count{display:block;margin-top:7px;color:#E5EBE4;font-weight:750;font-size:13px;line-height:1.45}
 @media(max-width:650px){#statsDialog .data-header{align-items:stretch;flex-direction:column}#statsDialog .data-header button{align-self:flex-start}#statsDialog .data-filters label{flex-basis:calc(50% - 8px)}#statsDialog .data-pagination{justify-content:center;flex-wrap:wrap}}
 @media(max-width:400px){#statsDialog .data-filters label{flex-basis:100%}}
 #statsDialog .stats-tabs button[hidden]{display:none!important}
-#statsDialog .review-summary{padding:14px 17px;border:1px solid #635072;border-radius:12px;background:#292036;color:#f1e4fa;font-weight:650;margin:16px 0 23px}
+#statsDialog .review-summary{padding:14px 17px;border:1px solid #174C75;border-radius:12px;background:#092B49;color:#E5EBE4;font-weight:650;margin:16px 0 23px}
 #statsDialog .review-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:20px 0 10px}
 #statsDialog .review-heading h5{font-size:17px;margin:0}
-#statsDialog .review-heading span{font-size:13px;color:#d1b5df}
+#statsDialog .review-heading span{font-size:13px;color:#E5EBE4}
 #statsDialog .review-list{display:grid;gap:9px}
-#statsDialog .review-item{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 17px;width:100%;text-align:left;border-radius:12px;background:#251d31;border:1px solid #51405f;min-width:0}
-#statsDialog .review-item:hover,#statsDialog .review-item:focus-visible{border-color:#b584cd;background:#332541}
+#statsDialog .review-item{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 17px;width:100%;text-align:left;border-radius:12px;background:#092B49;border:1px solid #174C75;min-width:0}
+#statsDialog .review-item:hover,#statsDialog .review-item:focus-visible{border-color:#A6C0CF;background:#174C75}
 #statsDialog .review-item>span:first-child{display:grid;gap:5px;min-width:0}
 #statsDialog .review-item strong{font-size:15px;overflow-wrap:anywhere}
-#statsDialog .review-item small{font-size:13px;color:#c7b6d3}
+#statsDialog .review-item small{font-size:13px;color:#E5EBE4}
 #statsDialog .review-reasons{font-size:12px;color:#f3ba96;line-height:1.4}
-#statsDialog .review-open{font-size:13px;color:#e3b9f5;flex:none}
-#statsDialog .review-note{font-size:13px;line-height:1.6;color:#c9b8d3}
-#ridePreviewDialog .review-preview{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:15px;padding:15px 16px;border:1px solid #875c93;background:#35233e;border-radius:12px}
-#ridePreviewDialog .review-preview strong{font-size:15px;color:#fff0ff}
-#ridePreviewDialog .review-preview p{font-size:13px;line-height:1.55;color:#e2d0ed;margin:5px 0 0}
+#statsDialog .review-open{font-size:13px;color:#E5EBE4;flex:none}
+#statsDialog .review-note{font-size:13px;line-height:1.6;color:#E5EBE4}
+#ridePreviewDialog .review-preview{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:15px;padding:15px 16px;border:1px solid #507995;background:#092B49;border-radius:12px}
+#ridePreviewDialog .review-preview strong{font-size:15px;color:#E5EBE4}
+#ridePreviewDialog .review-preview p{font-size:13px;line-height:1.55;color:#E5EBE4;margin:5px 0 0}
 #ridePreviewDialog .review-preview button{flex:none;max-width:45%;white-space:normal;line-height:1.4}
 @media(max-width:630px){#statsDialog .review-item{align-items:flex-start;flex-direction:column}#statsDialog .review-open{align-self:flex-start}#ridePreviewDialog .review-preview{align-items:stretch;flex-direction:column}#ridePreviewDialog .review-preview button{max-width:none;align-self:flex-start}}
 
 #captureDialog{width:min(970px,96vw);max-width:min(970px,96vw);padding:22px;max-height:94vh;overflow-y:auto}
 #captureDialog .capture-brand{display:flex;align-items:center;gap:12px;min-width:0}
 #captureDialog .capture-brand h2{font-size:22px;margin:0}
-#captureDialog .capture-brand p{margin:2px 0 0;color:#c9b7d7;font-size:13px;line-height:1.5}
+#captureDialog .capture-brand p{margin:2px 0 0;color:#E5EBE4;font-size:13px;line-height:1.5}
 #captureDialog .dialog-head{align-items:center;margin-bottom:14px}
 #captureDialog .capture-settings{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 14px}
-#captureDialog .capture-settings label{min-width:155px;flex:1;display:flex;flex-direction:column;align-items:stretch;gap:5px;color:#dcd0e7;font-size:12px;font-weight:650}
-#captureDialog .capture-settings select{min-height:39px;background:#2d2538;color:#fff;border:1px solid #645473;border-radius:8px}
-#captureDialog .capture-zoom-row{display:flex;align-items:center;gap:12px;margin:0 0 13px;padding:10px 13px;border:1px solid #51405f;border-radius:10px;background:#241b30;flex-wrap:wrap}
-#captureDialog .capture-zoom-row label{display:flex;gap:9px;align-items:center;font-size:12px;color:#e6d6ec;font-weight:650;white-space:nowrap}
-#captureDialog .capture-zoom-row input{flex:1 1 190px;min-width:100px;accent-color:#bd85d8;cursor:pointer}
-#captureDialog .capture-zoom-row output{font-size:12px;color:#e7cfef;font-variant-numeric:tabular-nums;min-width:38px;text-align:right}
-#captureDialog .capture-zoom-row small{flex-basis:100%;color:#c1adcd;font-size:11px}
-#captureDialog .capture-stage.transparent-preview{background-color:#dfd9e8;background-image:linear-gradient(45deg,#ffffff 25%,transparent 25%),linear-gradient(-45deg,#ffffff 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ffffff 75%),linear-gradient(-45deg,transparent 75%,#ffffff 75%);background-size:26px 26px;background-position:0 0,0 13px,13px -13px,-13px 0}
+#captureDialog .capture-settings label{min-width:155px;flex:1;display:flex;flex-direction:column;align-items:stretch;gap:5px;color:#E5EBE4;font-size:12px;font-weight:650}
+#captureDialog .capture-settings select{min-height:39px;background:#092B49;color:#fff;border:1px solid #507995;border-radius:8px}
+#captureDialog .capture-zoom-row{display:flex;align-items:center;gap:12px;margin:0 0 13px;padding:10px 13px;border:1px solid #174C75;border-radius:10px;background:#092B49;flex-wrap:wrap}
+#captureDialog .capture-zoom-row label{display:flex;gap:9px;align-items:center;font-size:12px;color:#E5EBE4;font-weight:650;white-space:nowrap}
+#captureDialog .capture-zoom-row input{flex:1 1 190px;min-width:100px;accent-color:#A6C0CF;cursor:pointer}
+#captureDialog .capture-zoom-row output{font-size:12px;color:#E5EBE4;font-variant-numeric:tabular-nums;min-width:38px;text-align:right}
+#captureDialog .capture-zoom-row small{flex-basis:100%;color:#E5EBE4;font-size:11px}
+#captureDialog .capture-stage.transparent-preview{background-color:#E5EBE4;background-image:linear-gradient(45deg,#ffffff 25%,transparent 25%),linear-gradient(-45deg,#ffffff 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ffffff 75%),linear-gradient(-45deg,transparent 75%,#ffffff 75%);background-size:26px 26px;background-position:0 0,0 13px,13px -13px,-13px 0}
 #captureDialog .capture-stage.light-preview{background:#e7e9eb}
-#captureDialog .capture-stage.dark-preview{background:#100b1c}
-.advanced-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:10px 0 22px}.advanced-summary{padding:15px;border:1px solid #574467;border-radius:10px;background:#2a2134}.advanced-summary strong{display:block;font-size:17px;color:#f3ddf7}.advanced-summary span{display:block;font-size:12px;color:#c9b4d7;margin-top:6px}.advanced-graph-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.advanced-graph{background:#292132;border:1px solid #594666;border-radius:12px;padding:16px;min-width:0}.advanced-graph h5{font-size:15px;margin:0 0 16px}.advanced-graph p{font-size:11px;margin-top:10px}.advanced-chart svg{display:block;width:100%;height:auto;overflow:hidden}.advanced-table{margin-top:10px;color:#d9c9e3;font-size:12px}.advanced-table summary{cursor:pointer;list-style:none;padding:6px 0}.advanced-table summary::-webkit-details-marker{display:none}.advanced-table table{border-collapse:collapse;width:100%;font-size:11px}.advanced-table th,.advanced-table td{border-bottom:1px solid #51415a;padding:6px;text-align:left}.advanced-table th:last-child,.advanced-table td:last-child{text-align:right}@media(max-width:760px){.advanced-graph-grid{grid-template-columns:minmax(0,1fr)}}
-#captureDialog .capture-stage{position:relative;overflow:hidden;width:min(100%,calc(50vh * var(--capture-ratio,1.7777778)));aspect-ratio:var(--capture-ratio,1.7777778);margin-inline:auto;border:1px solid #665171;border-radius:13px;background:#100b1c;touch-action:none;cursor:grab}
+#captureDialog .capture-stage.dark-preview{background:#092B49}
+.advanced-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:10px 0 22px}.advanced-summary{padding:15px;border:1px solid #174C75;border-radius:10px;background:#092B49}.advanced-summary strong{display:block;font-size:17px;color:#E5EBE4}.advanced-summary span{display:block;font-size:12px;color:#E5EBE4;margin-top:6px}.advanced-graph-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.advanced-graph{background:#092B49;border:1px solid #174C75;border-radius:12px;padding:16px;min-width:0}.advanced-graph h5{font-size:15px;margin:0 0 16px}.advanced-graph p{font-size:11px;margin-top:10px}.advanced-chart svg{display:block;width:100%;height:auto;overflow:hidden}.advanced-table{margin-top:10px;color:#E5EBE4;font-size:12px}.advanced-table summary{cursor:pointer;list-style:none;padding:6px 0}.advanced-table summary::-webkit-details-marker{display:none}.advanced-table table{border-collapse:collapse;width:100%;font-size:11px}.advanced-table th,.advanced-table td{border-bottom:1px solid #174C75;padding:6px;text-align:left}.advanced-table th:last-child,.advanced-table td:last-child{text-align:right}@media(max-width:760px){.advanced-graph-grid{grid-template-columns:minmax(0,1fr)}}
+#captureDialog .capture-stage{position:relative;overflow:hidden;width:min(100%,calc(50vh * var(--capture-ratio,1.7777778)));aspect-ratio:var(--capture-ratio,1.7777778);margin-inline:auto;border:1px solid #174C75;border-radius:13px;background:#092B49;touch-action:none;cursor:grab}
 #captureDialog .capture-stage:active{cursor:grabbing}
 #captureDialog .capture-stage canvas{position:relative;z-index:2;display:block;width:100%;height:100%;pointer-events:none}
 #captureDialog .capture-tiles{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:1}
 #captureDialog .capture-tiles img{position:absolute;left:0;top:0;width:256px;height:256px;pointer-events:none;user-select:none}
 #captureDialog .capture-tiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}
-#captureDialog .capture-map-credit{position:absolute;bottom:9px;right:9px;z-index:4;font-size:10px;color:#e9e1f1;background:#171523cf;padding:3px 6px;border-radius:4px;pointer-events:none}
+#captureDialog .capture-map-credit{position:absolute;bottom:9px;right:9px;z-index:4;font-size:10px;color:#E5EBE4;background:#092B49cf;padding:3px 6px;border-radius:4px;pointer-events:none}
 #captureDialog .capture-controls{position:absolute;right:10px;top:10px;display:grid;gap:7px}
-#captureDialog .capture-controls button{padding:0 9px;min-width:38px;min-height:38px;font-size:16px;background:#281c38e8;border:1px solid #7b6492;color:#fff;border-radius:9px}
-#captureDialog .capture-overlay-status{position:absolute;bottom:12px;left:12px;padding:8px 12px;background:#1d1629eb;border:1px solid #685174;border-radius:8px;pointer-events:none;font-size:12px;color:#e8d8f5}
+#captureDialog .capture-controls button{padding:0 9px;min-width:38px;min-height:38px;font-size:16px;background:#092B49e8;border:1px solid #507995;color:#fff;border-radius:9px}
+#captureDialog .capture-overlay-status{position:absolute;bottom:12px;left:12px;padding:8px 12px;background:#092B49eb;border:1px solid #174C75;border-radius:8px;pointer-events:none;font-size:12px;color:#E5EBE4}
 #captureDialog .capture-overlay-status[hidden]{display:none}
 #captureDialog .capture-editor-foot{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px;margin-top:14px}
-#captureDialog .capture-editor-foot p{margin:0;flex:1 1 290px;color:#cdbdd9;font-size:13px;line-height:1.55}
+#captureDialog .capture-editor-foot p{margin:0;flex:1 1 290px;color:#E5EBE4;font-size:13px;line-height:1.55}
 #captureDialog .capture-editor-actions{display:flex;flex-wrap:wrap;gap:9px;justify-content:flex-end}
 #captureDialog .capture-editor-actions button{min-height:42px}
-#captureDialog .capture-status{min-height:18px;font-size:13px;color:#d6c1e4;margin-top:9px}
+#captureDialog .capture-status{min-height:18px;font-size:13px;color:#E5EBE4;margin-top:9px}
 @media(max-width:560px){#captureDialog{padding:14px}#captureDialog .capture-settings label{min-width:125px}#captureDialog .capture-editor-actions{width:100%}#captureDialog .capture-editor-actions button{flex:1}#captureDialog .capture-stage{width:min(100%,calc(46vh * var(--capture-ratio,1.7777778)))}#captureDialog .capture-zoom-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}#captureDialog .capture-zoom-row label{grid-column:1;grid-row:1}#captureDialog .capture-zoom-row output{grid-column:2;grid-row:1}#captureDialog .capture-zoom-row input{grid-column:1/-1;grid-row:2;width:100%;min-width:0;margin:0}#captureDialog .capture-zoom-row small{grid-column:1/-1;grid-row:3}#captureDialog .capture-overlay-status{top:9px;bottom:auto;left:9px;max-width:calc(100% - 69px);font-size:11px;padding:6px 8px}#captureDialog .capture-map-credit{bottom:6px;right:6px;font-size:9px;max-width:85%}}
-.brand-text{min-width:0}.brand-title-row{display:flex;align-items:baseline;flex-wrap:wrap;column-gap:13px;row-gap:0}.brand-title-row h1{flex:0 0 auto}.brand-credit{font-size:16px;font-weight:650;line-height:1.35;color:#f0e3fa;white-space:nowrap}.brand-credit a{color:#ffe4fa;font-weight:750;text-decoration:none;border-bottom:1px solid #dba0db}.brand-credit a:hover,.brand-credit a:focus-visible{color:#ffffff;border-color:#ebd1ff}@media(max-width:1120px){.brand-credit{font-size:14px}.brand-title-row{gap:9px}}@media(max-width:900px){header .brand small{display:none}}@media(max-width:830px){.brand-credit{font-size:14px}}@media(max-width:640px){.brand-title-row{gap:3px}.brand-credit{display:block;width:100%;font-size:14px;line-height:1.35}header{min-height:76px}}
+.brand-text{min-width:0}.brand-title-row{display:flex;align-items:baseline;flex-wrap:wrap;column-gap:13px;row-gap:0}.brand-title-row h1{flex:0 0 auto}.brand-credit{font-size:16px;font-weight:650;line-height:1.35;color:#E5EBE4;white-space:nowrap}.brand-credit a{color:#E5EBE4;font-weight:750;text-decoration:none;border-bottom:1px solid #E5EBE4}.brand-credit a:hover,.brand-credit a:focus-visible{color:#ffffff;border-color:#E5EBE4}@media(max-width:1120px){.brand-credit{font-size:14px}.brand-title-row{gap:9px}}@media(max-width:900px){header .brand small{display:none}}@media(max-width:830px){.brand-credit{font-size:14px}}@media(max-width:640px){.brand-title-row{gap:3px}.brand-credit{display:block;width:100%;font-size:14px;line-height:1.35}header{min-height:76px}}
 
-#installUpdate.update-available:not(:disabled){background:linear-gradient(115deg,#bd90e7,#f5b5d4);border-color:#efb5f0;color:#21132a;font-weight:750;box-shadow:0 0 0 1px #e8adeb88,0 0 16px #cb7feb65;animation:lhUpdateGlow 3.2s ease-in-out infinite}
-#installUpdate.update-available:hover:not(:disabled){background:linear-gradient(115deg,#d2a8f4,#ffc5de)}
-@keyframes lhUpdateGlow{0%,100%{box-shadow:0 0 0 1px #e8adeb88,0 0 13px #cb7feb55}50%{box-shadow:0 0 0 2px #e8adebaa,0 0 22px #cb7febaa}}
+#installUpdate.update-available:not(:disabled){background:linear-gradient(115deg,#F4D35E,#E5EBE4);border-color:#E5EBE4;color:#092B49;font-weight:750;box-shadow:0 0 0 1px #E5EBE488,0 0 16px #F4D35E65;animation:lhUpdateGlow 3.2s ease-in-out infinite}
+#installUpdate.update-available:hover:not(:disabled){background:linear-gradient(115deg,#E5EBE4,#E5EBE4)}
+@keyframes lhUpdateGlow{0%,100%{box-shadow:0 0 0 1px #E5EBE488,0 0 13px #F4D35E55}50%{box-shadow:0 0 0 2px #E5EBE4aa,0 0 22px #F4D35Eaa}}
 @media(prefers-reduced-motion:reduce){#installUpdate.update-available{animation:none}}
 
-.v120-card{padding:16px;border:1px solid #594568;border-radius:12px;background:#242031;margin:12px 0;line-height:1.5}
+.v120-card{padding:16px;border:1px solid #174C75;border-radius:12px;background:#092B49;margin:12px 0;line-height:1.5}
 .v120-toolbar,.v120-compare-pickers{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:14px 0}
-.v120-toolbar label,.v120-compare-pickers label{display:flex;flex-direction:column;gap:5px;min-width:130px;flex:1;color:#d4c4e2;font-size:13px}
-.v120-toolbar select,.v120-compare-pickers select,.v120-compare-pickers input{width:100%;background:#242031}
+.v120-toolbar label,.v120-compare-pickers label{display:flex;flex-direction:column;gap:5px;min-width:130px;flex:1;color:#E5EBE4;font-size:13px}
+.v120-toolbar select,.v120-compare-pickers select,.v120-compare-pickers input{width:100%;background:#092B49}
 .v120-compare-pickers button{min-height:39px}
-.v120-compare-stage{width:100%;height:310px;position:relative;border-radius:14px;overflow:hidden;background:#171322;border:1px solid #58466a;margin:15px 0}
-#compareTiles{position:absolute;inset:0;overflow:hidden;background:#161621;z-index:0;pointer-events:none}
+.v120-compare-stage{width:100%;height:310px;position:relative;border-radius:14px;overflow:hidden;background:#092B49;border:1px solid #174C75;margin:15px 0}
+#compareTiles{position:absolute;inset:0;overflow:hidden;background:#092B49;z-index:0;pointer-events:none}
 #compareTiles img{position:absolute;left:0;top:0;width:256px;height:256px;pointer-events:none;user-select:none;filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)}
 .v120-compare-stage #compareCanvas{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:1;pointer-events:none}
-.v120-compare-stage .compare-map-badge{position:absolute;z-index:2;left:12px;top:12px;padding:6px 9px;border:1px solid #574766;border-radius:8px;background:#272037dc;color:#f2e5fb;font-size:12px;font-weight:600;pointer-events:none}
-.v120-compare-stage .compare-map-attribution{position:absolute;z-index:2;right:7px;bottom:6px;background:#181425b5;color:#cbafd9;font-size:10px;padding:2px 5px;border-radius:3px;text-decoration:none}
+.v120-compare-stage .compare-map-badge{position:absolute;z-index:2;left:12px;top:12px;padding:6px 9px;border:1px solid #174C75;border-radius:8px;background:#092B49dc;color:#E5EBE4;font-size:12px;font-weight:600;pointer-events:none}
+.v120-compare-stage .compare-map-attribution{position:absolute;z-index:2;right:7px;bottom:6px;background:#092B49b5;color:#E5EBE4;font-size:10px;padding:2px 5px;border-radius:3px;text-decoration:none}
 .v120-compare-stage .compare-map-attribution[hidden]{display:none}
 .v120-metrics{grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:15px}
-.v120-telemetry{border:1px solid #5b466a;border-radius:12px;background:#211b2c;padding:14px;margin:14px 0}
+.v120-telemetry{border:1px solid #174C75;border-radius:12px;background:#092B49;padding:14px;margin:14px 0}
 .v120-telemetry-heading{display:flex;align-items:end;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.v120-telemetry-heading p{margin:4px 0 8px;color:#bdb1cc;font-size:12px}
+.v120-telemetry-heading p{margin:4px 0 8px;color:#E5EBE4;font-size:12px}
 .v120-telemetry-heading select{min-width:160px}
 #telemetryCanvas{display:block;width:100%;height:220px;margin-top:12px;touch-action:pan-y;cursor:crosshair}
 #telemetryCanvas[hidden],#telemetryScrub[hidden]{display:none}
-.telemetry-scrub-label{display:flex;align-items:center;gap:14px;margin-top:12px;color:#bfb3ce;font-size:12px}
-#telemetryScrub{flex:1;min-width:120px;accent-color:#e7a2cd}
+.telemetry-scrub-label{display:flex;align-items:center;gap:14px;margin-top:12px;color:#E5EBE4;font-size:12px}
+#telemetryScrub{flex:1;min-width:120px;accent-color:#E5EBE4}
 #telemetryStatus{margin-top:10px;min-height:28px;line-height:1.55}
-#heatVisitTooltip{position:absolute;z-index:6;pointer-events:none;min-width:182px;max-width:255px;padding:11px 13px;border-radius:11px;border:1px solid #b682c8;background:#201729f2;box-shadow:0 12px 30px #0009;color:#f8eaff;font-size:13px;line-height:1.5}
+#heatVisitTooltip{position:absolute;z-index:6;pointer-events:none;min-width:182px;max-width:255px;padding:11px 13px;border-radius:11px;border:1px solid #A6C0CF;background:#092B49f2;box-shadow:0 12px 30px #082C4B99;color:#E5EBE4;font-size:13px;line-height:1.5}
 #heatVisitTooltip[hidden]{display:none}
 #heatVisitTooltip strong{display:block;font-size:15px;font-weight:750}
-#heatVisitTooltip span{display:block;font-size:11px;color:#cdbbd8;margin-top:4px}
-#timeMachineDialog[open]{position:fixed!important;inset:auto 16px 16px auto!important;margin:0!important;width:min(1190px,calc(100vw - 32px));max-width:none;max-height:min(38vh,240px);overflow:auto;padding:12px 15px;border:1px solid #806494;border-radius:13px;background:#211a2deF;box-shadow:0 12px 44px #07060bb8;z-index:80;backdrop-filter:blur(14px)}
-#timeMachineDialog:not([open]){display:none}
-#timeMachineDialog .tm-dock{display:flex;align-items:center;gap:13px;min-width:0}
-#timeMachineDialog .tm-title{font-size:14px;font-weight:750;white-space:nowrap;color:#f2d9fa}
-#timeMachineDialog .tm-mode{display:flex;align-items:center;gap:6px;flex:none;font-size:12px;color:#d5c3e4}
-#timeMachineDialog .tm-mode select{font-size:12px;max-width:175px;padding:7px}
-#timeMachineDialog .tm-year{display:flex;gap:9px;align-items:center;flex:1 1 155px;min-width:115px}
-#timeMachineDialog .tm-year strong{font-size:15px;min-width:40px;text-align:center;color:#f4e6fa}
-#timeMachineDialog #timeMachineYear{width:100%;min-width:65px}
-#timeMachineDialog .tm-step,#timeMachineDialog .tm-actions{display:flex;gap:5px;align-items:center;flex:none}
-#timeMachineDialog .tm-step button,#timeMachineDialog .tm-actions button{padding:7px 10px;min-height:34px;white-space:nowrap;font-size:12px}
-#timeMachineDialog .tm-step button:first-child,#timeMachineDialog .tm-step button:last-child{font-size:19px;line-height:1;padding:5px 10px}
-#timeMachineDialog .tm-summary{font-size:12px;color:#dbcae7;white-space:nowrap;flex:none}
-#timeMachineDialog .tm-status{font-size:11px;color:#beacd0;margin:4px 0 0;min-height:0}
-#timeMachineDialog .tm-status:empty{display:none}
-@media(max-width:1070px){#timeMachineDialog .tm-dock{flex-wrap:wrap;gap:9px 12px}#timeMachineDialog .tm-title{flex:0 0 auto}#timeMachineDialog .tm-year{flex:1 1 190px}#timeMachineDialog .tm-summary{order:5}#timeMachineDialog .tm-actions{margin-left:auto}}
-@media(max-width:560px){#timeMachineDialog[open]{inset:auto 8px 8px 8px!important;width:calc(100vw - 16px);max-height:45vh;padding:10px}#timeMachineDialog .tm-title{font-size:13px}#timeMachineDialog .tm-mode{flex:1}#timeMachineDialog .tm-mode select{max-width:160px}#timeMachineDialog .tm-year{order:3;flex:1 1 100%}#timeMachineDialog .tm-step{order:4}#timeMachineDialog .tm-actions{order:5}#timeMachineDialog .tm-summary{order:6;width:100%}#timeMachineDialog .tm-step button,#timeMachineDialog .tm-actions button{font-size:11px;padding:6px 8px}}
+#heatVisitTooltip span{display:block;font-size:11px;color:#E5EBE4;margin-top:4px}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@media(max-width:1070px){}
+@media(max-width:560px){}
 @media(max-width:650px){.v120-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.v120-compare-stage{height:240px}.v120-compare-pickers>*{flex:1 1 100%}}
-.v121-compare-browse{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:0 0 14px;color:#c6b7d5;font-size:12px}
+.v121-compare-browse{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:0 0 14px;color:#E5EBE4;font-size:12px}
 .v121-compare-browse button{font-size:12px;min-height:34px;padding:7px 12px}
 
 #ridePreviewDialog{width:min(1280px,96vw);max-width:min(1280px,96vw);max-height:92dvh}
@@ -5253,28 +5969,28 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 @media(max-width:630px){#ridePreviewDialog{width:100vw;max-width:100vw;max-height:100dvh;margin:0;border-radius:0;padding:14px}#ridePreviewDialog .ride-preview-map{height:235px}#ridePreviewDialog .ride-preview-details{grid-template-columns:repeat(2,minmax(0,1fr))}#ridePreviewDialog .v120-telemetry-heading{flex-direction:column;align-items:stretch}#ridePreviewDialog .v120-telemetry-heading select{width:100%}}
 
 
-.v121-compare-metrics{margin:16px 0;border:1px solid #51435e;border-radius:13px;overflow:hidden}
-.v121-compare-metric-row{display:grid;grid-template-columns:1fr 1fr 1fr 1.4fr;gap:12px;padding:12px 15px;align-items:center;border-top:1px solid #3b3149;font-size:13px;line-height:1.45}
+.v121-compare-metrics{margin:16px 0;border:1px solid #174C75;border-radius:13px;overflow:hidden}
+.v121-compare-metric-row{display:grid;grid-template-columns:1fr 1fr 1fr 1.4fr;gap:12px;padding:12px 15px;align-items:center;border-top:1px solid #174C75;font-size:13px;line-height:1.45}
 .v121-compare-metric-row:first-child{border-top:0}
-.v121-compare-header{color:#d4bde6;background:#2a2236;font-weight:700}
+.v121-compare-header{color:#E5EBE4;background:#092B49;font-weight:700}
 .v121-compare-metric-row span{overflow-wrap:anywhere}
-.v121-compare-metric-row .v121-a{color:#dda7ff;font-weight:650}
+.v121-compare-metric-row .v121-a{color:#E5EBE4;font-weight:650}
 .v121-compare-metric-row .v121-b{color:#ffc29a;font-weight:650}
-.v121-compare-trends{border:1px solid #51435e;border-radius:13px;padding:17px;background:#1b1725;margin:15px 0}
+.v121-compare-trends{border:1px solid #174C75;border-radius:13px;padding:17px;background:#092B49;margin:15px 0}
 .v121-compare-trend-head{display:flex;align-items:start;justify-content:space-between;gap:14px;flex-wrap:wrap}
-.v121-compare-trend-head strong{font-size:16px;color:#eee6fb}
-.v121-compare-trend-head p{font-size:13px;line-height:1.5;color:#c2b5d0;margin:5px 0 10px}
-.v121-compare-trend-head label{font-size:13px;color:#e3d2eb}
-.v121-compare-trend-head select{display:block;width:180px;max-width:100%;margin-top:5px;background:#242031}
+.v121-compare-trend-head strong{font-size:16px;color:#E5EBE4}
+.v121-compare-trend-head p{font-size:13px;line-height:1.5;color:#E5EBE4;margin:5px 0 10px}
+.v121-compare-trend-head label{font-size:13px;color:#E5EBE4}
+.v121-compare-trend-head select{display:block;width:180px;max-width:100%;margin-top:5px;background:#092B49}
 #compareTrendCanvas{height:225px;width:100%;display:block;touch-action:pan-y}
-.v121-compare-legend{display:flex;gap:20px;flex-wrap:wrap;font-size:13px;color:#dfd6e8;margin:8px 0 12px}
+.v121-compare-legend{display:flex;gap:20px;flex-wrap:wrap;font-size:13px;color:#E5EBE4;margin:8px 0 12px}
 .v121-compare-legend span{display:inline-flex;align-items:center;gap:7px}
 .v121-compare-legend i{width:20px;height:3px;display:inline-block;border-radius:3px}
-.v121-first{background:#d18aff}.v121-second{background:#ffaf6d}
-.v121-duplicates{border-top:1px solid #4a3d5e;padding-top:19px;margin-top:19px}
-.v121-duplicates h3{font-size:17px;margin:0 0 10px;color:#f1e8fa}
+.v121-first{background:#E5EBE4}.v121-second{background:#ffaf6d}
+.v121-duplicates{border-top:1px solid #174C75;padding-top:19px;margin-top:19px}
+.v121-duplicates h3{font-size:17px;margin:0 0 10px;color:#E5EBE4}
 .v121-duplicate-list{display:grid;gap:11px;margin:12px 0}
-.v121-duplicate-card{padding:14px;border:1px solid #51435e;background:#201a2b;border-radius:12px;display:grid;gap:12px;min-width:0}
+.v121-duplicate-card{padding:14px;border:1px solid #174C75;background:#092B49;border-radius:12px;display:grid;gap:12px;min-width:0}
 .v121-duplicate-card>strong{font-size:13px;line-height:1.4}
 .v121-duplicate-card>button{justify-self:start}
 .v121-duplicate-options{display:grid;gap:8px}
@@ -5283,59 +5999,59 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 .v121-duplicate-choice{display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap}
 .v121-duplicate-choice>label{flex:1 1 190px}
 .v121-duplicate-choice>button{flex:none;padding:7px 10px;font-size:12px}
-.v121-duplicate-choice small{color:#bfa2db;font-size:12px}
-#duplicateArchive{max-height:380px;overflow:auto;scrollbar-width:thin} .v121-archived-row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;background:#211b2c;border:1px solid #51435e;border-radius:9px;overflow-wrap:anywhere;font-size:13px}
+.v121-duplicate-choice small{color:#E5EBE4;font-size:12px}
+#duplicateArchive{max-height:380px;overflow:auto;scrollbar-width:thin} .v121-archived-row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;background:#092B49;border:1px solid #174C75;border-radius:9px;overflow-wrap:anywhere;font-size:13px}
 @media(max-width:650px){.v121-compare-metric-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.v121-compare-header{display:none}.v121-compare-metric-row span:first-child{grid-column:1/-1;font-weight:700}.v121-compare-metric-row span:last-child{grid-column:1/-1}}
-#ridePreviewDialog #openFlyover{background:linear-gradient(110deg,#d28be0,#e78da4);color:#201326;border:1px solid #e0a6e7;font-weight:750}
+#ridePreviewDialog #openFlyover{background:linear-gradient(110deg,#F4D35E,#F4D35E);color:#092B49;border:1px solid #E5EBE4;font-weight:750}
 #ridePreviewDialog #openFlyover:disabled{opacity:.55}
-#flyoverDialog{width:min(1450px,98vw);max-width:98vw;height:min(900px,96dvh);max-height:96dvh;padding:0;border:1px solid #85547d;background:#170f21;color:#f8effd;border-radius:18px;overflow:hidden;box-shadow:0 32px 110px #080311e5}
-#flyoverDialog::backdrop{background:#080511e0;backdrop-filter:blur(8px)}
+#flyoverDialog{width:min(1450px,98vw);max-width:98vw;height:min(900px,96dvh);max-height:96dvh;padding:0;border:1px solid #507995;background:#092B49;color:#E5EBE4;border-radius:18px;overflow:hidden;box-shadow:0 32px 110px #092B49e5}
+#flyoverDialog::backdrop{background:#092B49e0;backdrop-filter:blur(8px)}
 #flyoverDialog .flyover-shell{height:100%;display:flex;flex-direction:column;min-height:0}
-#flyoverDialog .flyover-top{display:flex;align-items:center;gap:14px;justify-content:space-between;padding:15px 20px;background:linear-gradient(110deg,#37213e,#25192f);border-bottom:1px solid #70537b}
+#flyoverDialog .flyover-top{display:flex;align-items:center;gap:14px;justify-content:space-between;padding:15px 20px;background:linear-gradient(110deg,#092B49,#092B49);border-bottom:1px solid #507995}
 #flyoverDialog .flyover-top h2{margin:0;font-size:22px;font-weight:750;line-height:1.2;overflow-wrap:anywhere}
-#flyoverDialog .flyover-top p{font-size:12px;color:#d4c1dc;margin:5px 0 0}
+#flyoverDialog .flyover-top p{font-size:12px;color:#E5EBE4;margin:5px 0 0}
 #flyoverDialog .flyover-top button{flex:none}
-#flyoverViewport{position:relative;flex:1;min-height:240px;background:radial-gradient(ellipse at 40% 30%,#45374f,#13111d 72%)}
+#flyoverViewport{position:relative;flex:1;min-height:240px;background:radial-gradient(ellipse at 40% 30%,#174C75,#092B49 72%)}
 #flyoverViewport .maplibregl-canvas{outline:none}
-#flyoverViewport .flyover-rider-marker{width:22px;height:22px;border:2px solid #fff1de;border-radius:50%;background:#190c29;box-shadow:0 2px 12px #11081dcc,0 0 0 2px #28132c88;display:flex;align-items:center;justify-content:center;pointer-events:none;will-change:transform}
+#flyoverViewport .flyover-rider-marker{width:22px;height:22px;border:2px solid #fff1de;border-radius:50%;background:#092B49;box-shadow:0 2px 12px #092B49cc,0 0 0 2px #092B4988;display:flex;align-items:center;justify-content:center;pointer-events:none;will-change:transform}
 #flyoverViewport .flyover-rider-marker span{width:10px;height:10px;border-radius:50%;background:#ffa956;box-shadow:0 0 9px #ffa956aa;display:block}
-#flyoverDialog .flyover-heading{flex:1 1 200px;min-width:0}#flyoverTerrainBadge{position:static;pointer-events:none;background:#251a31;border:1px solid #765c81;border-radius:8px;padding:7px 10px;color:#f1e6f7;font-size:11px;font-weight:600;max-width:min(380px,48%);margin:0 9px 0 auto;box-shadow:none}#flyoverDialog .flyover-top{flex-wrap:wrap}#flyoverDialog .flyover-top #flyoverClose{white-space:nowrap}@media(max-width:620px){#flyoverTerrainBadge{order:3;max-width:100%;width:100%;margin:0;padding:6px 9px}}
+#flyoverDialog .flyover-heading{flex:1 1 200px;min-width:0}#flyoverTerrainBadge{position:static;pointer-events:none;background:#092B49;border:1px solid #507995;border-radius:8px;padding:7px 10px;color:#E5EBE4;font-size:11px;font-weight:600;max-width:min(380px,48%);margin:0 9px 0 auto;box-shadow:none}#flyoverDialog .flyover-top{flex-wrap:wrap}#flyoverDialog .flyover-top #flyoverClose{white-space:nowrap}@media(max-width:620px){#flyoverTerrainBadge{order:3;max-width:100%;width:100%;margin:0;padding:6px 9px}}
 #flyoverTerrainBadge.is-error{border-color:#d99497;color:#ffcbcd}
 #flyoverViewport::after{content:"";pointer-events:none;position:absolute;inset:0;background:radial-gradient(ellipse at 50% 55%,transparent 43%,rgba(12,7,19,.15) 100%);z-index:1}
-#flyoverViewport .maplibregl-ctrl-attrib{background:#1b1329dd;color:#eee4f6}
-#flyoverViewport .maplibregl-ctrl-attrib a{color:#f8d4f1}
-#flyoverDialog .flyover-controls{padding:16px 21px 18px;background:linear-gradient(160deg,#291b34,#211728);border-top:1px solid #72547b;display:grid;gap:11px}
+#flyoverViewport .maplibregl-ctrl-attrib{background:#092B49dd;color:#E5EBE4}
+#flyoverViewport .maplibregl-ctrl-attrib a{color:#E5EBE4}
+#flyoverDialog .flyover-controls{padding:16px 21px 18px;background:linear-gradient(160deg,#092B49,#092B49);border-top:1px solid #507995;display:grid;gap:11px}
 #flyoverDialog .flyover-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
 #flyoverDialog .flyover-actions button{min-height:39px}
-#flyoverDialog .flyover-actions #flyoverPlay{background:linear-gradient(105deg,#d48fe6,#e78fae);color:#281528;border-color:#e8b1e8;font-weight:750}
-#flyoverDialog .flyover-actions label{display:flex;align-items:center;gap:7px;font-size:13px;color:#e1d0eb}
+#flyoverDialog .flyover-actions #flyoverPlay{background:linear-gradient(105deg,#F4D35E,#F4D35E);color:#092B49;border-color:#E5EBE4;font-weight:750}
+#flyoverDialog .flyover-actions label{display:flex;align-items:center;gap:7px;font-size:13px;color:#E5EBE4}
 #flyoverDialog .flyover-actions select{min-width:80px}
-#flyoverDialog #flyoverProgress{width:100%;accent-color:#f39ac6;cursor:pointer;margin:0}
-#flyoverDialog .flyover-times{display:flex;justify-content:space-between;gap:12px;color:#bdadcb;font-size:12px}
+#flyoverDialog #flyoverProgress{width:100%;accent-color:#E5EBE4;cursor:pointer;margin:0}
+#flyoverDialog .flyover-times{display:flex;justify-content:space-between;gap:12px;color:#E5EBE4;font-size:12px}
 #flyoverDialog .flyover-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
-#flyoverDialog .flyover-metrics div{background:#35263f;border:1px solid #5b4668;border-radius:10px;padding:10px 12px;min-width:0}
-#flyoverDialog .flyover-metrics span{display:block;font-size:11px;color:#cdbad9;margin-bottom:5px}
-#flyoverDialog .flyover-metrics strong{display:block;font-size:16px;font-weight:700;color:#f9effc;overflow-wrap:anywhere}
-#flyoverDialog .flyover-disclosure{margin:0;font-size:11px;color:#c2b0d0;line-height:1.35}#flyoverStatus{min-height:17px;font-size:12px;color:#d6c4dd;line-height:1.45}
+#flyoverDialog .flyover-metrics div{background:#092B49;border:1px solid #174C75;border-radius:10px;padding:10px 12px;min-width:0}
+#flyoverDialog .flyover-metrics span{display:block;font-size:11px;color:#E5EBE4;margin-bottom:5px}
+#flyoverDialog .flyover-metrics strong{display:block;font-size:16px;font-weight:700;color:#E5EBE4;overflow-wrap:anywhere}
+#flyoverDialog .flyover-disclosure{margin:0;font-size:11px;color:#E5EBE4;line-height:1.35}#flyoverStatus{min-height:17px;font-size:12px;color:#E5EBE4;line-height:1.45}
 #flyoverStatus.is-error{color:#ffb8ba}
 @media(max-width:720px){#flyoverDialog{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;border-radius:0}#flyoverDialog .flyover-top{padding:11px 13px}#flyoverDialog .flyover-top h2{font-size:17px}#flyoverDialog .flyover-controls{padding:11px 13px;gap:9px}#flyoverDialog .flyover-metrics{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}#flyoverDialog .flyover-metrics div{padding:7px}#flyoverDialog .flyover-metrics strong{font-size:13px}#flyoverDialog .flyover-metrics span{font-size:10px}#flyoverDialog .flyover-actions{gap:6px}#flyoverDialog .flyover-actions button{font-size:12px;padding:7px}}
-.v122-speed-review{grid-column:1/-1;display:grid;gap:8px;margin-top:12px;padding:12px;border:1px solid #675178;border-radius:12px;background:#241c33}.v122-speed-review button{justify-self:start}.v122-speed-review p{font-size:12px;line-height:1.5}.garmin-usb-panel{margin-top:13px;padding:13px;border-radius:11px;background:#25192f;border:1px solid #634b73;display:grid;gap:9px}.garmin-usb-panel strong{font-size:14px;color:#f1dcf7}.garmin-usb-panel p{font-size:12px;margin:0;line-height:1.5}.garmin-usb-panel button{width:100%}.garmin-usb-panel #garminUsbFound[hidden]{display:none}.garmin-usb-panel #garminUsbFound{display:grid;gap:8px}.garmin-usb-panel label{font-size:12px;color:#e8d6f2}.garmin-usb-panel select{width:100%;min-width:0}.garmin-usb-panel #garminUsbStatus{overflow-wrap:anywhere;font-size:12px;line-height:1.5}
+.v122-speed-review{grid-column:1/-1;display:grid;gap:8px;margin-top:12px;padding:12px;border:1px solid #507995;border-radius:12px;background:#092B49}.v122-speed-review button{justify-self:start}.v122-speed-review p{font-size:12px;line-height:1.5}.garmin-usb-panel{margin-top:13px;padding:13px;border-radius:11px;background:#092B49;border:1px solid #174C75;display:grid;gap:9px}.garmin-usb-panel strong{font-size:14px;color:#E5EBE4}.garmin-usb-panel p{font-size:12px;margin:0;line-height:1.5}.garmin-usb-panel button{width:100%}.garmin-usb-panel #garminUsbFound[hidden]{display:none}.garmin-usb-panel #garminUsbFound{display:grid;gap:8px}.garmin-usb-panel label{font-size:12px;color:#E5EBE4}.garmin-usb-panel select{width:100%;min-width:0}.garmin-usb-panel #garminUsbStatus{overflow-wrap:anywhere;font-size:12px;line-height:1.5}
 #statsDialog #facts.facts{display:flex;flex-direction:column;align-items:stretch;gap:24px}
 
-#dropTarget{position:fixed;inset:10px;z-index:10050;pointer-events:none;display:grid;place-items:center;border:3px dashed #ad8aee;border-radius:18px;background:#190e28e8;box-shadow:inset 0 0 0 6px #241338e5;backdrop-filter:blur(6px)}#dropTarget[hidden]{display:none}#dropTarget>div{text-align:center;padding:26px;display:grid;gap:10px}#dropTarget strong{font-size:clamp(22px,4vw,36px);color:#fff6ff}#dropTarget span{color:#cdb8e0;font-size:14px}
+#dropTarget{position:fixed;inset:10px;z-index:10050;pointer-events:none;display:grid;place-items:center;border:3px dashed #F4D35E;border-radius:18px;background:#092B49e8;box-shadow:inset 0 0 0 6px #092B49e5;backdrop-filter:blur(6px)}#dropTarget[hidden]{display:none}#dropTarget>div{text-align:center;padding:26px;display:grid;gap:10px}#dropTarget strong{font-size:clamp(22px,4vw,36px);color:#E5EBE4}#dropTarget span{color:#E5EBE4;font-size:14px}
 
 #settingsDialog .settings-panel .settings-section{margin-bottom:16px;padding-bottom:14px}
-#settingsDialog .settings-watch,#settingsDialog .garmin-usb-panel{border:1px solid #50415f;background:#241d30;border-radius:13px;padding:17px;margin:14px 0}
-#settingsDialog .settings-watch>h3,#settingsDialog .garmin-usb-panel>strong{margin:0 0 5px;font-size:16px;font-weight:650;color:#f0e5f6}
-#settingsDialog .settings-watch .settings-note{margin:8px 0 12px;font-size:14px;line-height:1.48;color:#c8bfd4}
+#settingsDialog .settings-watch,#settingsDialog .garmin-usb-panel{border:1px solid #174C75;background:#092B49;border-radius:13px;padding:17px;margin:14px 0}
+#settingsDialog .settings-watch>h3,#settingsDialog .garmin-usb-panel>strong{margin:0 0 5px;font-size:16px;font-weight:650;color:#E5EBE4}
+#settingsDialog .settings-watch .settings-note{margin:8px 0 12px;font-size:14px;line-height:1.48;color:#E5EBE4}
 #settingsDialog .settings-actions{gap:10px 13px;flex-wrap:wrap;padding:13px 0}
 #settingsDialog .settings-actions>div:first-child{flex:1 1 215px;min-width:0}
 #settingsDialog .settings-actions>button{min-height:36px;max-width:100%;white-space:normal;flex:0 1 auto}
-#settingsDialog .settings-watch .field{border-top:1px solid #463953;padding-top:12px;margin-top:12px}
-#settingsDialog .settings-subdetails{border:1px solid #544364;border-radius:10px;padding:0 12px;margin:14px 0;background:#241b30}
-#settingsDialog .settings-subdetails>summary{cursor:pointer;font-size:14px;font-weight:650;color:#ddc9e9;padding:12px 3px}
-#settingsDialog .settings-subdetails[open]>summary{border-bottom:1px solid #4b395b;margin-bottom:10px}
-#settingsDialog .settings-danger{border-color:#78505d}
+#settingsDialog .settings-watch .field{border-top:1px solid #174C75;padding-top:12px;margin-top:12px}
+#settingsDialog .settings-subdetails{border:1px solid #174C75;border-radius:10px;padding:0 12px;margin:14px 0;background:#092B49}
+#settingsDialog .settings-subdetails>summary{cursor:pointer;font-size:14px;font-weight:650;color:#E5EBE4;padding:12px 3px}
+#settingsDialog .settings-subdetails[open]>summary{border-bottom:1px solid #174C75;margin-bottom:10px}
+#settingsDialog .settings-danger{border-color:#507995}
 #settingsDialog .settings-danger>summary{color:#f0b7bd}
 #settingsDialog .settings-storage .local-storage{padding:6px 0 12px}
 @media(max-width:620px){#settingsDialog .settings-watch,#settingsDialog .garmin-usb-panel{padding:12px}#settingsDialog .settings-actions>button{flex:1 1 135px}#settingsDialog .settings-actions{align-items:stretch}}
@@ -5347,84 +6063,84 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
 #bikeTiles.bike-regional img{filter:url(#lh-bike-tint) drop-shadow(0 0 1px var(--bike-tint-color,#54dc96))}
 #bikeTiles.bike-regional-wide img{filter:url(#lh-bike-tint) drop-shadow(0 0 1.1px var(--bike-tint-color,#54dc96)) drop-shadow(0 0 1px var(--bike-tint-color,#54dc96))}
 #bikeLayerControls[hidden]{display:none!important}
-.bike-panel{border-top:1px solid #665073;padding-bottom:20px}
+.bike-panel{border-top:1px solid #174C75;padding-bottom:20px}
 .bike-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .bike-panel-heading h2{margin:0}.bike-panel-heading .toggle{gap:10px}
-.bike-layer-note{font-size:12px;line-height:1.5;margin:9px 0;color:#bdb0ca}
+.bike-layer-note{font-size:12px;line-height:1.5;margin:9px 0;color:#E5EBE4}
 #bikeLayerStatus.is-error{color:#edb7b7}
-#bikeLayerControls{display:flex;flex-direction:column;gap:12px;padding:12px;background:#20172e;border:1px solid #4d385e;border-radius:12px;margin-top:12px}
+#bikeLayerControls{display:flex;flex-direction:column;gap:12px;padding:12px;background:#092B49;border:1px solid #174C75;border-radius:12px;margin-top:12px}
 #bikeLayerControls .field{margin:0;gap:6px}
-.bike-tint-control{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid #584368;border-radius:10px;background:#2b2138}
+.bike-tint-control{display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid #174C75;border-radius:10px;background:#092B49}
 .bike-tint-control label{font-weight:650;font-size:13px;flex:1}
-.bike-tint-control input[type=color]{width:58px;height:39px;flex:none;cursor:pointer;border:1px solid #8965a3;background:#23172f;border-radius:9px;padding:4px}
-#bikeTintColorValue{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#e1d3e8;min-width:66px;text-align:right}
+.bike-tint-control input[type=color]{width:58px;height:39px;flex:none;cursor:pointer;border:1px solid #507995;background:#092B49;border-radius:9px;padding:4px}
+#bikeTintColorValue{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#E5EBE4;min-width:66px;text-align:right}
 #statsDialog #facts .stats-record-group{min-width:0}
-#statsDialog #facts .stats-record-group h5{margin:0 0 4px;font-size:15px;font-weight:750;color:#f2dff5}
-#statsDialog #facts .stats-record-description{margin:0 0 12px;color:#c9b6d3;font-size:13px;line-height:1.5}
+#statsDialog #facts .stats-record-group h5{margin:0 0 4px;font-size:15px;font-weight:750;color:#E5EBE4}
+#statsDialog #facts .stats-record-description{margin:0 0 12px;color:#E5EBE4;font-size:13px;line-height:1.5}
 #statsDialog #facts .stats-record-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 #statsDialog #facts .stats-record-empty{margin:3px 0;padding:12px 0;font-size:14px;grid-column:1/-1}
 @media(max-width:980px){#statsDialog #facts .stats-record-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:390px){#statsDialog #facts .stats-record-grid{grid-template-columns:1fr}}
 
-.v122-review-dialog{width:min(760px,95vw);max-height:90vh;overflow:auto;background:#21192c;color:#f1e8fa;border:1px solid #765689;border-radius:17px;padding:20px;box-shadow:0 20px 90px #090614a0}
-.v122-review-dialog::backdrop{background:#080611ba;backdrop-filter:blur(3px)}
+.v122-review-dialog{width:min(760px,95vw);max-height:90vh;overflow:auto;background:#092B49;color:#E5EBE4;border:1px solid #507995;border-radius:17px;padding:20px;box-shadow:0 20px 90px #092B49a0}
+.v122-review-dialog::backdrop{background:#092B49ba;backdrop-filter:blur(3px)}
 .v122-review-dialog .dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
 .v122-review-dialog .dialog-head h2{margin:0 0 4px}.v122-review-dialog .dialog-head p{margin:0 0 14px}
 .v122-edit-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0}
-.v122-edit-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:#e4d2ec;font-weight:650}
-.v122-edit-fields input{width:100%;box-sizing:border-box;min-width:0;padding:10px 12px;border-radius:9px;border:1px solid #684d79;color:#f5effb;background:#30233d}
+.v122-edit-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:#E5EBE4;font-weight:650}
+.v122-edit-fields input{width:100%;box-sizing:border-box;min-width:0;padding:10px 12px;border-radius:9px;border:1px solid #174C75;color:#E5EBE4;background:#092B49}
 .v122-edit-actions{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;margin:15px 0}
-#routeRepairCanvas{display:block;width:100%;height:240px;background:linear-gradient(145deg,#13131e,#241a33);border:1px solid #533e69;border-radius:12px;margin:12px 0}
-.v122-repair-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:#dfc6eb;margin:8px 0}
-.v122-repair-legend span:first-child{color:#ef9bc1}.v122-repair-legend span:last-child{color:#7aefba}
+#routeRepairCanvas{display:block;width:100%;height:240px;background:linear-gradient(145deg,#092B49,#092B49);border:1px solid #174C75;border-radius:12px;margin:12px 0}
+.v122-repair-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:#E5EBE4;margin:8px 0}
+.v122-repair-legend span:first-child{color:#E5EBE4}.v122-repair-legend span:last-child{color:#7aefba}
 .v122-repair-candidates{display:grid;gap:9px;margin-top:14px;max-height:230px;overflow:auto}
-.v122-repair-candidates label{display:flex;align-items:flex-start;gap:9px;padding:12px;border-radius:10px;border:1px solid #604773;background:#31233e;font-size:12px;line-height:1.55}
+.v122-repair-candidates label{display:flex;align-items:flex-start;gap:9px;padding:12px;border-radius:10px;border:1px solid #174C75;background:#092B49;font-size:12px;line-height:1.55}
 @media(max-width:640px){.v122-edit-fields{grid-template-columns:1fr}.v122-review-dialog{padding:14px}#routeRepairCanvas{height:180px}}
 
-/* Settings categories: one focused panel at a time, no endless dialog scroll. */
+ 
 #settingsDialog{width:min(1040px,96vw);max-width:1040px;height:min(780px,calc(100dvh - 40px));max-height:calc(100dvh - 40px);padding:0;overflow:hidden;scrollbar-gutter:auto}
 #settingsDialog[open]{display:flex;flex-direction:column}
 #settingsDialog>.dialog-head{position:relative;top:auto;flex:none;padding:19px 26px;min-height:85px}
 #settingsDialog .settings-layout{display:grid;grid-template-columns:222px minmax(0,1fr);flex:1;min-height:0;overflow:hidden}
-#settingsDialog .settings-nav{display:flex;flex-direction:column;gap:5px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:22px 12px;background:#211a2e;border-right:1px solid #473751}
-#settingsDialog .settings-nav-caption{font-size:10px;font-weight:750;letter-spacing:.16em;color:#a697bb;padding:2px 12px 11px}
-#settingsDialog .settings-category{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;flex:none;width:100%;border-radius:11px;text-align:left;border:1px solid transparent;background:transparent;padding:13px 13px;color:#d8cce4;line-height:1.3;transition:background .13s,border-color .13s}
+#settingsDialog .settings-nav{display:flex;flex-direction:column;gap:5px;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:22px 12px;background:#092B49;border-right:1px solid #174C75}
+#settingsDialog .settings-nav-caption{font-size:10px;font-weight:750;letter-spacing:.16em;color:#A6C0CF;padding:2px 12px 11px}
+#settingsDialog .settings-category{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;flex:none;width:100%;border-radius:11px;text-align:left;border:1px solid transparent;background:transparent;padding:13px 13px;color:#E5EBE4;line-height:1.3;transition:background .13s,border-color .13s}
 #settingsDialog .settings-category strong{font-size:14px;font-weight:690}
-#settingsDialog .settings-category small{font-size:11px;line-height:1.3;color:#a99ab9;margin:0}
-#settingsDialog .settings-category:hover{background:#34273f;border-color:#51405f}
-#settingsDialog .settings-category[aria-selected="true"]{background:linear-gradient(110deg,#433053,#35263e);border-color:#79528f;box-shadow:inset 3px 0 #da82df}
-#settingsDialog .settings-category[aria-selected="true"] strong{color:#fff7ff}
-#settingsDialog .settings-category[aria-selected="true"] small{color:#d4badf}
-#settingsDialog .settings-category:focus-visible{outline:2px solid #daa5ed;outline-offset:-2px}
+#settingsDialog .settings-category small{font-size:11px;line-height:1.3;color:#A6C0CF;margin:0}
+#settingsDialog .settings-category:hover{background:#174C75;border-color:#174C75}
+#settingsDialog .settings-category[aria-selected="true"]{background:linear-gradient(110deg,#174C75,#092B49);border-color:#507995;box-shadow:inset 3px 0 #F4D35E}
+#settingsDialog .settings-category[aria-selected="true"] strong{color:#E5EBE4}
+#settingsDialog .settings-category[aria-selected="true"] small{color:#E5EBE4}
+#settingsDialog .settings-category:focus-visible{outline:2px solid #E5EBE4;outline-offset:-2px}
 #settingsDialog .settings-panels{min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:24px 29px 30px}
 #settingsDialog .settings-panel[hidden]{display:none!important}
 #settingsDialog .settings-panel{min-width:0}
-#settingsDialog .settings-panel-head{padding:0 0 20px;margin-bottom:14px;border-bottom:1px solid #45364f}
-#settingsDialog .settings-panel-head .settings-kicker{margin:0 0 7px;color:#c68ed8;letter-spacing:.095em;font-size:11px;font-weight:750;text-transform:uppercase}
-#settingsDialog .settings-panel-head h2{color:#f6eef8;font-size:23px;line-height:1.2;letter-spacing:-.015em;margin:0 0 8px}
-#settingsDialog .settings-panel-head>p:last-child{margin:0;color:#bcb0ca;font-size:13px;line-height:1.5}
-#settingsDialog .settings-section{margin:0 0 22px;padding:3px 0 24px;border-bottom:1px solid #43354e}
+#settingsDialog .settings-panel-head{padding:0 0 20px;margin-bottom:14px;border-bottom:1px solid #174C75}
+#settingsDialog .settings-panel-head .settings-kicker{margin:0 0 7px;color:#A6C0CF;letter-spacing:.095em;font-size:11px;font-weight:750;text-transform:uppercase}
+#settingsDialog .settings-panel-head h2{color:#E5EBE4;font-size:23px;line-height:1.2;letter-spacing:-.015em;margin:0 0 8px}
+#settingsDialog .settings-panel-head>p:last-child{margin:0;color:#E5EBE4;font-size:13px;line-height:1.5}
+#settingsDialog .settings-section{margin:0 0 22px;padding:3px 0 24px;border-bottom:1px solid #174C75}
 #settingsDialog .settings-section:last-child{margin-bottom:0;border-bottom:0;padding-bottom:4px}
 #settingsDialog .settings-section>h2{font-size:17px;margin:4px 0 10px;line-height:1.35}
 #settingsDialog .settings-section .settings-actions{flex-wrap:wrap;gap:14px}
 #settingsDialog .settings-section .settings-actions>div{flex:1 1 235px}
 #settingsDialog .settings-section .settings-actions>button{flex:0 0 auto}
 #settingsDialog .settings-panel .settings-note{margin:10px 0 14px}
-#settingsDialog .settings-global-status{flex:none;padding:0 23px;background:#292033}
+#settingsDialog .settings-global-status{flex:none;padding:0 23px;background:#092B49}
 #settingsDialog .settings-global-status .settings-status{min-height:0;font-size:12px;line-height:1.35;max-height:54px;overflow:auto}
 #settingsDialog .settings-global-status .settings-status:empty{display:none}
 #settingsDialog .settings-savebar{position:relative;bottom:auto;flex:none;padding:14px 23px}
 #settingsDialog .speed-threshold-control{display:flex;align-items:stretch;gap:9px;width:100%}
 #settingsDialog .speed-threshold-control input[type=number]{flex:1;min-width:0;width:100%;font-variant-numeric:tabular-nums}
-#settingsDialog .speed-threshold-suffix{display:flex;align-items:center;justify-content:center;flex:none;min-width:64px;padding:0 12px;border:1px solid #6a517e;border-radius:9px;background:#33273f;color:#f4d8ff;font-size:14px;font-weight:700;white-space:nowrap}
+#settingsDialog .speed-threshold-suffix{display:flex;align-items:center;justify-content:center;flex:none;min-width:64px;padding:0 12px;border:1px solid #507995;border-radius:9px;background:#174C75;color:#E5EBE4;font-size:14px;font-weight:700;white-space:nowrap}
 @media(max-width:750px){
  #settingsDialog{width:calc(100vw - 22px);max-height:calc(100dvh - 20px);height:calc(100dvh - 20px)}
  #settingsDialog .settings-layout{display:flex;flex-direction:column}
- #settingsDialog .settings-nav{display:flex;flex-direction:row;gap:7px;flex:none;min-height:auto;overflow-x:auto;overflow-y:hidden;padding:10px 12px;border-right:0;border-bottom:1px solid #473751;scrollbar-width:thin}
+ #settingsDialog .settings-nav{display:flex;flex-direction:row;gap:7px;flex:none;min-height:auto;overflow-x:auto;overflow-y:hidden;padding:10px 12px;border-right:0;border-bottom:1px solid #174C75;scrollbar-width:thin}
  #settingsDialog .settings-nav-caption{display:none}
  #settingsDialog .settings-category{width:auto;min-width:130px;min-height:56px;padding:10px 13px}
  #settingsDialog .settings-category small{display:none}
- #settingsDialog .settings-category[aria-selected="true"]{box-shadow:inset 0 -3px #da82df}
+ #settingsDialog .settings-category[aria-selected="true"]{box-shadow:inset 0 -3px #F4D35E}
  #settingsDialog .settings-panels{flex:1;padding:20px 19px 26px}
  #settingsDialog .settings-panel-head h2{font-size:21px}
  #settingsDialog .settings-section .settings-actions>div{flex:initial;width:100%}
@@ -5439,43 +6155,2472 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
  #settingsDialog #saveSettings{min-width:118px}
 }
 
-/* Garmin full-history import is visible without opening Settings. */
-.garmin-home-progress{display:grid;gap:5px;margin-top:10px;padding:11px 12px;border:1px solid #4e4264;border-radius:10px;background:#241a32;color:#e6dcef;font-size:12px;line-height:1.45}
+ 
+.garmin-home-progress{display:grid;gap:5px;margin-top:10px;padding:11px 12px;border:1px solid #174C75;border-radius:10px;background:#092B49;color:#E5EBE4;font-size:12px;line-height:1.45}
 .garmin-home-progress[hidden],#importStatus[hidden]{display:none!important}
-.garmin-home-progress strong{font-size:12px;color:#f2e9ff}
-.garmin-home-progress small{font-size:11px;color:#bdb0cd}
+.garmin-home-progress strong{font-size:12px;color:#E5EBE4}
+.garmin-home-progress small{font-size:11px;color:#E5EBE4}
+ 
+body[data-activity-focus="foot"] .bike-panel,
+body[data-activity-focus="foot"] .cycling-only,
+body[data-activity-focus="foot"] .stats-bike-card,
+body[data-activity-focus="foot"] #tabReview,
+body[data-activity-focus="foot"] #settingsPanel-insights .smart-filter-row,
+body[data-activity-focus="foot"] #settingsPanel-insights #openSpeedReview{display:none!important}
+.activity-focus-panel .field{margin-top:7px}
+.activity-focus-panel select{width:100%}
+#activityFocusNote{margin:9px 0 0;font-size:13px;line-height:1.5}
+
+ 
+#ridePreviewDialog #ridePreviewMap{cursor:grab;touch-action:none;user-select:none;outline-offset:3px}
+#ridePreviewDialog #ridePreviewMap.lh-map-dragging{cursor:grabbing}
+#ridePreviewDialog #ridePreviewMap:focus-visible{outline:3px solid #E5EBE4}
+#ridePreviewDialog .lh-preview-controls{position:absolute;z-index:6;right:12px;top:12px;display:grid;gap:6px;touch-action:manipulation}
+#ridePreviewDialog .lh-preview-controls button{background:#092B49ec;border:1px solid #507995;border-radius:9px;color:#E5EBE4;min-width:42px;min-height:42px;padding:6px 10px;font-size:19px;font-weight:700;box-shadow:0 5px 16px #092B4966;cursor:pointer;touch-action:manipulation}
+#ridePreviewDialog .lh-preview-controls button:last-child{font-size:12px}
+#ridePreviewDialog .lh-preview-controls button:hover{background:#174C75;border-color:#E5EBE4}
+#ridePreviewDialog .lh-preview-controls button:focus-visible{outline:2px solid #f7c1a6;outline-offset:1px}
+#ridePreviewDialog .lh-preview-map-hint{position:absolute;z-index:4;bottom:12px;left:12px;color:#E5EBE4;font-size:11px;background:#092B49c9;border:1px solid #507995;padding:6px 9px;border-radius:8px;pointer-events:none}
+#ridePreviewDialog .ride-preview-badge{right:68px;left:12px;width:max-content;max-width:calc(100% - 86px)}
+#ridePreviewDialog .ride-preview-details{display:block;margin:18px 0 12px}
+#ridePreviewDialog .lh-metric-bucket{margin:0 0 17px}
+#ridePreviewDialog .lh-metric-header{display:flex;align-items:center;gap:11px;margin:0 0 10px;min-height:38px}
+#ridePreviewDialog .lh-metric-icon{width:35px;height:35px;display:grid;place-items:center;flex:none;border-radius:10px;border:1px solid #507995;background:linear-gradient(135deg,#174C75,#174C75);color:#E5EBE4;font-size:18px}
+#ridePreviewDialog .lh-metric-header h3{font-size:14px;font-weight:700;letter-spacing:.1px;margin:0 0 3px;color:#E5EBE4}
+#ridePreviewDialog .lh-metric-header p{font-size:11px;line-height:1.3;color:#E5EBE4;margin:0}
+#ridePreviewDialog .lh-metric-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+#ridePreviewDialog .lh-metric-grid .ride-preview-detail{border-radius:11px;background:linear-gradient(145deg,#092B49,#092B49);border:1px solid #174C75;box-shadow:inset 0 1px #ffffff09;padding:12px;min-height:82px}
+#ridePreviewDialog .lh-metric-grid .ride-preview-detail span{font-size:11px;color:#E5EBE4}
+#ridePreviewDialog .lh-metric-grid .ride-preview-detail strong{font-size:16px}
+#ridePreviewDialog .lh-preview-head-actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+#ridePreviewDialog .lh-preview-head-actions button{min-height:38px}
+#ridePreviewDialog #openActivitySources{border-color:#A6C0CF;background:#174C75;color:#E5EBE4}
+#ridePreviewDialog #openActivitySources:hover:not(:disabled){background:#174C75}
+.lh-source-dialog{width:min(970px,96vw);max-width:96vw;max-height:92dvh;overflow:auto;padding:24px;border:1px solid #507995;border-radius:18px;background:#092B49;color:#E5EBE4}
+.lh-source-dialog .dialog-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}
+.lh-source-dialog .dialog-head h2{margin:5px 0 8px;font-size:23px}
+.lh-source-dialog .dialog-head .muted{line-height:1.55;max-width:650px}
+.lh-section-eyebrow{font-size:10px;font-weight:800;letter-spacing:1.5px;color:#E5EBE4}
+.lh-source-review-list{margin:18px 0}
+.lh-source-review-list .v123-source-card{margin:0 0 14px;border:1px solid #174C75;border-radius:12px;padding:14px;background:#092B49}
+.lh-source-review-list .v123-source-card>summary{padding:7px 5px;font-size:16px;line-height:1.4}
+.lh-source-review-list .v123-source-grid{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.lh-source-review-list .v123-source-field{text-align:left;align-items:stretch;background:#092B49;border:1px solid #174C75;border-radius:9px;padding:11px;color:#E5EBE4;font-size:13px;gap:8px}
+.lh-source-review-list .v123-source-field select{font-size:12px}
+.lh-source-review-list .lh-source-subgroup{grid-column:1/-1;color:#E5EBE4;font-size:12px;font-weight:750;margin-top:8px;border-bottom:1px solid #174C75;padding:4px 0 7px}
+.lh-source-review-list .lh-source-context{margin:8px 0 14px;display:flex;flex-wrap:wrap;gap:7px}
+.lh-source-review-list .lh-source-chip{padding:5px 9px;border-radius:7px;border:1px solid #174C75;background:#092B49;font-size:11px;color:#E5EBE4;overflow-wrap:anywhere;max-width:100%}
+.lh-source-review-list .lh-source-help{font-size:12px;line-height:1.55;color:#E5EBE4;margin:6px 0 15px}
+.lh-source-review-list .lh-source-empty{padding:24px;border:1px dashed #507995;border-radius:11px;color:#E5EBE4;line-height:1.6}
+.lh-source-review-list .settings-actions{flex-wrap:wrap}
+#sourceReviewStatus{font-size:12px;min-height:20px}
+@media(max-width:960px){#ridePreviewDialog .lh-metric-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:630px){#ridePreviewDialog .dialog-head{align-items:flex-start}#ridePreviewDialog .lh-preview-head-actions{width:100%;justify-content:space-between}#ridePreviewDialog .lh-metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}#ridePreviewDialog .lh-preview-map-hint{bottom:36px;font-size:10px} .lh-source-dialog{width:100vw;max-width:100vw;max-height:100dvh;padding:15px}}
+
+ 
+:root{--atlas-bg:#082C4B;--atlas-surface:#151a28;--atlas-raised:#1d2334;--atlas-line:#343a50;--atlas-text:#E5EBE4;--atlas-muted:#aeb8cc;--atlas-purple:#E5EBE4;--atlas-orange:#ffb77e;--atlas-radius:16px}
+body{color:var(--atlas-text)!important;background:var(--atlas-bg)!important;font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif!important;letter-spacing:-.006em}
+button,select,input{font-family:inherit;transition:border-color .16s,background-color .16s,box-shadow .16s}
+button{border-radius:11px!important;border:1px solid #44465d!important;background:#292c3e!important;color:#E5EBE4!important;font-size:12px!important;font-weight:650}
+button:hover:not(:disabled){background:#393c55!important;border-color:#507995!important}
+button.primary,.stats-cta,.stats-header{background:linear-gradient(120deg,#F4D35E,#E5EBE4)!important;border-color:#E5EBE4!important;color:#092B49!important;box-shadow:0 4px 16px #F4D35E2a!important}
+button.primary:hover:not(:disabled),.stats-cta:hover:not(:disabled),.stats-header:hover:not(:disabled){background:linear-gradient(120deg,#E5EBE4,#E5EBE4)!important}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #ffbb88!important;outline-offset:2px}
+header{position:relative;background:linear-gradient(120deg,#082C4B,#092B49 55%,#092B49)!important;border-bottom:1px solid #174C75!important;min-height:76px;box-shadow:0 8px 36px #092B4940;padding:12px 25px!important;z-index:12}
+header .brand{gap:11px}header .logo{height:43px!important;width:43px!important;filter:drop-shadow(0 4px 15px #F4D35E52)!important}
+header h1{font-size:20px!important;letter-spacing:-.05em!important;font-weight:820!important}header .brand-text>small{color:#9fa7bb!important;letter-spacing:.012em!important;font-size:11px}
+header .brand-credit{background:#092B49!important;border:1px solid #174C75!important;border-radius:7px;padding:3px 8px!important;font-size:10px!important}
+header .brand-credit a{color:#f4c5a4!important}header .header-actions{gap:8px!important}header .header-actions button{padding:10px 15px!important}
+#headerSources{background:#092B49!important;border-color:#174C75!important}#headerSources:before{content:'◈';margin-right:8px;color:#E5EBE4}
+.workspace{background:var(--atlas-bg)!important}aside{background:linear-gradient(175deg,#082C4B,#082C4B 60%,#082C4B)!important;border-right:1px solid #34374b!important;padding:0 13px 30px!important;box-shadow:inset -1px 0 #ffffff07}
+.lh-workspace-title{padding:28px 11px 12px}.lh-eyebrow{font-size:10px!important;font-weight:820;letter-spacing:.19em;color:#E5EBE4}
+.lh-workspace-title h2{font-size:22px!important;letter-spacing:-.05em;line-height:1.2;color:#E5EBE4;margin:8px 0 4px!important}
+.lh-title-accent{color:var(--atlas-orange)}.lh-workspace-title p{font-size:11px;color:#a4adc4;margin:0}
+.lh-quicknav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:11px 6px 20px}
+.lh-quicknav button{display:flex;align-items:center;justify-content:flex-start;gap:9px;padding:11px 12px!important;text-align:left;background:#202536!important;font-size:12px!important;min-height:40px}
+.lh-quicknav button>span{width:21px;text-align:center;font-size:17px;color:#E5EBE4}
+.lh-quicknav .lh-quicknav-active{background:#174C75!important;border-color:#507995!important}
+aside>section{background:#191e2c!important;border:1px solid #363b4e!important;border-radius:16px!important;padding:17px 15px!important;margin:0 2px 12px!important;box-shadow:0 8px 24px #082C4B13}
+aside>section h2{font-size:13px!important;text-transform:none!important;letter-spacing:-.015em!important;color:#E5EBE4!important;font-weight:760!important}
+aside>section .muted,aside>section .foot{font-size:11px!important;color:#a9b5c8!important;line-height:1.55!important}
+aside>.foot{padding:6px 12px;color:#8f9cad!important}.lh-panel-heading{display:flex;align-items:center;gap:10px;margin-bottom:11px}
+.lh-panel-heading h2{margin:0!important}.lh-panel-icon{display:grid;place-items:center;background:#174C75;color:#E5EBE4;border:1px solid #174C75;border-radius:10px;min-width:32px;height:32px;font-size:17px}
+#activityFocus,#sport,#search,aside input[type=date],#palette,aside select{background:#22283a!important;color:#E5EBE4!important;border:1px solid #42475e!important;border-radius:10px!important}
+aside .field label,.toggle{font-size:11.5px!important;color:#cdd4e0!important}
+.stat,.metric{background:linear-gradient(140deg,#22283a,#092B49)!important;border:1px solid #174C75!important;border-radius:12px!important;padding:13px!important}
+.stat strong{font-size:21px!important;letter-spacing:-.045em}.stat span{font-weight:620;font-size:10px!important;letter-spacing:.045em;text-transform:uppercase}
+main#map{background:#082C4B!important;border:10px solid #082C4B!important;border-radius:21px!important;box-shadow:inset 0 0 0 1px #174C75!important;margin:8px 10px 10px 2px}
+main#map .maptop{background:linear-gradient(135deg,#082C4Bf0,#092B49ef)!important;border:1px solid #174C75!important;border-radius:14px!important;padding:14px 17px!important;box-shadow:0 14px 30px #082C4B44!important;backdrop-filter:blur(13px)}
+main#map .map-caption-title{font-size:16px!important;font-weight:800!important;letter-spacing:-.04em}main#map .maptop #mapDetail{font-size:11px!important;color:#b7bed5;margin-top:4px}
+main#map .legend{background:#082C4Bf0!important;border:1px solid #174C75!important;border-radius:12px!important;padding:11px!important;box-shadow:0 10px 35px #082C4B33}
+main#map .tools button{height:39px;width:39px;border-radius:10px!important;background:#24263be8!important}
+main#map .attribution{background:#1e2238e0!important;border-radius:8px!important}
+dialog{background:#082C4B!important;color:#E5EBE4!important;border:1px solid #174C75!important;border-radius:19px!important;box-shadow:0 28px 110px #092B49d0!important}
+dialog .dialog-head h2{font-size:24px!important;letter-spacing:-.05em!important}dialog .dialog-head .muted{color:#aeb7c9!important}
+dialog .metric,.lh-metric-bucket{background:#242837!important;border-color:#424559!important}
+#settingsDialog .settings-section{border-color:#174C75!important}#settingsDialog .settings-panel,#settingsDialog .settings-stack{background:transparent!important}
+#settingsDialog select, #settingsDialog input[type=number], #settingsDialog input[type=search]{background:#252b3d!important;color:#E5EBE4!important;border-color:#454960!important}
+.lh-source-dialog{width:min(1020px,96vw)!important;max-width:96vw!important;max-height:92dvh!important;padding:26px!important}
+.lh-source-dialog .dialog-head{position:sticky;top:-26px;background:#082C4Bf7;z-index:2;border-bottom:1px solid #393d52;padding:0 0 14px;margin-bottom:14px}
+.lh-source-policy-hero{display:flex;align-items:flex-start;gap:16px;border:1px solid #174C75;border-radius:16px;padding:18px;margin-bottom:16px;background:linear-gradient(120deg,#174C75,#242b3c 74%)}
+.lh-source-policy-mark{font-size:28px;display:grid;place-items:center;width:48px;height:48px;flex:none;background:#174C75;border:1px solid #507995;border-radius:14px;color:#E5EBE4}
+.lh-source-policy-hero strong{font-size:19px;letter-spacing:-.035em}.lh-source-policy-hero p{margin:5px 0 0;line-height:1.55;color:#E5EBE4;font-size:12px}
+.lh-source-policy-tools{display:flex;gap:9px;justify-content:flex-end;flex-wrap:wrap;margin-bottom:16px}.lh-source-policy-tools button{padding:9px 13px!important}
+.lh-source-policy-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+.lh-source-policy-section{border:1px solid #3d4156;border-radius:15px;background:#202536;padding:15px 16px!important;margin:0!important;min-width:0}
+.lh-source-policy-section h3{margin:0 0 12px!important;font-size:14px;color:#E5EBE4;letter-spacing:-.03em;display:flex;align-items:center;gap:8px}
+.lh-source-group-icon{display:grid;place-items:center;width:29px;height:29px;border-radius:9px;background:#174C75;color:#E5EBE4;font-size:16px}
+.lh-source-policy-row{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(158px,180px);gap:12px;align-items:center;padding:10px 0;border-top:1px solid #353b4e!important}
+.lh-source-policy-field{display:grid;gap:4px;min-width:0}.lh-source-policy-field strong{font-size:12px;font-weight:680;color:#E5EBE4}.lh-source-policy-field small{font-size:10px;color:#9ba8c3;line-height:1.35;overflow-wrap:anywhere}
+.lh-source-policy-row select{width:100%;background:#161c2b!important;border:1px solid #4e5369!important;color:#E5EBE4!important;border-radius:10px!important;font-size:12px;min-width:0}
+.lh-source-policy-footer{position:sticky;bottom:-26px;z-index:2;background:#082C4Bf8;border-top:1px solid #3c4055;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 0 4px;margin-top:17px}
+.lh-source-policy-footer span{font-size:11px;color:#b2bbce}.lh-source-policy-footer button{padding:12px 20px!important}
+#sourceReviewStatus{margin-top:10px;color:#E5EBE4!important;min-height:20px;font-size:12px}
+@media(max-width:1000px){header .brand-credit{display:none}header .header-actions button{padding:8px 10px!important}.lh-source-policy-grid{grid-template-columns:1fr}}
+@media(max-width:740px){header{min-height:67px;padding:9px 12px!important}header .brand-text>small{display:none}header h1{font-size:16px!important}#headerSources{display:none}main#map{border-width:4px!important;margin:5px!important;border-radius:14px!important}.lh-quicknav{grid-template-columns:repeat(4,minmax(0,1fr))}.lh-quicknav button{justify-content:center;flex-direction:column;gap:0;padding:7px!important;font-size:10px!important}.lh-source-dialog{padding:14px!important}.lh-source-policy-row{grid-template-columns:1fr;gap:6px}.lh-source-policy-footer{bottom:-14px;align-items:stretch;flex-direction:column}.lh-source-dialog .dialog-head{top:-14px}.lh-source-policy-tools{justify-content:flex-start}}
+@media(prefers-reduced-motion:reduce){button,select,input{transition:none!important}}
+ 
+:root{--terrain-ink:#0b252c;--terrain-navy:#102f36;--terrain-paper:#f2f4f0;--terrain-card:#fffefa;--terrain-line:#dbe2de;--terrain-body:#19353d;--terrain-muted:#657d80;--terrain-mint:#72e3c4;--terrain-teal:#168b7d;--terrain-gold:#ffbf7d;--terrain-shadow:0 15px 36px #15363b0c}
+body{background:#e9eeeb!important;color:var(--terrain-body)!important;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif!important}
+header{height:76px!important;min-height:76px!important;padding:11px 26px!important;background:#0c252d!important;border-bottom:1px solid #2c5359!important;box-shadow:none!important;color:#e9f5f1!important}
+header:after{display:none!important}header .brand{gap:11px!important}header .logo{width:43px!important;height:43px!important;filter:drop-shadow(0 0 9px #5ce4b939)!important}
+header h1{font-size:21px!important;color:#f8fdfb!important;letter-spacing:-.055em!important;font-weight:760!important}header .brand-text>small{color:#8fc0bc!important;font-size:10px!important;letter-spacing:.145em!important;font-weight:750!important}
+header .brand-credit{border:1px solid #35615f!important;background:#173d42!important;border-radius:50px!important;color:#c2dfd9!important;padding:5px 10px!important;white-space:nowrap}
+header .brand-credit a{color:#f9d0a0!important;text-decoration:none!important}header .header-actions{gap:7px!important}
+header .header-actions button{min-height:41px;padding:10px 15px!important;background:#14353d!important;color:#d4e9e4!important;border:1px solid #31565d!important;border-radius:9px!important;font-size:12px!important;font-weight:650!important;box-shadow:none!important}
+header .header-actions button:hover{background:#25525b!important;border-color:#639f94!important;color:#fff!important}
+header .header-actions .stats-header{background:#b7efd8!important;color:#0b3434!important;border-color:#b7efd8!important;box-shadow:none!important}
+header .header-actions .stats-header:hover{background:#d0f9e8!important;color:#0b3434!important}
+#headerSources{background:#194149!important;border-color:#376d69!important}#headerSources:before{content:'✳';color:#8ef3cf!important;margin-right:7px}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #d49d4c!important;outline-offset:2px}
+.workspace{height:calc(100vh - 76px)!important;display:grid!important;grid-template-columns:84px 318px minmax(0,1fr);gap:0;background:#e8ede9!important;min-width:0!important;min-height:0}
+.terrain-rail{min-width:0;background:#0e2b32!important;border-right:1px solid #315157!important;display:flex;flex-direction:column;align-items:center;padding:22px 8px 16px;gap:14px;z-index:3}
+.terrain-rail-intro{display:flex;flex-direction:column;align-items:center;gap:5px;color:#9bcac0;font-size:9px;font-weight:800;letter-spacing:.19em}.terrain-rail-cross{display:grid;place-items:center;width:37px;height:37px;font-size:23px;line-height:1;background:#234c4b;border-radius:13px;color:#b2ffdf;border:1px solid #427c72}
+.terrain-rail .lh-quicknav{margin:21px 0 0!important;width:100%;display:flex!important;flex-direction:column!important;gap:9px!important;align-items:stretch}
+.terrain-rail .lh-quicknav button{font-size:10px!important;line-height:1.2!important;min-height:66px!important;padding:10px 3px!important;margin:0!important;display:flex!important;flex-direction:column!important;justify-content:center!important;align-items:center!important;gap:7px!important;text-align:center!important;background:transparent!important;border:1px solid transparent!important;border-radius:13px!important;color:#a8c5c3!important;box-shadow:none!important}
+.terrain-rail .lh-quicknav button:hover{background:#1d4549!important;color:#fff!important}
+.terrain-rail .lh-quicknav .lh-quicknav-active{background:#2e5955!important;border-color:#438477!important;color:#e7fff7!important;box-shadow:inset 3px 0 #87f0cc!important}
+.terrain-rail .lh-quicknav button svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.65;stroke-linecap:round;stroke-linejoin:round;flex:none;opacity:.97}
+.terrain-rail .lh-quicknav button span{width:auto!important;color:inherit!important;font-size:10px!important;letter-spacing:0!important}
+.terrain-rail-foot{margin-top:auto;color:#81aea9;font-size:9px;font-weight:750;text-align:center;letter-spacing:.16em;line-height:1.5}.terrain-live-dot{display:inline-block;background:#73efbf;width:7px;height:7px;border-radius:50%;vertical-align:middle;box-shadow:0 0 0 3px #65e7ba24;flex:none}
+.workspace>aside{width:318px!important;height:100%!important;min-width:0;background:#f2f4f0!important;border:0!important;border-right:1px solid #d5dfda!important;padding:0 13px 30px!important;color:#193640!important;box-shadow:none!important;overflow-y:auto!important;scrollbar-color:#bfceca transparent}
+.lh-workspace-title{padding:24px 11px 21px!important;margin:0!important;border-bottom:1px solid #d7e0dc!important}
+.lh-eyebrow{color:#348778!important;font-size:10px!important;letter-spacing:.15em!important;font-weight:780!important}
+.lh-workspace-title h2{font-size:29px!important;font-weight:790!important;line-height:1.1!important;margin:10px 0 8px!important;letter-spacing:-.065em!important;color:#102e35!important;text-transform:none!important}
+.lh-workspace-title h2 em{font-style:normal;color:#258c7b}.lh-workspace-title p{color:#72858a!important;font-size:12px!important;line-height:1.55!important}
+.terrain-sidebar-caption{display:flex;align-items:center;gap:8px;color:#7b9290;font-size:10px;line-height:1.4;margin-top:18px;letter-spacing:.01em}
+aside>section{background:var(--terrain-card)!important;border:1px solid #dbe3df!important;border-radius:13px!important;box-shadow:0 4px 13px #224b4307!important;padding:16px 15px!important;margin:13px 0 0!important}
+aside>section:hover{border-color:#c1d5ce!important}
+aside>section h2,aside>section h3{font-size:13px!important;font-weight:740!important;text-transform:none!important;letter-spacing:-.012em!important;color:#153740!important;margin:0 0 9px!important}
+.lh-panel-heading{margin-bottom:10px!important}.lh-panel-icon{display:grid!important;place-items:center;width:30px!important;height:30px!important;color:#186d62!important;background:#e4f5ed!important;border:1px solid #c9ebde!important;border-radius:9px!important;font-size:17px!important}
+aside .muted,aside .foot,aside .status,aside .bike-layer-note,aside #tileNotice,aside small{color:#687d81!important;font-size:11px!important;line-height:1.55!important}
+aside .stat,aside .stats .stat{background:#f0f6f1!important;border:1px solid #dee9e2!important;border-radius:10px!important;box-shadow:none!important}
+aside .stats .stat strong{font-size:23px!important;letter-spacing:-.055em!important;color:#12363d!important}
+aside .stats .stat span{color:#67817e!important;font-size:9px!important;letter-spacing:.08em!important}
+aside .field label,aside label,aside .toggle{color:#315057!important;font-size:11px!important;font-weight:650!important}
+aside input[type=checkbox],aside input[type=radio]{accent-color:#167c6e!important}
+aside select,aside input:not([type=checkbox]):not([type=range]):not([type=color]),aside button:not(.lh-help-trigger){background:#f4f7f3!important;border:1px solid #d2ded9!important;color:#17383d!important;border-radius:9px!important;box-shadow:none!important;font-size:12px!important;min-height:35px}
+aside button:hover:not(.lh-help-trigger){border-color:#5cafa1!important;background:#e6f4ef!important;color:#164b48!important}
+aside button.primary{background:#185f58!important;color:#f3fff9!important;border-color:#185f58!important;box-shadow:0 4px 10px #1c6c5625!important}
+aside button.primary:hover{background:#1c7e71!important;border-color:#1c7e71!important;color:#fff!important}
+aside .bike-panel,aside .activity-focus-panel{background:#fdfdf9!important}
+aside .legend,aside .status{color:#617575!important}
+aside .lh-help-trigger{color:#327366!important;background:#f0f7f3!important;border-color:#bad6ca!important}
+aside a{color:#167c6c!important}
+main#map{min-height:0!important;height:auto!important;min-width:0!important;margin:15px!important;border:1px solid #284550!important;border-radius:18px!important;position:relative!important;background:radial-gradient(circle at 65% 50%,#183c40 0%,#0b2029 55%,#091a22 100%)!important;box-shadow:0 28px 45px #22454320!important;overflow:hidden!important}
+main#map:before{content:'';position:absolute;inset:0;opacity:.19;background-image:linear-gradient(#5da09a17 1px,transparent 1px),linear-gradient(90deg,#5da09a17 1px,transparent 1px);background-size:54px 54px;pointer-events:none;z-index:0}
+main#map .terrain-map-topline{position:absolute;top:18px;left:22px;right:100px;z-index:4;display:flex;justify-content:space-between;align-items:start;gap:20px;pointer-events:none}
+.terrain-stage-title{display:grid;gap:6px}.terrain-stage-kicker{display:flex;align-items:center;gap:8px;font-size:10px;color:#b2e5d8;letter-spacing:.18em;font-weight:770}.terrain-stage-title strong{font-size:24px;line-height:1.18;font-weight:760;letter-spacing:-.052em;color:#f2faf6;text-shadow:0 3px 14px #07191caa}.terrain-stage-title strong span{color:#8df5cb}.terrain-map-instruction{font-size:10px;letter-spacing:.16em;color:#a2bbb7;font-weight:700;padding-top:9px}
+main#map .maptop{top:107px!important;left:22px!important;max-width:min(340px,calc(100% - 120px))!important;padding:13px 16px!important;color:#eafaf2!important;background:#09232add!important;border:1px solid #3e7775!important;border-radius:12px!important;box-shadow:0 12px 24px #0614174d!important}
+main#map .maptop .map-caption-title{color:#f5fff8!important;font-size:13px!important;font-weight:770!important}
+main#map .maptop #mapDetail{color:#a9c5be!important;font-size:11px!important}
+main#map .tools{right:20px!important;top:22px!important;gap:6px!important}
+main#map .tools button{background:#13323bec!important;border:1px solid #4b7979!important;color:#f2fff8!important;border-radius:10px!important;box-shadow:0 8px 20px #061b2299!important}
+main#map .tools button:hover{background:#27605e!important}
+.terrain-map-footer{position:absolute;bottom:18px;left:20px;z-index:4;display:flex;align-items:center;gap:15px;border:1px solid #4d7d78;background:#0c2931ee;box-shadow:0 8px 28px #06171988;padding:10px 12px;border-radius:13px;max-width:calc(100% - 40px)}
+.terrain-mini-stat{display:grid;gap:1px;min-width:95px}.terrain-mini-stat span{font-size:9px;color:#a7c7c1;letter-spacing:.1em;font-weight:700}.terrain-mini-stat strong{font-size:21px;line-height:1.18;letter-spacing:-.04em;color:#f3fdf6;font-weight:760}.terrain-stat-divider{width:1px;height:26px;background:#38615d}
+.terrain-map-footer button{background:#b4efd4!important;border:1px solid #b4efd4!important;color:#17473f!important;font-size:11px!important;padding:10px 13px!important;white-space:nowrap;border-radius:8px!important;box-shadow:none!important}
+.terrain-map-footer button:hover{background:#e0ffea!important;color:#123b32!important}.terrain-map-footer button span{margin-left:8px}
+main#map .legend{bottom:98px!important;left:20px!important;background:#102f37e8!important;border:1px solid #4a7979!important;box-shadow:0 12px 25px #061b2275!important;border-radius:12px!important;color:#d6efeb!important;font-size:10px!important;padding:11px 13px!important}
+main#map .legend select{color:#e7fcf2!important;background:#21464b!important;border:1px solid #517978!important}
+main#map .legend #legendLabel{color:#a9c9c5!important}main#map #attribution{color:#a8c8c5!important}
+ 
+#statsDialog,#ridePreviewDialog,#sourceReviewDialog,#settingsDialog{background:#0e242d!important;color:#ecf8f3!important;border:1px solid #3c6162!important;border-radius:17px!important;box-shadow:0 26px 75px #041419a8!important}
+#statsDialog .insights-topbar,#ridePreviewDialog>.dialog-head,#settingsDialog>.dialog-head,#sourceReviewDialog>.dialog-head{background:#13343b!important;border-color:#3d6767!important;box-shadow:none!important}
+#statsDialog .insights-topbar::after,#ridePreviewDialog>.dialog-head::after,#settingsDialog>.dialog-head::after{background:none!important;display:none!important}
+#statsDialog .insights-intro h3,#statsDialog h2,#statsDialog h3,#ridePreviewDialog h2,#settingsDialog h2,#sourceReviewDialog h2{color:#f1fbf7!important}
+#statsDialog .metric,#statsDialog .insights-content-card,#statsDialog .analytics-card,#ridePreviewDialog .metric,#ridePreviewDialog .ride-preview-stat-group,#settingsDialog .settings-section,.lh-source-policy-section{background:#15343c!important;border:1px solid #325f61!important;box-shadow:none!important}
+#statsDialog .metric strong,#ridePreviewDialog .metric strong{color:#f2fff9!important}
+#statsDialog .metric span,#statsDialog .muted,#ridePreviewDialog .muted,#settingsDialog .muted,#sourceReviewDialog .muted{color:#a7c6c3!important}
+#statsDialog button.primary,#ridePreviewDialog button.primary,#sourceReviewDialog button.primary,#settingsDialog button.primary{background:#b4efd4!important;border:1px solid #b4efd4!important;color:#123d36!important;box-shadow:none!important}
+#statsDialog button:not(.primary),#ridePreviewDialog button:not(.primary),#sourceReviewDialog button:not(.primary),#settingsDialog button:not(.primary){background:#20424a!important;border-color:#497478!important;color:#e4f4ed!important}
+#statsDialog button:not(.primary):hover,#ridePreviewDialog button:not(.primary):hover,#sourceReviewDialog button:not(.primary):hover,#settingsDialog button:not(.primary):hover{background:#2f5b60!important;color:#fff!important}
+#settingsDialog .settings-nav,#statsDialog .stats-tabs{background:#102e36!important;border-color:#376267!important}
+#settingsDialog .settings-category[aria-selected=true],#statsDialog .stats-tabs button[aria-selected=true]{background:#275d56!important;color:#eaffef!important;box-shadow:inset 3px 0 #78e6bd!important;border-color:#3a756c!important}
+#settingsDialog input:not([type=checkbox]),#settingsDialog select,#sourceReviewDialog select,#statsDialog select,#statsDialog input{background:#15343c!important;border-color:#487477!important;color:#f5fff9!important}
+#settingsDialog .settings-savebar,#sourceReviewDialog .lh-source-policy-footer{background:#112f35!important;border-color:#386666!important}
+#settingsDialog .settings-section h2,#sourceReviewDialog .lh-source-policy-field strong{color:#e6fcf2!important}
+#sourceReviewDialog .lh-source-policy-field small{color:#a1c2be!important}.lh-source-policy-row{border-color:#41676a!important}
+#statsDialog .metric,#statsDialog #metricGrid .metric{background:#14363e!important;border-color:#396767!important;--lh-accent:#9deace;--lh-wash:#67cfa820;box-shadow:none!important}
+#statsDialog #metricGrid .metric:nth-child(2n){--lh-accent:#f2b873;--lh-wash:#e7b36a18}
+ 
+@media(max-width:1190px){.workspace{grid-template-columns:72px 282px minmax(0,1fr)}.workspace>aside{width:282px!important}.terrain-rail{padding:17px 5px}.terrain-map-instruction{display:none}}
+@media(max-width:880px){body{overflow:auto!important}header{height:auto!important;min-height:76px!important;flex-wrap:wrap!important;gap:9px!important;padding:10px 14px!important}header .header-actions{width:100%;justify-content:flex-start!important}.workspace{height:auto!important;grid-template-columns:74px minmax(0,1fr)!important;grid-template-rows:auto auto!important}.terrain-rail{grid-column:1;grid-row:1;align-self:stretch;min-height:0}.workspace>aside{grid-column:2;grid-row:1;width:100%!important;height:auto!important;max-height:460px!important;overflow:auto!important;border-right:0!important}.workspace>main#map{grid-column:1 / -1;grid-row:2;height:72vh!important;min-height:480px!important;margin:9px!important}.terrain-rail .lh-quicknav{gap:5px!important;margin-top:10px!important}.terrain-rail .lh-quicknav button{min-height:60px!important}.terrain-rail-foot{display:none}}
+@media(max-width:550px){header h1{font-size:17px!important}header .brand-credit{display:none!important}header .brand-text>small{font-size:9px!important;letter-spacing:.08em!important}header .header-actions button{padding:7px 10px!important;font-size:11px!important;min-height:34px}.workspace{grid-template-columns:62px minmax(0,1fr)!important}.terrain-rail{padding:12px 3px}.terrain-rail-intro{font-size:8px}.terrain-rail-cross{width:32px;height:32px}.terrain-rail .lh-quicknav button{font-size:9px!important;min-height:57px!important;padding:5px 1px!important}.terrain-rail .lh-quicknav button svg{width:20px;height:20px}.workspace>aside{padding:0 9px 14px!important;max-height:420px!important}.lh-workspace-title{padding:18px 6px 12px!important}.lh-workspace-title h2{font-size:24px!important}.terrain-sidebar-caption{display:none}aside>section{margin:9px 0 0!important;padding:12px!important}main#map .terrain-map-topline{top:14px;left:13px;right:62px}.terrain-stage-title strong{font-size:19px}.terrain-stage-kicker{font-size:8px}.terrain-map-instruction{display:none}main#map .maptop{top:88px!important;left:12px!important;max-width:calc(100% - 76px)!important;padding:8px 11px!important}main#map .tools{top:14px!important;right:12px!important}.terrain-map-footer{left:10px;bottom:11px;gap:7px;padding:8px;max-width:calc(100% - 20px)}.terrain-mini-stat{min-width:65px}.terrain-mini-stat span{font-size:7px}.terrain-mini-stat strong{font-size:17px}.terrain-map-footer button{padding:7px!important;font-size:9px!important}.terrain-map-footer button span{display:none}main#map .legend{left:10px!important;bottom:82px!important;max-width:220px!important;padding:8px!important;font-size:9px!important}}
+@media(prefers-reduced-motion:reduce){.terrain-rail button,button{transition:none!important}}
+ 
+.workspace>aside .muted,.workspace>aside .status,.workspace>aside .foot,.workspace>aside p:not(.terrain-sidebar-caption),.workspace>aside #tileNotice{color:#557076!important}
+.workspace>aside .lh-workspace-title p{color:#637c7e!important}
+#sourceReviewDialog .lh-source-policy-hero{background:linear-gradient(120deg,#1b4547,#15383d 74%)!important;border:1px solid #39776f!important}
+#sourceReviewDialog .lh-source-policy-mark{background:#235b54!important;border:1px solid #5caa90!important;color:#d4f9df!important}
+#sourceReviewDialog .lh-source-policy-hero p{color:#adcec6!important}
+#sourceReviewDialog .lh-section-eyebrow{color:#9eeed4!important}
+#sourceReviewDialog .lh-source-policy-section h3{color:#eafaf4!important}
+#sourceReviewDialog .lh-source-policy-section h3 span{background:#24554f!important;color:#b6f3d3!important}
+#settingsDialog .settings-category{position:relative;padding-left:43px!important}
+#settingsDialog .settings-category:before{content:'◉';position:absolute;left:14px;top:17px;color:#8be6c9;font-size:19px;line-height:1}
+#settingsDialog #settingsTab-imports:before{content:'↧'}#settingsDialog #settingsTab-insights:before{content:'▥'}#settingsDialog #settingsTab-library:before{content:'▦'}#settingsDialog #settingsTab-updates:before{content:'↻'}
+#settingsDialog .settings-category small{color:#aac6be!important}
+#settingsDialog .settings-category strong{color:#eafaf2!important}
+#settingsDialog .settings-panels{background:#102932!important;color:#eaf7ef!important}
+#settingsDialog .settings-panel{background:transparent!important;color:#eaf7ef!important}
+#settingsDialog .settings-panel-head{border-color:#386265!important}
+#settingsDialog .settings-panel-head .settings-kicker{color:#80e2c3!important}
+#settingsDialog .settings-panel-head>p:last-child{color:#abcac3!important}
+#settingsDialog .settings-section{background:transparent!important;border:0!important;border-bottom:1px solid #385c60!important;border-radius:0!important;padding:2px 0 21px!important;margin:0 0 19px!important}
+#settingsDialog .settings-section:last-child{border-bottom:0!important}
+#settingsDialog .settings-section strong,#settingsDialog .settings-actions strong,#settingsDialog .field label{color:#e3f5ee!important}
+#settingsDialog .settings-section p,#settingsDialog .settings-section small,#settingsDialog .settings-note,#settingsDialog .settings-actions small,#settingsDialog .settings-section .muted{color:#afcbc5!important}
+#settingsDialog .settings-actions{border-color:#355b5d!important;background:transparent!important}
+#settingsDialog .settings-global-status{background:#13333a!important;color:#bad9ce!important}
+#settingsDialog a,#settingsDialog a:visited{color:#86efd4!important;text-decoration-color:#4da895!important}
+#settingsDialog .speed-threshold-suffix{background:#1c4449!important;border-color:#4c7772!important;color:#d7f6e9!important}
+#settingsDialog .settings-nav-caption{color:#8cb8ae!important}
+#settingsDialog .settings-category[aria-selected=true] small{color:#b9ecd9!important}
+ 
+@media(max-width:880px){
+ .workspace{display:flex!important;flex-direction:column!important;min-height:0!important;height:auto!important}
+ .terrain-rail{order:0;display:flex!important;flex-direction:row!important;width:100%!important;min-height:70px!important;height:70px!important;flex:none!important;padding:5px 13px!important}
+ .terrain-rail-intro{display:none!important}
+ .terrain-rail .lh-quicknav{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;width:100%;margin:0!important;gap:8px!important}
+ .terrain-rail .lh-quicknav button{min-height:56px!important;gap:3px!important;padding:4px!important;flex-direction:column!important}
+ .terrain-rail .lh-quicknav button svg{width:19px;height:19px}
+ .workspace>main#map{order:1;grid-row:auto;grid-column:auto;width:calc(100% - 18px)!important;height:62vh!important;min-height:400px!important;margin:9px!important;flex:none!important}
+ .workspace>aside{order:2;grid-row:auto;grid-column:auto;width:100%!important;height:auto!important;max-height:none!important;overflow:visible!important;padding:0 12px 25px!important;border-top:1px solid #d7e2dc!important}
+}
+
+ 
+
+
+:root{
+ --trail-navy:#0D3B66; --trail-navy-950:#082741; --trail-navy-900:#0B3155; --trail-navy-800:#144976;
+ --trail-navy-600:#38668B; --trail-yellow:#F4D35E; --trail-gold:#FFCE7C;
+ --trail-cream:#FAF0CA; --trail-ivory:#FFFCF2; --trail-paper:#F8F4E5;
+ --trail-ink:#102F4B; --trail-muted:#596E7E; --trail-line:#DDDCC7;
+ --trail-shadow:0 15px 42px rgba(13,59,102,.10);
+ --terrain-ink:#102f4b;--terrain-navy:#0d3b66;--terrain-paper:#faf0ca;--terrain-card:#fffcf2;
+ --terrain-line:#dfdfc7;--terrain-body:#163955;--terrain-muted:#62788c;
+ --terrain-mint:#f4d35e;--terrain-teal:#0d3b66;--terrain-gold:#ffce7c;
+ --terrain-shadow:var(--trail-shadow);
+}
+html{background:var(--trail-paper)!important}
+body{background:var(--trail-paper)!important;color:var(--trail-ink)!important}
+button:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible{outline:3px solid var(--trail-yellow)!important;outline-offset:2px!important}
+a{color:var(--trail-navy)}
+ 
+header{background:var(--trail-navy)!important;border-bottom:2px solid #1B507D!important;color:#FFFCF2!important}
+header .logo{filter:drop-shadow(0 0 8px rgba(244,211,94,.2))!important}
+header h1{color:#FFFCF2!important}
+header .brand-text>small{color:#D4E2ED!important}
+header .brand-credit{border-color:#527797!important;background:#144671!important;color:#F1EACD!important}
+header .brand-credit a{color:var(--trail-yellow)!important;text-decoration-color:#8A793F!important;text-underline-offset:3px}
+header .header-actions button{background:#174D7A!important;border:1px solid #4B7290!important;color:#FAF0CA!important}
+header .header-actions button:hover{background:#245D8A!important;border-color:#F4D35E!important;color:#fff!important}
+header .header-actions .stats-header{background:var(--trail-yellow)!important;border-color:var(--trail-yellow)!important;color:var(--trail-ink)!important;font-weight:800!important}
+header .header-actions .stats-header:hover{background:#FFDF76!important;border-color:#FFDF76!important;color:var(--trail-ink)!important}
+#headerSources{background:#204F78!important;border-color:#70869A!important}
+#headerSources:before{color:var(--trail-yellow)!important}
+ 
+.workspace{background:var(--trail-paper)!important}
+.terrain-rail{background:var(--trail-navy)!important;border-color:#3F6685!important}
+.terrain-rail-intro{color:#E8DEBA!important}
+.terrain-rail-cross{background:var(--trail-yellow)!important;border:1px solid #FFEB9B!important;color:var(--trail-navy)!important;border-radius:12px!important}
+.terrain-rail .lh-quicknav button{color:#D4DFE8!important}
+.terrain-rail .lh-quicknav button:hover{background:#235783!important;color:#fff!important}
+.terrain-rail .lh-quicknav .lh-quicknav-active{background:var(--trail-yellow)!important;color:var(--trail-navy)!important;border-color:#FFE385!important;box-shadow:inset 0 -3px #DAB33E!important;font-weight:800!important}
+.terrain-rail .lh-quicknav .lh-quicknav-active svg{stroke-width:1.9!important}
+.terrain-rail .lh-quicknav .lh-quicknav-active span{color:var(--trail-navy)!important;font-weight:800!important}
+.terrain-rail-foot{color:#CBD9DC!important}
+.terrain-live-dot{background:var(--trail-yellow)!important;box-shadow:0 0 0 3px #F4D35E2E!important}
+ 
+.workspace>aside{background:var(--trail-cream)!important;border-right:1px solid #DED29D!important;color:var(--trail-ink)!important;scrollbar-color:#D6C77C transparent}
+.lh-workspace-title{border-bottom-color:#D5C98E!important}
+.lh-eyebrow{color:var(--trail-navy)!important}
+.lh-workspace-title h2{color:var(--trail-navy)!important}
+.lh-workspace-title h2 em{color:#B18B1C!important}
+.lh-workspace-title p,.workspace>aside .lh-workspace-title p{color:#4E657A!important}
+.terrain-sidebar-caption{color:#667689!important}
+aside>section{background:var(--trail-ivory)!important;border-color:#E4DDBD!important;box-shadow:0 7px 20px #243A5020!important}
+aside>section:hover{border-color:#C4B36C!important}
+aside>section h2,aside>section h3{color:var(--trail-navy)!important}
+.lh-panel-icon{background:#FBEBAB!important;border-color:#E5D084!important;color:var(--trail-navy)!important}
+aside .muted,aside .foot,aside .status,aside .bike-layer-note,aside #tileNotice,aside small,
+.workspace>aside .muted,.workspace>aside .status,.workspace>aside .foot,.workspace>aside p:not(.terrain-sidebar-caption),.workspace>aside #tileNotice{color:#556D7B!important}
+aside .stats .stat,aside .stat{background:#F7F0D6!important;border-color:#E1D7B1!important}
+aside .stats .stat strong{color:var(--trail-navy)!important}
+aside .stats .stat span{color:#58748D!important}
+aside .field label,aside label,aside .toggle{color:#244E70!important}
+aside input[type=checkbox],aside input[type=radio]{accent-color:var(--trail-navy)!important}
+aside select,aside input:not([type=checkbox]):not([type=range]):not([type=color]),aside button:not(.lh-help-trigger){background:#FFFEFA!important;border:1px solid #D4CBA7!important;color:#214D6F!important}
+aside button:hover:not(.lh-help-trigger){border-color:#D6B341!important;background:#FFF3C9!important;color:var(--trail-navy)!important}
+aside button.primary{background:var(--trail-yellow)!important;border-color:#E8C248!important;color:var(--trail-navy)!important;box-shadow:0 4px 11px rgba(136,100,14,.14)!important;font-weight:790!important}
+aside button.primary:hover{background:#FFE078!important;border-color:#DFB830!important;color:var(--trail-navy)!important}
+aside .bike-panel,aside .activity-focus-panel{background:var(--trail-ivory)!important}
+aside .lh-help-trigger{color:var(--trail-navy)!important;background:#FFF5D0!important;border-color:#E5CF75!important}
+aside a{color:#0D3B66!important}
+aside input[type=range]{accent-color:#D1AB38!important}
+ 
+main#map{background:radial-gradient(ellipse at 57% 42%,#143E62 0%,#0D2944 55%,#06192D 100%)!important;border-color:#1A466D!important;box-shadow:0 25px 38px #0D3B6631!important}
+main#map:before{background-image:linear-gradient(#F4D35E0B 1px,transparent 1px),linear-gradient(90deg,#F4D35E0B 1px,transparent 1px)!important}
+.terrain-stage-kicker{color:#F7DE80!important}
+.terrain-stage-title strong{color:#FFFCF2!important}
+.terrain-stage-title strong span{color:var(--trail-yellow)!important}
+.terrain-map-instruction{color:#C9D6DE!important}
+main#map .maptop{background:#082A48EB!important;border-color:#54758C!important;color:var(--trail-ivory)!important}
+main#map .maptop .map-caption-title{color:#FFF9E8!important}
+main#map .maptop #mapDetail{color:#C1D5DE!important}
+main#map .tools button{background:#0D3B66EE!important;border-color:#6686A1!important;color:#FFF5D5!important}
+main#map .tools button:hover{background:#F4D35E!important;border-color:#F4D35E!important;color:#0D3B66!important}
+main#map .legend{background:#092C4BEE!important;border-color:#57758F!important;color:#FFF4CF!important}
+main#map .legend select{background:#164C78!important;border-color:#607B8E!important;color:#FDF4E1!important}
+main#map .legend a{color:#FFF0A9!important}
+main#map .empty .panel{background:#0B3353F0!important;border-color:#6081A0!important;color:#FFFCF2!important}
+.terrain-map-footer{background:#092B49F0!important;border:1px solid #55768E!important;color:#FFFAEA!important}
+.terrain-mini-stat span{color:#C2D4DE!important}
+.terrain-mini-stat strong{color:#FFF7DC!important}
+.terrain-stat-divider{background:#6D8599!important}
+.terrain-map-footer button{background:var(--trail-yellow)!important;border-color:var(--trail-yellow)!important;color:var(--trail-navy)!important;font-weight:800!important}
+.terrain-map-footer button:hover{background:#FFE078!important;border-color:#FFE078!important;color:var(--trail-navy)!important}
+ 
+#sourceReviewDialog{background:#F9F3DA!important;color:var(--trail-ink)!important;border:1px solid #D8CC9F!important}
+#sourceReviewDialog .dialog-head{background:var(--trail-navy)!important;border-bottom:2px solid var(--trail-yellow)!important;color:#FFF8E7!important}
+#sourceReviewDialog .dialog-head h2{color:#FFF9E8!important}
+#sourceReviewDialog .dialog-head .muted{color:#DCE6EA!important}
+#sourceReviewDialog .lh-section-eyebrow{color:var(--trail-yellow)!important}
+#sourceReviewDialog .lh-source-policy-hero{background:#F4EAC6!important;border:1px solid #E0D19C!important;color:var(--trail-ink)!important}
+#sourceReviewDialog .lh-source-policy-hero h3,#sourceReviewDialog .lh-source-policy-hero strong{color:var(--trail-navy)!important}
+#sourceReviewDialog .lh-source-policy-hero p{color:#50647A!important}
+#sourceReviewDialog .lh-source-policy-mark{background:var(--trail-yellow)!important;border:1px solid #E0BE42!important;color:var(--trail-navy)!important}
+#sourceReviewDialog .lh-source-policy-section{background:#FFFDF5!important;border-color:#DED6B5!important;color:var(--trail-ink)!important}
+#sourceReviewDialog .lh-source-policy-section h3{color:var(--trail-navy)!important}
+#sourceReviewDialog .lh-source-policy-section h3 span{background:#F5E4A5!important;color:var(--trail-navy)!important}
+#sourceReviewDialog .lh-source-policy-row{border-color:#E1DAC1!important}
+#sourceReviewDialog .lh-source-policy-field strong{color:var(--trail-navy)!important}
+#sourceReviewDialog .lh-source-policy-field small,#sourceReviewDialog .muted{color:#5F7282!important}
+#sourceReviewDialog select{background:#FFFDF7!important;border:1px solid #C9C6AD!important;color:var(--trail-navy)!important}
+#sourceReviewDialog button:not(.primary){background:#FFFCF1!important;border:1px solid #D5CCA2!important;color:var(--trail-navy)!important}
+#sourceReviewDialog button:not(.primary):hover{background:#FAEDBA!important;border-color:#C5AC4D!important;color:var(--trail-navy)!important}
+#sourceReviewDialog button.primary{background:var(--trail-yellow)!important;border-color:#D9B944!important;color:var(--trail-navy)!important;font-weight:800!important}
+#sourceReviewDialog .lh-source-policy-footer{background:#F8F0D5!important;border-top:1px solid #D9C998!important;color:var(--trail-ink)!important}
+#sourceReviewDialog #sourceReviewStatus{color:#435F76!important}
+ 
+#settingsDialog,#statsDialog,#ridePreviewDialog,#activityEditDialog{background:#0B3155!important;color:#FAF0CA!important;border:1px solid #527392!important}
+#settingsDialog>.dialog-head,#ridePreviewDialog>.dialog-head,#activityEditDialog>.dialog-head,
+#statsDialog .insights-topbar{background:var(--trail-navy)!important;border-bottom:2px solid var(--trail-yellow)!important;color:#FDF8E6!important}
+#settingsDialog h2,#ridePreviewDialog h2,#statsDialog h2{color:#FFFBED!important}
+#settingsDialog .muted,#ridePreviewDialog .muted,#statsDialog .muted{color:#CDDCE4!important}
+#settingsDialog .settings-nav,#statsDialog .stats-tabs{background:#082944!important;border-color:#3C5F7B!important}
+#settingsDialog .settings-category[aria-selected=true],#statsDialog .stats-tabs button[aria-selected=true]{background:#F4D35E!important;border-color:#DDB940!important;color:var(--trail-navy)!important;box-shadow:inset 3px 0 #FFE890!important}
+#settingsDialog .settings-category[aria-selected=true] strong,#settingsDialog .settings-category[aria-selected=true] small{color:var(--trail-navy)!important}
+#settingsDialog .settings-category:not([aria-selected=true]) strong{color:#FFF7E0!important}
+#settingsDialog .settings-category:not([aria-selected=true]) small{color:#C9D8E1!important}
+#settingsDialog .settings-category:before{color:#F4D35E!important}
+#settingsDialog .settings-category[aria-selected=true]:before{color:var(--trail-navy)!important}
+#settingsDialog .settings-panels{background:#0C3153!important;color:#FDF7E7!important}
+#settingsDialog .settings-panel{background:transparent!important;color:#FDF7E7!important}
+#settingsDialog .settings-panel-head{border-color:#456783!important}
+#settingsDialog .settings-panel-head .settings-kicker{color:#F4D35E!important}
+#settingsDialog .settings-panel-head>p:last-child{color:#CAD6E1!important}
+#settingsDialog .settings-section{border-bottom-color:#43627B!important}
+#settingsDialog .settings-section strong,#settingsDialog .settings-actions strong,#settingsDialog .field label{color:#FFF6D8!important}
+#settingsDialog .settings-section p,#settingsDialog .settings-section small,#settingsDialog .settings-note,#settingsDialog .settings-actions small,#settingsDialog .settings-section .muted{color:#CEDBE2!important}
+#settingsDialog input:not([type=checkbox]),#settingsDialog select,#statsDialog input,#statsDialog select{background:#154A73!important;border-color:#68849B!important;color:#FFF8E9!important}
+#settingsDialog input[type=checkbox]{accent-color:var(--trail-yellow)!important}
+#settingsDialog .settings-savebar,#sourceReviewDialog .lh-source-policy-footer{box-shadow:0 -8px 22px rgba(5,22,41,.10)!important}
+#settingsDialog .settings-savebar{background:#092C4C!important;border-color:#436884!important}
+#settingsDialog button.primary,#statsDialog button.primary,#ridePreviewDialog button.primary{background:#F4D35E!important;color:#0D3B66!important;border-color:#F4D35E!important;font-weight:800!important}
+#settingsDialog button:not(.primary),#statsDialog button:not(.primary),#ridePreviewDialog button:not(.primary){background:#18476C!important;color:#FFF5D8!important;border-color:#557A99!important}
+#settingsDialog button:not(.primary):hover,#statsDialog button:not(.primary):hover,#ridePreviewDialog button:not(.primary):hover{background:#2A5A80!important;color:#FFF!important;border-color:#F4D35E!important}
+#settingsDialog .settings-global-status{background:#16466F!important;color:#F7EFDA!important}
+#settingsDialog a{color:#F4D35E!important;text-decoration-color:#C4A63E!important}
+#statsDialog .metric,#statsDialog #metricGrid .metric,#statsDialog .insights-content-card,#statsDialog .analytics-card,
+#ridePreviewDialog .metric,#ridePreviewDialog .ride-preview-stat-group{background:#16436C!important;border-color:#406B8B!important;color:#FFF7DB!important}
+#statsDialog .metric strong,#ridePreviewDialog .metric strong{color:#FFF8DE!important}
+#statsDialog .metric span,#ridePreviewDialog .metric span{color:#C9DBE6!important}
+#statsDialog #metricGrid .metric{--lh-accent:#F4D35E;--lh-wash:#F4D35E1D}
+#statsDialog #metricGrid .metric:nth-child(2n){--lh-accent:#FFCE7C;--lh-wash:#FFCE7C1B}
+#ridePreviewDialog .ride-preview-map{border-color:#66849A!important}
+#ridePreviewDialog .lh-preview-controls button{background:#123F68!important;color:#FFEFBA!important;border-color:#7A8996!important}
+#ridePreviewDialog .lh-preview-controls button:hover{background:#F4D35E!important;color:#0D3B66!important}
+#ridePreviewDialog .v120-telemetry{background:#0B3155!important;color:#FFF5DE!important;border-color:#516E8B!important}
+#ridePreviewDialog .ride-preview-badge{background:#0B3155!important;color:#FFEDAE!important;border-color:#8A825C!important}
+#ridePreviewDialog input[type=range]{accent-color:#F4D35E!important}
+ 
+@media(max-width:880px){
+ .terrain-rail{background:var(--trail-navy)!important}
+ .workspace>aside{border-top-color:#D7CB94!important}
+ .workspace>main#map{border-color:#234B74!important}
+}
+@media(prefers-reduced-motion:reduce){header .header-actions button,aside button,.terrain-rail button{transition:none!important}}
+
+ 
+#settingsDialog .settings-watch,#settingsDialog .garmin-usb-panel,
+#settingsDialog .settings-subdetails,#settingsDialog .settings-storage,
+#settingsDialog .settings-cloud-panel{background:#123E64!important;border:1px solid #4D7190!important;color:#FFF7E3!important}
+#settingsDialog .settings-watch>h3,#settingsDialog .garmin-usb-panel>strong{color:#FFF4D4!important}
+#settingsDialog .settings-watch .field{border-top-color:#4A7290!important}
+#settingsDialog .settings-watch .settings-note{color:#D7E0E5!important}
+#settingsDialog .settings-subdetails summary{color:#F4D35E!important}
+#settingsDialog .settings-watch input{background:#174A73!important;border-color:#6A879C!important;color:#FFF6E0!important}
+#settingsDialog .settings-section .settings-card,#settingsDialog .settings-section .settings-field-group,
+#settingsDialog .settings-section .storage-card{background:#133F65!important;border-color:#517391!important}
+#settingsDialog .settings-kicker,#settingsDialog .settings-nav-caption{color:#F4D35E!important}
+#settingsDialog .settings-category:not([aria-selected=true]):hover{background:#28577D!important}
+#sourceReviewDialog .lh-source-policy-footer small,#sourceReviewDialog .lh-source-policy-footer .muted,
+#sourceReviewDialog .lh-source-policy-footer>span{color:#3E5B72!important}
+#sourceReviewDialog .lh-source-policy-tools button{font-weight:700!important}
+#statsDialog #facts .record-metric{background:#153F65!important;border-color:#527493!important;color:#FFF7DE!important}
+#statsDialog #facts .record-metric::before{background:linear-gradient(90deg,var(--record-accent,#F4D35E),transparent 88%)!important}
+#statsDialog #facts .record-metric:nth-child(4n+1){--record-accent:#F4D35E}
+#statsDialog #facts .record-metric:nth-child(4n+2){--record-accent:#FFCE7C}
+#statsDialog #facts .record-metric:nth-child(4n+3){--record-accent:#B5D3EA}
+#statsDialog #facts .record-metric:nth-child(4n+4){--record-accent:#F5DF96}
+#ridePreviewDialog .ride-preview-detail{background:#16446E!important;border-color:#517593!important}
+#ridePreviewDialog .ride-preview-detail::before{background:linear-gradient(90deg,#F4D35E,#FFCE7C80,transparent)!important}
+#ridePreviewDialog #showRideMap{background:var(--trail-yellow)!important;border-color:var(--trail-yellow)!important;color:var(--trail-navy)!important}
+#ridePreviewDialog .ride-preview-detail span,#ridePreviewDialog #ridePreviewStatus{color:#D1DBE2!important}
+#settingsDialog .settings-global-status{color:#E5EEE4!important}
+.workspace>aside .range-value,.workspace>aside output{color:#B88F1D!important}
+
+ 
+main#map .attribution{background:#092B49E6!important;color:#E9E4CF!important;border:1px solid #4A6C86!important;border-radius:7px!important;font-size:11px!important}
+main#map .attribution a{color:#FAF0CA!important}
+@media(max-width:550px){main#map .attribution{top:177px!important;bottom:auto!important;right:9px!important;padding:3px 5px!important;font-size:9px!important;max-width:158px!important}}
+
+
+
+:root{--lh-surface:#FFFCF2;--lh-navy:#0D3B66;--lh-yellow:#F4D35E;--lh-cream:#FAF0CA;--lh-line:#DCD3AF}
+html,body{background:#F8F4E5!important}
+button{background:#16446D;border:1px solid #587894;color:#FFFAE9}
+button:hover{border-color:var(--lh-yellow);background:#225781;color:#fff}
+input[type=range],input[type=checkbox],input[type=radio]{accent-color:var(--lh-yellow)!important}
+button:focus-visible,select:focus-visible,input:focus-visible,[role=button]:focus-visible{outline:3px solid var(--lh-yellow)!important;outline-offset:3px!important}
+ 
+.terrain-rail{padding-top:20px!important;gap:0!important}
+.terrain-rail .lh-quicknav{margin:6px 0 0!important}
+.terrain-rail-intro,.terrain-rail-foot,.terrain-map-topline,.terrain-map-footer,.terrain-sidebar-caption{display:none!important}
+.lh-workspace-title{padding-bottom:17px!important}
+.lh-workspace-title h2{font-size:25px!important;letter-spacing:-.04em!important;margin:7px 0!important;color:var(--lh-navy)!important}
+.lh-workspace-title p{max-width:255px;font-size:12px!important;color:#536A79!important}
+header .brand{gap:12px!important}
+header .brand-text{display:flex!important;flex-direction:column!important;align-items:flex-start!important;gap:4px!important}
+header .brand-title-row{display:block!important}
+header .brand-title-row h1{font-size:22px!important;line-height:1.1!important;margin:0!important}
+header .brand-credit{display:block!important;background:transparent!important;border:0!important;border-radius:0!important;box-shadow:none!important;padding:0!important;white-space:normal!important;font-size:11px!important;line-height:1.3!important;color:#CBDBE6!important;font-weight:500!important}
+header .brand-credit a{color:#F4D35E!important;text-decoration:none!important;border:0!important;border-bottom:1px solid #F4D35E88!important;font-weight:750!important}
+header .brand-credit a:hover{color:#FFF1A8!important;border-bottom-color:#FFF1A8!important}
+#headerSources:before{content:none!important;display:none!important}
+ 
+main#map .maptop{top:18px!important;left:19px!important;right:auto!important;max-width:min(345px,calc(100% - 105px))!important;min-width:0!important;padding:13px 15px!important;background:#092C4BEF!important;border:1px solid #607C92!important;border-radius:12px!important;box-shadow:0 12px 30px #061b2f61!important;z-index:6!important;pointer-events:none!important}
+main#map .maptop .map-caption-title{font-size:17px!important;line-height:1.2!important;letter-spacing:-.02em!important;color:#FFF8E5!important}
+main#map .maptop #mapDetail{font-size:11px!important;line-height:1.4!important;color:#D0DDE7!important}
+main#map #clearRide{pointer-events:auto!important;background:var(--lh-yellow)!important;border-color:#E4BF3E!important;color:var(--lh-navy)!important}
+main#map .tools{top:18px!important;right:19px!important;z-index:6!important}
+ 
+main#map .legend{position:absolute!important;bottom:19px!important;left:19px!important;z-index:10!important;pointer-events:auto!important;padding:12px 14px!important;background:#082F51F4!important;border:1px solid #597A96!important;border-radius:12px!important;min-width:222px!important}
+main#map .legend *{pointer-events:auto!important}
+main#map .legend .legend-select{border-top:1px solid #55718C!important;padding-top:11px!important;margin-top:10px!important;cursor:pointer!important;position:relative!important;z-index:11!important}
+main#map .legend .legend-select span,main#map .legend #legendLabel{color:#ECE6D6!important}
+main#map .legend select{appearance:auto!important;cursor:pointer!important;background:#18466F!important;border:1px solid #8395A6!important;color:#FFFBF0!important;min-height:36px!important;min-width:116px!important;position:relative!important;z-index:12!important}
+main#map .legend select:hover{border-color:var(--lh-yellow)!important}
+main#map .legend select:focus-visible{outline:3px solid var(--lh-yellow)!important}
+main#map .attribution{bottom:11px!important;right:11px!important;top:auto!important;z-index:5!important}
+ 
+#sourceReviewDialog{padding:26px!important;background:#F9F4E2!important;border:1px solid #D4C9A6!important;border-radius:18px!important;box-shadow:0 26px 90px #061B32A3!important}
+#sourceReviewDialog>.dialog-head{margin:-26px -26px 22px!important;padding:23px 26px 25px!important;top:-26px!important;display:flex!important;align-items:center!important;justify-content:space-between!important;gap:28px!important;background:#0D3B66!important;border-bottom:3px solid #F4D35E!important}
+#sourceReviewDialog>.dialog-head>div{flex:1 1 auto;min-width:0;max-width:710px!important}
+#sourceReviewDialog>.dialog-head h2{font-size:25px!important;font-weight:780!important;line-height:1.14!important;letter-spacing:-.035em!important;margin:0 0 9px!important;color:#FFF8E3!important}
+#sourceReviewDialog>.dialog-head p{max-width:630px!important;color:#DFE7EC!important;font-size:12px!important;line-height:1.65!important;margin:0!important}
+#sourceReviewDialog #closeSourceReview{flex:0 0 auto;background:#FAF0CA!important;color:#0D3B66!important;border:1px solid #E2D29A!important;min-height:40px!important;padding:8px 16px!important;font-weight:750!important}
+#sourceReviewDialog #closeSourceReview:hover{background:#F4D35E!important}
+#sourceReviewDialog .lh-source-policy-hero{display:block!important;border-left:4px solid var(--lh-yellow)!important;background:#F6EBC5!important;padding:17px 20px!important;margin:0 0 18px!important;border-radius:11px!important}
+#sourceReviewDialog .lh-source-policy-hero strong{font-size:16px!important;line-height:1.35!important;font-weight:770!important;color:#0D3B66!important}
+#sourceReviewDialog .lh-source-policy-hero p{margin:6px 0 0!important;max-width:780px!important;color:#475D70!important;font-size:12px!important;line-height:1.6!important}
+#sourceReviewDialog .lh-source-policy-tools{gap:10px!important;align-items:center!important}
+#sourceReviewDialog .lh-source-policy-section{background:#FFFEF9!important;box-shadow:none!important}
+#sourceReviewDialog .lh-source-policy-section h3{color:#0D3B66!important}
+#sourceReviewDialog .lh-source-group-icon{background:#F6E5A8!important;color:#0D3B66!important;border:1px solid #E4D28C!important}
+#sourceReviewDialog .lh-source-policy-row select{background:#FFFDF4!important;border:1px solid #BDBB9F!important;color:#0D3B66!important}
+#sourceReviewDialog .lh-source-policy-row select:focus-visible{outline:2px solid #DAAC1D!important}
+#sourceReviewDialog .lh-source-policy-footer{background:#F9F2D9!important;border-color:#D9CC9F!important}
+ 
+dialog:not(#sourceReviewDialog){background:#0B3155!important;color:#FFF7DE!important;border-color:#557793!important}
+dialog:not(#sourceReviewDialog) .dialog-head{border-color:#557793!important}
+#statsDialog .insights-topbar::after,#settingsDialog>.dialog-head::after,#ridePreviewDialog .ride-preview-detail::before{background:linear-gradient(90deg,#F4D35E,#FFCE7C,transparent)!important}
+#statsDialog .insights-heading .insights-mark{background:#154A75!important;border-color:#7089A0!important;box-shadow:none!important;color:#FAF0CA!important}
+#statsDialog .stats-tabs button[aria-selected=true]::before{background:#F4D35E!important}
+#statsDialog .stats-tabs button[aria-selected=true] .insights-nav-symbol{color:#0D3B66!important}
+#statsDialog .insights-eyebrow,#statsDialog .stats-story-kicker{color:#F4D35E!important}
+#statsDialog #metricGrid .metric:nth-child(n){--flare:#F4D35E;--flare-wash:#F4D35E1A;--lh-accent:#F4D35E;--lh-wash:#F4D35E1A}
+#statsDialog #facts .record-metric:nth-child(n){--record-accent:#F4D35E}
+#statsDialog .chart-bar{background:linear-gradient(90deg,#F4D35E,#FFCE7C)!important}
+#statsDialog .ride-list-item:hover{background:#20527B!important;border-color:#F4D35E!important;box-shadow:none!important}
+#statsDialog .sport-row strong,#statsDialog .insights-nav-symbol{color:#F4D35E!important}
+#statsDialog .insights-filter-drawer:focus-within{border-color:#F4D35E!important}
+#settingsDialog .settings-section .settings-actions,#settingsDialog .settings-section .settings-subdetails{border-color:#527390!important}
+#ridePreviewDialog .ride-preview-source,#ridePreviewDialog .ride-preview-detail{background:#16446E!important;border-color:#547594!important;color:#FFF6E0!important}
+#ridePreviewDialog #openActivitySources{background:#F4D35E!important;color:#0D3B66!important;border-color:#F4D35E!important}
+#ridePreviewDialog #openActivitySources:hover{background:#FFDF78!important}
+#ridePreviewDialog .ride-preview-badge{background:#092B49F0!important;border-color:#69859B!important;color:#FFF4D3!important}
+#ridePreviewDialog .lh-preview-map-hint{background:#092B49D9!important;color:#FFF0CE!important}
+#statsDialog .metric,#statsDialog .insights-content-card,#ridePreviewDialog .metric{box-shadow:none!important}
+#busy,#heatVisitTooltip{background:#0B3155!important;color:#FAF0CA!important;border:1px solid #587794!important}
+.empty .panel{background:#0B3155ED!important;border-color:#647F94!important;color:#FFF7DE!important;box-shadow:0 15px 40px #061C32A8!important}
+.empty .panel strong{color:#FFF7DE!important}.empty .panel span{color:#C8D9E3!important}
+ 
+#statsDialog button:focus-visible,#statsDialog .ride-list-item:focus-visible,#ridePreviewDialog button:focus-visible{outline:3px solid #F4D35E!important;outline-offset:2px!important}
+#settingsDialog .settings-category[aria-selected=true] small{color:#0D3B66!important}
+@media(max-width:880px){
+ .terrain-rail{padding-top:6px!important}
+ .terrain-rail .lh-quicknav{margin:0!important}
+ .workspace>main#map{min-height:470px!important}
+}
+@media(max-width:550px){
+ header .brand-credit{font-size:10px!important;display:block!important}
+ #sourceReviewDialog{padding:14px!important}
+ #sourceReviewDialog>.dialog-head{margin:-14px -14px 17px!important;padding:17px 15px!important;top:-14px!important;gap:12px!important}
+ #sourceReviewDialog>.dialog-head h2{font-size:20px!important}
+ #sourceReviewDialog>.dialog-head p{font-size:11px!important}
+ #sourceReviewDialog #closeSourceReview{padding:6px 10px!important;min-height:35px!important}
+ main#map .maptop{top:13px!important;left:12px!important;max-width:calc(100% - 76px)!important;padding:11px 12px!important}
+ main#map .maptop .map-caption-title{font-size:15px!important}
+ main#map .legend{left:11px!important;bottom:12px!important;padding:9px 10px!important;min-width:205px!important}
+ main#map .attribution{right:8px!important;top:150px!important;bottom:auto!important;font-size:9px!important}
+}
+
+
+ 
+#settingsDialog .palette-ends,#settingsDialog .settings-save-state,#statsDialog .insights-nav-privacy{color:#D4E1E8!important}
+#statsDialog .insights-nav-privacy svg{color:#F4D35E!important}
+#statsDialog .chart-row>span,#statsDialog .chart-row>strong,#statsDialog .weekday-row span{color:#D6E3E9!important}
+#statsDialog .chart-track{background:#194971!important}
+#settingsDialog .local-storage code{background:#123D61!important;border-color:#5B7B95!important;color:#FAF0CA!important}
+#settingsDialog .path-label{color:#CEDDE6!important}
+#settingsDialog .anomaly-setting{color:#FFF5DB!important}
+#ridePreviewDialog .ride-preview-detail span{color:#C9DCE7!important}
+#sourceReviewDialog .lh-source-policy-field small{color:#607286!important}
+#sourceReviewDialog .lh-source-policy-row:hover{background:#FFF8DB!important}
+#sourceReviewDialog .lh-source-policy-row:hover select{border-color:#C4A83B!important}
+
+
+#settingsDialog .palette-preview{border:1px solid #718DA1!important}
+#statsDialog .insights-filter-drawer{border-color:#587896!important;background:#123D63!important}
+#statsDialog .insights-filter-drawer .filter-caret{color:#F4D35E!important}
+#statsDialog .insights-filter-drawer:hover{border-color:#F4D35E!important}
+
+
+header {min-height:89px!important;height:auto!important;padding-top:9px!important;padding-bottom:9px!important}
+header .brand-text {gap:3px!important}
+header .brand-text > small.lh-brand-slogan {
+ display:block!important;visibility:visible!important;opacity:1!important;
+ margin:0!important;color:#FAF0CA!important;font-size:12px!important;
+ line-height:1.35!important;font-weight:450!important;letter-spacing:0!important;
+ max-width:100%;white-space:normal!important;text-transform:none!important;
+}
+header .brand-credit {
+ display:block!important;font-size:13px!important;line-height:1.4!important;
+ font-weight:550!important;letter-spacing:.005em!important;
+ color:#DCE7ED!important;background:transparent!important;
+ border:0!important;border-radius:0!important;box-shadow:none!important;padding:0!important;
+}
+header .brand-credit a {color:#F4D35E!important;font-weight:750!important;border-bottom:1px solid #BBA64E88!important}
+@media(max-width:900px){
+ header .brand-text > small.lh-brand-slogan{display:block!important}
+}
+@media(max-width:640px){
+ header{min-height:96px!important;padding:8px 10px!important}
+ header .brand-text > small.lh-brand-slogan{font-size:10.5px!important;line-height:1.25!important}
+ header .brand-credit{display:block!important;font-size:11.5px!important;line-height:1.25!important}
+}
+
+ 
+:root{--tr-navy:#0D3B66;--tr-blue:#174C75;--tr-deep:#082C4B;--tr-yellow:#F4D35E;--tr-cream:#FAF0CA;--tr-paper:#FFFDF7;--tr-ink:#123A5C;--tr-muted:#5C7387;--tr-border:#C8D7D6}
+#map{isolation:isolate}
+#map .lh-time-lens{position:absolute;bottom:15px;left:225px;right:16px;z-index:25;background:#FAF0CAf5;border:1px solid #F4D35E;box-shadow:0 14px 35px #082C4B65;border-radius:15px;padding:9px 12px;color:#0D3B66;max-width:840px;margin:0 auto}
+#map .lh-time-top{display:flex;align-items:center;gap:10px;font-size:12px;line-height:1.3;white-space:nowrap}
+#map .lh-time-top strong{font-size:13px;letter-spacing:-.2px}
+#map .lh-time-top span{color:#547188;overflow:hidden;text-overflow:ellipsis}
+#map .lh-time-top button{margin-left:auto;min-height:25px;padding:2px 8px;background:transparent;border:0;color:#0D3B66;font-size:12px}
+#map .lh-time-body{display:flex;align-items:center;gap:9px;margin-top:8px}
+#map .lh-time-body[hidden]{display:none!important}
+#map .lh-time-mode{display:flex;align-items:center;gap:6px;min-width:100px;font-size:12px}
+#map .lh-time-mode select{min-height:33px;padding:5px 7px;border:1px solid #ACC3C9;background:#FFFDF7;color:#0D3B66;min-width:110px;font-size:12px}
+#map #timeLensYear{flex:1;min-width:80px;accent-color:#0D3B66;cursor:pointer}
+#map #timeLensYearLabel{font-size:17px;font-weight:800;min-width:44px;text-align:center;font-variant-numeric:tabular-nums}
+#map .lh-time-body button{padding:5px 10px;min-height:33px;font-size:12px;color:#0D3B66;background:#FFFDF7;border:1px solid #BACDCB}
+#map .lh-time-body #timeLensAll{background:#F4D35E;border-color:#E0C454;font-weight:750}
+#map .lh-time-status{min-height:0;font-size:11px;color:#4D697B;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
+#map .lh-time-status:empty{display:none}
+#map .lh-place-inspector{position:absolute;right:75px;top:20px;z-index:30;bottom:auto;width:330px;max-height:min(76vh,690px);overflow:auto;padding:16px;background:#FFFDF7f7;border:1px solid #F4D35E;border-radius:17px;color:#0D3B66;box-shadow:0 18px 42px #082C4B79;backdrop-filter:blur(8px)}
+#map .lh-place-inspector[hidden],#map .lh-place-pin[hidden]{display:none!important}
+#map .lh-place-heading{display:flex;align-items:start;gap:10px;justify-content:space-between;margin:0 0 12px}
+#map .lh-place-heading h2{font-size:20px;letter-spacing:-.3px;color:#0D3B66;margin:4px 0 0}
+#map .lh-place-kicker{font-size:10px;font-weight:800;letter-spacing:.1em;color:#567288}
+#map .lh-place-heading button{background:#FAF0CA;border-color:#E2D6AD;color:#0D3B66;padding:7px 10px;min-height:34px}
+#map #placeHint{font-size:13px;line-height:1.5;color:#385B74;margin:0 0 13px}
+#map .lh-place-inspector label{display:flex;align-items:center;gap:12px;font-size:12px;font-weight:700;padding-bottom:12px}
+#map #placeRadius{min-height:36px;padding:6px;background:#FAF0CA;color:#0D3B66;border:1px solid #CCD2B5;flex:1}
+#map .lh-place-summary{font-size:12px;color:#385B74;padding:9px 0;border-top:1px solid #D6DBCC}
+#map .lh-place-limited{font-size:12px;line-height:1.45;color:#765E1B;background:#FFF3C4;padding:9px;border-radius:8px}
+#map .lh-place-activity{display:flex;flex-direction:column;align-items:start;text-align:left;gap:4px;width:100%;background:#FFFDF7;border:0;border-top:1px solid #DCE4DB;padding:10px 5px;min-height:54px;color:#0D3B66;border-radius:0}
+#map .lh-place-activity:hover{background:#FAF0CA}
+#map .lh-place-activity strong{font-size:13px;line-height:1.35}
+#map .lh-place-activity span{font-size:11px;color:#567288}
+#map .lh-place-pin{position:absolute;width:19px;height:19px;z-index:22;border-radius:50%;border:4px solid #FFFDF7;background:#F4D35E;box-shadow:0 0 0 3px #0D3B66,0 2px 15px #082C4Bc0;transform:translate(-50%,-50%);pointer-events:none}
+#map #placeToggle[aria-pressed=true]{background:#F4D35E;color:#0D3B66;border-color:#FFFDF7}
+#map #placeToggle svg{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.lh-command-dialog{border:1px solid #F4D35E;border-radius:17px;background:#FFFDF7;color:#0D3B66;width:min(560px,calc(100vw - 36px));padding:20px;box-shadow:0 25px 80px #082C4Ba8}
+.lh-command-dialog::backdrop{background:#082C4Bb9;backdrop-filter:blur(5px)}
+.lh-command-heading{display:flex;justify-content:space-between;align-items:start;gap:15px;margin-bottom:17px}
+.lh-command-heading strong{display:block;font-size:23px;line-height:1.2}
+.lh-command-heading span{font-size:12px;color:#5C7387}
+.lh-command-heading button{padding:7px 10px;background:#FAF0CA;border-color:#D7D8C6;color:#0D3B66}
+.lh-command-dialog>label{display:block;font-size:12px;font-weight:700;margin:0 0 5px}
+#lhCommandSearch{width:100%;background:#FFF;color:#0D3B66;border:2px solid #0D3B66}
+#lhCommandResults{display:grid;gap:6px;margin-top:11px;max-height:45vh;overflow:auto}
+#lhCommandResults button{width:100%;min-height:43px;text-align:left;color:#0D3B66;background:#FAF0CA;border:1px solid #DCD9C4}
+#lhCommandResults button:hover,#lhCommandResults button:focus-visible{background:#F4D35E;border-color:#0D3B66}
+ 
+#statsDialog{background:#FAF0CA!important;color:#0D3B66!important;border-color:#0D3B66!important}
+#statsDialog .insights-shell,#statsDialog .insights-main,#statsDialog .insights-panel,#statsDialog .insights-content,#statsDialog .insights-body{background:#FAF0CA!important;color:#0D3B66!important}
+#statsDialog .insights-topbar{background:#0D3B66!important;color:#FAF0CA!important;border-bottom:2px solid #F4D35E!important}
+#statsDialog .insights-topbar h2,#statsDialog .insights-topbar p{color:#FAF0CA!important}
+#statsDialog .insights-nav,#statsDialog .insights-sidebar,#statsDialog .insights-tabs{background:#0D3B66!important;color:#FAF0CA!important}
+#statsDialog .insights-nav button,#statsDialog .insights-tabs button{background:#174C75!important;color:#FAF0CA!important;border:1px solid #4E7592!important}
+#statsDialog .insights-nav button[aria-selected=true],#statsDialog .insights-tabs button[aria-selected=true],#statsDialog .insights-nav button.active{background:#F4D35E!important;color:#0D3B66!important;border-color:#F4D35E!important}
+#statsDialog .insights-nav .muted,#statsDialog .insights-tabs small{color:#DCE6E5!important}
+#statsDialog .insights-nav button[aria-selected=true] small,#statsDialog .insights-tabs button[aria-selected=true] small{color:#29485B!important}
+#statsDialog .insights-content-card,#statsDialog .stats-sport-card,#statsDialog .analytics-card,#statsDialog .analytics-toolbar,#statsDialog .analytics-count,#statsDialog .details-repair,#statsDialog .insights-filter-drawer,#statsDialog .metric,#statsDialog .sport-row,#statsDialog .stat-chart,#statsDialog .chart-card,#statsDialog .yearbook-card{background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #D4DBC9!important;box-shadow:none!important}
+#statsDialog .analytics-card{background:#FFFDF7!important;box-shadow:0 2px 9px #0D3B660a!important}
+#statsDialog h2:not(.insights-topbar h2),#statsDialog h3,#statsDialog h4,#statsDialog h5,#statsDialog .analytics-card-head h5,#statsDialog .analytics-studio-header h4,#statsDialog .metric strong,#statsDialog .sport-row strong,#statsDialog .bike-row strong{color:#0D3B66!important}
+#statsDialog p,#statsDialog .muted,#statsDialog small,#statsDialog .analytics-card-head p,#statsDialog .analytics-guidance,#statsDialog .analytics-card-summary,#statsDialog .analytics-studio-header p,#statsDialog .analytics-toolbar label,#statsDialog .analytics-card-tools label{color:#526C80!important}
+#statsDialog .insights-topbar p,#statsDialog .insights-topbar small,#statsDialog .insights-nav p,#statsDialog .insights-nav small{color:#FAF0CA!important}
+#statsDialog select,#statsDialog input,#statsDialog details{background:#FFFDF7;color:#0D3B66;border-color:#AFC3CE}
+#statsDialog .analytics-categories button{background:#FAF0CA;color:#0D3B66;border-color:#B7C7C9}
+#statsDialog .analytics-categories button[aria-pressed=true]{background:#F4D35E!important;color:#0D3B66!important;border-color:#D9B531!important}
+#statsDialog .analytics-tooltip{background:#0D3B66;color:#FAF0CA;border-color:#F4D35E}
+#statsDialog .analytics-plot .plot-label,#statsDialog .analytics-plot .plot-tick{fill:#0D3B66!important}
+#statsDialog .analytics-plot .plot-grid,#statsDialog .analytics-plot .plot-axis{stroke:#B2C5D1!important}
+#statsDialog .analytics-plot .plot-line-new{stroke:#174C75!important}
+#statsDialog .analytics-plot .plot-area-new{fill:#F4D35E!important;opacity:.3}
+#statsDialog .analytics-plot .plot-dot-new{fill:#F4D35E!important;stroke:#0D3B66!important}
+#statsDialog .insights-filter-drawer{background:#FFFDF7!important}
+#statsDialog .stats-sport-card .sport-row{border-color:#D6DECE!important}
+#statsDialog .bike-row{border-left-color:#F4D35E!important;color:#375B73!important}
+#statsDialog #closeStats{background:#174C75!important;color:#FAF0CA!important;border-color:#66829C!important}
+#settingsDialog{background:#FAF0CA!important;color:#0D3B66!important;border-color:#0D3B66!important}
+#settingsDialog .dialog-head,#settingsDialog .settings-savebar{background:#0D3B66!important;border-color:#F4D35E!important}
+#settingsDialog .dialog-head h2,#settingsDialog .dialog-head p,#settingsDialog .dialog-head .muted{color:#FAF0CA!important}
+#settingsDialog .settings-stack,#settingsDialog .settings-panel,#settingsDialog .settings-section,#settingsDialog .settings-actions,#settingsDialog .settings-panel-head{background:#FAF0CA!important;color:#0D3B66!important}
+#settingsDialog .settings-section{border-color:#C9D6CF!important}
+#settingsDialog .settings-section h2,#settingsDialog .settings-actions strong,#settingsDialog .settings-panel-head h2{color:#0D3B66!important}
+#settingsDialog .settings-actions small,#settingsDialog .settings-note,#settingsDialog .settings-panel-head p,#settingsDialog .muted,#settingsDialog .path-label{color:#4D687A!important}
+#settingsDialog input:not([type=range]):not([type=checkbox]),#settingsDialog select,#settingsDialog textarea{background:#FFFDF7!important;color:#0D3B66!important;border-color:#B9CACF!important}
+#settingsDialog .settings-close{background:#174C75!important;color:#FAF0CA!important;border-color:#627F97!important}
+#settingsDialog .settings-tabs button[aria-selected=true],#settingsDialog .settings-nav button[aria-selected=true]{background:#F4D35E!important;color:#0D3B66!important}
+#settingsDialog .settings-save-state{color:#FAF0CA!important}
+#settingsDialog .local-storage code{color:#0D3B66!important;background:#FFFDF7!important;border-color:#D5DCCF!important}
+ 
+.bike-panel,.bike-panel #bikeLayerControls,.bike-panel .bike-tint-control{background:#FFFDF7!important;color:#0D3B66!important;border-color:#D4DBC9!important}
+.bike-panel .bike-tint-control label,.bike-panel .bike-tint-control output,.bike-panel .bike-layer-note{color:#0D3B66!important}
+.bike-panel .bike-tint-control input[type=color]{background:#FAF0CA!important;border:1px solid #0D3B66!important}
+ 
+header .header-actions button,#statsTop{background:#174C75!important;color:#FAF0CA!important;border-color:#507995!important;box-shadow:none!important}
+header .header-actions button.primary,header #statsTop{background:#F4D35E!important;color:#0D3B66!important;border-color:#E2BF4C!important}
+header .header-actions button:hover{border-color:#F4D35E!important;filter:brightness(1.04)}
+:focus-visible{outline:3px solid #F4D35E!important;outline-offset:2px}
+@media(max-width:1050px){#map .lh-time-lens{left:13px;right:13px;bottom:76px;max-width:none}#map .lh-place-inspector{right:70px;width:300px}}
+@media(max-width:680px){#map .lh-time-lens{left:8px;right:8px;bottom:80px;padding:8px}#map .lh-time-body{flex-wrap:wrap}#map .lh-place-inspector{right:8px;left:8px;top:70px;width:auto;max-height:50vh}}
+@media(prefers-reduced-motion:reduce){#map .lh-place-inspector,#map .lh-time-lens{animation:none!important;transition:none!important}}
+
+ 
+#statsDialog[open]{border:1px solid #557793!important;background:#0D3B66!important}
+#statsDialog .insights-main,#statsDialog .insights-main .insights-panel{background:#FAF0CA!important;color:#0D3B66!important}
+#statsDialog .insights-main h2,#statsDialog .insights-main h3,#statsDialog .insights-main h4,
+#statsDialog .insights-main .insights-section-title,#statsDialog .insights-main .insights-overview-heading,
+#statsDialog .insights-main .insights-panel-heading,#statsDialog .insights-main .insights-page-title{color:#0D3B66!important}
+#statsDialog .insights-main .insights-kicker,#statsDialog .insights-main .insights-section-kicker{color:#6F611F!important}
+#statsDialog .insights-main .insights-filter-drawer summary,#statsDialog .insights-main .insights-filter-drawer summary *{color:#0D3B66!important}
+#statsDialog .insights-main .insights-filter-drawer summary .filter-caret{color:#0D3B66!important}
+#statsDialog .stats-tabs button small,#statsDialog .stats-tabs button span{color:#FAF0CA!important}
+#statsDialog .stats-tabs button[aria-selected=true] small,#statsDialog .stats-tabs button[aria-selected=true] span{color:#0D3B66!important}
+#statsDialog .insights-main .chart-row span,#statsDialog .insights-main .chart-row strong,
+#statsDialog .insights-main .weekday-row span,#statsDialog .insights-main .sport-row span{color:#0D3B66!important}
+#statsDialog .insights-main .insights-filter-grid label{color:#0D3B66!important}
+#statsDialog .insights-main button:not(.primary){border-color:#B9CAD3}
+#map .lh-time-lens .lh-time-body button{background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #B9C5B8!important}
+#map .lh-time-lens .lh-time-body #timeLensAll{background:#F4D35E!important;color:#0D3B66!important;border-color:#D5B441!important}
+#map .lh-time-lens .lh-time-body button:disabled{background:#E3E0CE!important;color:#5D7281!important}
+#map .lh-place-inspector button{color:#0D3B66!important}
+#settingsDialog .settings-dialog-body,#settingsDialog .settings-main{background:#FAF0CA!important;color:#0D3B66!important}
+#settingsDialog .settings-panel h2,#settingsDialog .settings-panel h3{color:#0D3B66!important}
+#statsDialog .analytics-card p,#statsDialog .analytics-card .analytics-card-summary{color:#537084!important}
+#map .lh-time-lens[hidden]{display:none!important}
+
+
+#map .lh-time-lens{left:265px;right:16px;max-width:920px;padding:12px 15px!important;background:#FAF0CAfa!important;border:1px solid #CFB141!important;color:#0D3B66!important}
+#map .lh-time-body{flex-wrap:wrap;gap:9px 14px;margin-top:12px}
+#map .lh-time-body .lh-time-mode{flex:0 0 auto;color:#0D3B66}
+#map .lh-time-period{display:flex;align-items:center;gap:5px}
+#map .lh-time-period label{display:block;margin-right:4px;font-size:11px;font-weight:800;color:#0D3B66}
+#map .lh-time-period select{min-width:96px;max-width:148px;height:36px;border:1px solid #93A9B6!important;background:#FFFDF7!important;color:#0D3B66!important;border-radius:7px}
+#map .lh-time-body .lh-time-period button{min-width:31px;min-height:36px;padding:3px 8px;font-size:19px;line-height:1;font-weight:700}
+#map .lh-time-travel{flex:1 1 130px;display:flex;align-items:center;gap:9px;min-width:140px}
+#map .lh-time-travel input{min-width:70px;accent-color:#0D3B66!important}
+#map .lh-time-actions{display:flex;align-items:center;gap:7px}
+#map .lh-time-actions button{min-height:36px}
+#map .lh-time-top>strong{font-size:15px;color:#0D3B66}
+#map .lh-time-top button{color:#0D3B66!important;background:#FFFDF7!important;border:1px solid #B8C4C7!important;border-radius:9px!important;min-height:32px;padding:4px 11px!important}
+#map .lh-time-status{font-size:12px;color:#234F70!important;font-weight:650;margin-top:9px}
+#map .lh-time-lens.collapsed{left:auto!important;right:16px!important;bottom:16px!important;width:max-content!important;max-width:250px!important;min-width:0!important;margin:0!important;border-radius:999px!important;padding:5px!important;box-shadow:0 6px 22px #082C4B55}
+#map .lh-time-lens.collapsed .lh-time-body,#map .lh-time-lens.collapsed .lh-time-status,#map .lh-time-lens.collapsed .lh-time-top>strong,#map .lh-time-lens.collapsed .lh-time-top>span{display:none!important}
+#map .lh-time-lens.collapsed .lh-time-top{display:block!important}
+#map .lh-time-lens.collapsed #timeLensCollapse{margin:0!important;background:#F4D35E!important;color:#0D3B66!important;border-color:#C4A73B!important;border-radius:999px!important;padding:7px 14px!important;font-size:12px!important;font-weight:800!important}
+ 
+#statsDialog [aria-selected="true"],#statsDialog [aria-pressed="true"],#settingsDialog [aria-selected="true"],
+#statsDialog button.primary,#settingsDialog button.primary{color:#0D3B66!important}
+#statsDialog [aria-selected="true"] *,#statsDialog [aria-pressed="true"] *,#settingsDialog [aria-selected="true"] *,
+#statsDialog button.primary *,#settingsDialog button.primary *{color:#0D3B66!important}
+#statsDialog .insights-main .muted,#statsDialog .insights-main p,#statsDialog .insights-main small,
+#statsDialog .insights-main .analytics-note,#statsDialog .insights-main .analytics-guidance,
+#statsDialog .insights-main .analytics-table-note,#statsDialog .insights-main .data-explorer-help,
+#settingsDialog .settings-main .muted,#settingsDialog .settings-main small{color:#34556F!important}
+#statsDialog .insights-main .insights-kicker,#statsDialog .insights-main .insights-section-kicker{color:#705314!important}
+#statsDialog .insights-main button:disabled,#settingsDialog button:disabled{opacity:.75!important;color:#365771!important}
+#statsDialog .insights-main button,#statsDialog .insights-main select{border-color:#8AA3B3!important}
+#statsDialog .insights-main input:disabled,#statsDialog .insights-main select:disabled{color:#405B6D!important;background:#E7E6D9!important}
+#statsDialog .stats-activity-card,#statsDialog .insights-main .activity-card{background:#174C75!important;color:#FFFDF7!important;border:1px solid #547B98!important}
+#statsDialog .stats-activity-card *,#statsDialog .insights-main .activity-card *{color:#FFFDF7!important}
+#statsDialog .insights-main .stats-table th,#statsDialog .insights-main .data-table th{color:#FAF0CA!important;background:#0D3B66!important}
+#statsDialog .insights-main .stats-table td,#statsDialog .insights-main .data-table td{color:#FFFDF7!important;background:#0B304F!important}
+#statsDialog .insights-main .stats-table tr:nth-child(even) td,#statsDialog .insights-main .data-table tr:nth-child(even) td{background:#174363!important}
+#statsDialog .insights-main .stats-table a,#statsDialog .insights-main .data-table a{color:#F4D35E!important}
+#statsDialog .insights-main .stats-page-button:disabled{color:#34556F!important;background:#E6E5D9!important}
+#statsDialog .insights-main .stats-page-label{color:#0D3B66!important}
+#statsDialog .insights-main .data-pagination,#statsDialog #dataPageStatus,#statsDialog .data-summary,
+#statsDialog .data-header p,#statsDialog .data-header .stats-story-kicker,
+#statsDialog .insights-main .data-columns summary{color:#0D3B66!important}
+#statsDialog .insights-main .data-pagination button:not(:disabled){background:#174C75!important;color:#FFFDF7!important;border-color:#68839B!important}
+#statsDialog .insights-main .data-pagination button:disabled{background:#D5DDD9!important;color:#40586A!important;border-color:#AFBFC4!important;opacity:1!important}
+#statsDialog .insights-main #dataTable th{background:#0D3B66!important;color:#FAF0CA!important;border-color:#38607D!important}
+#statsDialog .insights-main #dataTable td{background:#0B304F!important;color:#FFFDF7!important;border-color:#315875!important}
+#statsDialog .insights-main #dataTable tbody tr:nth-child(even) td{background:#174363!important}
+#statsDialog .insights-main #dataTable button,#statsDialog .insights-main #dataTable a{color:#FAF0CA!important;border:1px solid #597C93!important}
+#statsDialog .insights-main .details-repair strong,#statsDialog .insights-main .details-repair p{color:#0D3B66!important}
+#statsDialog .insights-main .data-pagination #dataPageStatus{font-weight:700;opacity:1!important}
+
+#map .lh-time-lens select,#map .lh-time-lens option{color:#0D3B66!important;background:#FFFDF7!important}
+#map .lh-place-years{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:12px 0 4px;padding:9px;background:#FFFDF7;border:1px solid #D4DBC9;border-radius:10px}
+#map .lh-place-years>strong{color:#0D3B66;flex-basis:100%;font-size:12px}
+#map .lh-place-years button{background:#FAF0CA!important;border:1px solid #B7C9C9!important;color:#0D3B66!important;padding:5px 10px!important;min-height:30px;font-size:11px}
+@media(max-width:1250px){#map .lh-time-lens{left:15px;right:15px;bottom:75px}}
+
+
+
+
+#map .lh-time-lens:not(.collapsed){
+  left:280px!important;right:16px!important;bottom:22px!important;
+  width:max-content!important;max-width:calc(100% - 295px)!important;margin:0!important;
+  padding:7px 9px!important;border-radius:12px!important;background:#FAF0CAfa!important;
+  box-shadow:0 8px 26px #082C4B7a!important;
+}
+#map .lh-time-lens .lh-time-top{display:flex!important;align-items:center!important;gap:8px!important;white-space:nowrap;min-height:34px}
+#map .lh-time-lens .lh-time-top>strong{font-size:13px!important;letter-spacing:0!important;margin-right:3px!important;flex:none;color:#0D3B66!important}
+#map .lh-time-lens .lh-time-body{display:flex!important;align-items:center!important;flex-wrap:nowrap!important;flex:0 1 auto!important;gap:7px!important;margin:0!important;min-width:0!important}
+#map .lh-time-lens .lh-time-body[hidden]{display:none!important}
+#map .lh-time-lens .lh-time-period{gap:2px!important;white-space:nowrap}
+#map .lh-time-lens .lh-time-period label{font-size:11px!important;margin-right:3px!important}
+#map .lh-time-lens .lh-time-period button{min-width:23px!important;min-height:30px!important;height:30px!important;padding:1px 5px!important;font-size:17px!important;border-radius:7px!important}
+#map .lh-time-lens .lh-time-period select{min-width:70px!important;max-width:112px!important;height:30px!important;min-height:30px!important;padding:2px 5px!important;border-radius:7px!important;font-size:11px!important}
+#map .lh-time-lens .lh-time-period #timeLensYearSelect{width:71px!important;min-width:71px!important}
+#map .lh-time-lens .lh-time-period #timeLensMonth{width:109px!important}
+#map .lh-time-lens .lh-time-mode{min-width:0!important;display:flex!important;gap:3px!important;white-space:nowrap;font-size:11px!important}
+#map .lh-time-lens .lh-time-mode select{min-width:105px!important;max-width:112px!important;height:30px!important;min-height:30px!important;padding:2px 5px!important;font-size:11px!important}
+#map .lh-time-lens .lh-time-actions{gap:4px!important;flex:none!important}
+#map .lh-time-lens .lh-time-actions button{min-height:30px!important;height:30px!important;padding:3px 8px!important;font-size:11px!important;border-radius:7px!important}
+#map .lh-time-lens #timeLensMore,#map .lh-time-lens #timeLensCollapse{margin:0!important;min-height:30px!important;height:30px!important;padding:3px 8px!important;font-size:11px!important;flex:none!important;border:1px solid #9BAEB3!important;border-radius:7px!important;background:#FFFDF7!important;color:#0D3B66!important}
+#map .lh-time-lens #timeLensMore[hidden]{display:none!important}
+#map .lh-time-lens .lh-time-detail{display:flex;align-items:center;gap:10px;border-top:1px solid #D4C9A2;padding-top:7px;margin-top:7px;min-height:35px;font-size:11px;color:#244C67}
+#map .lh-time-lens .lh-time-detail[hidden]{display:none!important}
+#map .lh-time-lens .lh-time-detail .lh-time-travel{flex:1 1 110px;min-width:105px;max-width:250px;gap:5px}
+#map .lh-time-lens .lh-time-detail #timeLensYearLabel{font-size:12px!important;min-width:38px!important}
+#map .lh-time-lens .lh-time-detail .lh-time-status{margin:0!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#244C67!important;font-size:11px!important}
+#map .lh-time-lens .lh-time-detail>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#map .lh-time-lens.collapsed{left:auto!important;right:16px!important;bottom:16px!important;max-width:250px!important;padding:5px!important;width:max-content!important}
+#map .lh-time-lens.collapsed .lh-time-body,#map .lh-time-lens.collapsed .lh-time-detail,#map .lh-time-lens.collapsed #timeLensMore,#map .lh-time-lens.collapsed .lh-time-top>strong{display:none!important}
+#map .lh-time-lens.collapsed .lh-time-top{display:block!important;min-height:0!important}
+#map .lh-time-lens.collapsed #timeLensCollapse{background:#F4D35E!important;border-radius:999px!important;padding:7px 14px!important}
+#map #interaction:focus-visible{outline:3px solid #F4D35E;outline-offset:-5px}
+#map .lh-place-inspector #placeClose{background:#FAF0CA!important;color:#0D3B66!important;border:1px solid #BAAE89!important;border-radius:8px!important;font-weight:700!important}
+#map .lh-place-inspector .lh-place-activity{background:#FFFDF7!important;color:#0D3B66!important;border:0!important;border-top:1px solid #CFD9DB!important;border-radius:7px!important}
+#map .lh-place-inspector .lh-place-activity:hover{background:#FAF0CA!important}
+#map .lh-place-inspector .lh-place-activity strong{color:#0D3B66!important}
+#map .lh-place-inspector .lh-place-activity span{color:#436378!important}
+#map .lh-place-coordinates{display:block;font-size:11px;color:#446782;margin-top:3px;font-variant-numeric:tabular-nums}
+#ridePreviewDialog .lh-telemetry-explore{display:inline-block;margin-top:8px;background:#F4D35E;color:#0D3B66;border:1px solid #B68F1F;border-radius:8px;padding:8px 12px;font-size:12px;font-weight:750}
+#ridePreviewDialog .lh-telemetry-explore[hidden]{display:none!important}
+@media(max-width:1400px){#map .lh-time-lens:not(.collapsed){left:12px!important;right:12px!important;max-width:calc(100% - 24px)!important}}
+@media(max-width:1080px){#map .lh-time-lens:not(.collapsed) .lh-time-top{overflow-x:auto;scrollbar-width:thin}}
+
+
+
+#map .lh-place-calendar{margin:10px 0 11px;padding:10px;background:#FAF0CA;border:1px solid #D7CBA6;border-radius:11px;color:#0D3B66}
+#map .lh-place-calendar-head{display:flex;align-items:center;justify-content:space-between;gap:9px;margin-bottom:8px}
+#map .lh-place-calendar-head strong{font-size:12px;color:#0D3B66}
+#map .lh-place-calendar-head select{min-width:78px;max-width:100px;height:31px;min-height:31px;padding:3px 7px;background:#FFFDF7;color:#0D3B66;border:1px solid #B3A77E;font-size:12px}
+#map .lh-place-calendar-months{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}
+#map .lh-place-month{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;min-height:40px;padding:4px 2px;border-radius:7px;font-size:11px;line-height:1.1}
+#map button.lh-place-month{background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #BCA96B!important}
+#map button.lh-place-month:hover,#map button.lh-place-month:focus-visible{background:#F4D35E!important;border-color:#0D3B66!important}
+#map .lh-place-month b{font-size:12px;font-variant-numeric:tabular-nums}
+#map .lh-place-month-empty{background:#F2EAD1;color:#697D85;border:1px solid #E1D8BD}
+#map .lh-place-calendar-note{font-size:10px;line-height:1.35;color:#42627C;margin:8px 0 0}
+#map .lh-place-route{display:flex;align-items:stretch;gap:5px;border-top:1px solid #CFD9DB}
+#map .lh-place-route .lh-place-activity{flex:1 1 auto;min-width:0;border:0!important;padding-left:6px}
+#map .lh-place-route .lh-place-focus{flex:none;align-self:center;background:#F4D35E!important;color:#0D3B66!important;border:1px solid #B69834!important;border-radius:8px;padding:7px 9px;font-weight:750;font-size:11px;min-height:34px}
+#map .lh-place-route .lh-place-focus:hover{background:#FFCE7C!important}
+#map .lh-place-route .lh-place-focus:focus-visible{outline:2px solid #0D3B66;outline-offset:2px}
+#map .lh-place-route .lh-place-activity:focus-visible{outline:2px solid #0D3B66;outline-offset:-2px}
+
+ 
+#elevationDialog{width:min(1180px,94vw);max-width:94vw;max-height:94vh;padding:0;overflow:hidden;border:1px solid #829AA9;border-radius:16px;background:#FAF0CA;color:#0D3B66;box-shadow:0 25px 85px #071D35aa}
+#elevationDialog::backdrop{background:#061627c9;backdrop-filter:blur(4px)}
+#elevationDialog .elev-shell{display:flex;flex-direction:column;max-height:94vh;overflow:auto}
+#elevationDialog .elev-head{display:flex;gap:15px;justify-content:space-between;align-items:center;padding:18px 21px;background:#0D3B66;color:#FAF0CA}
+#elevationDialog .elev-head h2{margin:0;font-size:21px;line-height:1.2}
+#elevationDialog .elev-head p{margin:4px 0 0;font-size:12px;color:#E1EAF0}
+#elevationDialog .elev-head button{flex:none;border:1px solid #B1C5D1;background:#F4D35E;color:#0D3B66;font-weight:700}
+#elevationDialog .elev-main{padding:18px 20px;display:grid;gap:13px}
+#elevationDialog .elev-stage{position:relative;border:1px solid #4E7997;border-radius:12px;background:linear-gradient(145deg,#123B5C,#071B30);overflow:hidden}
+#elevationCanvas{display:block;width:100%;height:clamp(340px,49vh,520px);touch-action:none;cursor:grab;outline-offset:-3px}
+#elevationCanvas:active{cursor:grabbing}
+#elevationCanvas:focus-visible{outline:3px solid #F4D35E}
+#elevationDialog .elev-watermark{position:absolute;left:15px;top:13px;border-radius:7px;padding:7px 10px;background:#0B2B46dc;color:#F9EECB;font-size:11px;pointer-events:none}
+#elevationDialog .elev-controls{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) auto;gap:12px;align-items:end}
+#elevationDialog label{display:grid;gap:7px;font-size:12px;font-weight:700;color:#0D3B66}
+#elevationDialog input[type=range]{width:100%;accent-color:#0D3B66;cursor:pointer}
+#elevationDialog .elev-controls button{height:39px;background:#0D3B66;color:#FAF0CA;border:1px solid #0D3B66;border-radius:8px;font-weight:700}
+#elevationDialog .elev-controls button:hover{background:#225B86}
+#elevationDialog .elev-position{display:flex;gap:12px;align-items:center}
+#elevationDialog .elev-position label{flex:1}
+#elevationDialog .elev-details{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+#elevationDialog .elev-details div{border:1px solid #D3C79D;border-radius:8px;background:#FFFDF1;padding:9px 12px;min-width:0}
+#elevationDialog .elev-details span{display:block;color:#35546B;font-size:11px;margin-bottom:5px}
+#elevationDialog .elev-details strong{display:block;font-size:16px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;color:#0D3B66}
+#elevationDialog .elev-grade-legend{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;color:#294E6B}
+#elevationDialog .elev-grade-legend i{display:inline-block;width:13px;height:9px;border-radius:2px;vertical-align:middle;margin-right:4px}
+#elevationDialog .elev-foot{display:flex;justify-content:space-between;align-items:center;gap:16px;font-size:12px;color:#284C65}
+#elevationDialog .elev-foot p{margin:0;line-height:1.45;max-width:760px}
+#elevationStatus{min-height:18px;font-size:12px;color:#0D3B66}
+@media(max-width:700px){#elevationDialog .elev-controls{grid-template-columns:repeat(2,minmax(0,1fr))}#elevationDialog .elev-details{grid-template-columns:repeat(2,minmax(0,1fr))}#elevationDialog .elev-foot{display:block}#elevationCanvas{height:310px}}
+
+ 
+dialog#elevationDialog{background:#FAF0CA!important;color:#0D3B66!important;border-color:#829AA9!important;border-radius:16px!important;box-shadow:0 25px 85px #071D35aa!important}
+#elevationDialog .elev-head{background:#0D3B66!important;color:#FAF0CA!important}
+#elevationDialog .elev-head h2{color:#FAF0CA!important}
+#elevationDialog .elev-head button{background:#F4D35E!important;color:#0D3B66!important;border-color:#F4D35E!important}
+#elevationDialog .elev-controls button{background:#0D3B66!important;color:#FAF0CA!important;border-color:#0D3B66!important}
+#elevationDialog label,#elevationDialog .elev-grade-legend,#elevationDialog .elev-foot,#elevationStatus{color:#0D3B66!important}
+#elevationDialog .elev-details strong{color:#0D3B66!important}
+#elevationDialog .elev-details span{color:#35546B!important}
+#elevationDialog .elev-grade-legend i{filter:none!important}
+#elevationDialog #elevationExport{background:#0D3B66!important;color:#FAF0CA!important;border-color:#0D3B66!important}
+
+
+
+#statsDialog #metricGrid .metric,#statsDialog #metricGrid .lh-help-cardwrap .metric{background:#FFFDF7!important;border:1px solid #B6C7CE!important;color:#0D3B66!important;box-shadow:inset 0 3px #E4B83C,0 2px 6px #0D3B6612!important}
+#statsDialog #metricGrid .metric strong,#statsDialog #metricGrid .lh-help-cardwrap .metric strong{color:#0D3B66!important;font-weight:800!important;text-shadow:none!important;opacity:1!important}
+#statsDialog #metricGrid .metric span,#statsDialog #metricGrid .lh-help-cardwrap .metric span{color:#35556B!important;opacity:1!important;font-weight:600!important}
+#statsDialog .insights-main .stats-story-kicker,#statsDialog .insights-main .insights-eyebrow{color:#816008!important}
+#statsDialog .insights-main .stats-metric-group-label{color:#0D3B66!important}
+#statsDialog .insights-main .insights-units{color:#0D3B66!important;font-weight:700!important}
+#statsDialog .insights-main button[aria-selected="true"] *,#statsDialog .insights-main button[aria-pressed="true"] *{color:#0D3B66!important}
+#statsDialog .stats-tabs button[aria-selected="true"] strong,#statsDialog .stats-tabs button[aria-selected="true"] span{color:#0D3B66!important}
+#statsDialog .stats-tabs button:not([aria-selected="true"]) strong,#statsDialog .stats-tabs button:not([aria-selected="true"]) span{color:#FAF0CA!important}
+#statsDialog .insights-main button:disabled{opacity:1!important;color:#405A6C!important;background:#E5E5D8!important}
+
+#elevationDialog .elev-controls{grid-template-columns:repeat(4,minmax(0,1fr)) auto!important}
+#elevationDialog .elev-controls label{color:#0D3B66!important;font-weight:750!important}
+#elevationDialog .elev-controls select{width:100%;min-height:36px;border-radius:8px;border:1px solid #9EB4BC!important;background:#FFFDF7!important;color:#0D3B66!important;padding:6px 9px!important;font-weight:700}
+#elevationDialog .elev-stage{border-color:#6C91A8!important;background:linear-gradient(150deg,#103B5D,#071E35)!important}
+#elevationDialog .elev-grade-legend span{color:#23465F!important;font-weight:650!important}
+#elevationDialog .elev-grade-legend i{width:17px;height:11px;border-radius:4px;border:1px solid #6C8793!important}
+#elevationDialog .elev-watermark{color:#FFF8DE!important;background:#0C3151ee!important}
+#elevationDialog .elev-details div{background:#FFFDF7!important}
+@media(max-width:900px){#elevationDialog .elev-controls{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+
+
+#elevationDialog .elev-playbar{display:flex;align-items:center;flex-wrap:wrap;gap:11px;background:#FFFDF7;border:1px solid #D9CFA9;padding:10px 12px;border-radius:11px}
+#elevationDialog .elev-playbar>button{min-width:104px;padding:9px 12px;border:1px solid #0D3B66;background:#F4D35E;color:#0D3B66;font-weight:800;border-radius:8px}
+#elevationDialog .elev-playbar>button:not(:disabled){background:#F4D35E!important;color:#0D3B66!important;border-color:#D8B63B!important}
+@media(max-height:980px){#elevationCanvas{height:clamp(300px,41vh,440px)}}
+#elevationDialog .elev-playbar>button:hover:not(:disabled){background:#FFCE7C!important;color:#0D3B66!important}
+#elevationDialog .elev-playbar>button:disabled{opacity:.60;cursor:not-allowed}
+#elevationDialog .elev-playbar label{display:flex;align-items:center;gap:7px;white-space:nowrap;color:#0D3B66!important}
+#elevationDialog .elev-playbar select{width:76px;min-height:36px;background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #98ADBC;border-radius:8px;padding:6px}
+#elevationPlaybackStatus{color:#34576D;font-size:12px;font-weight:750;min-width:125px;flex:1;font-variant-numeric:tabular-nums}
+#elevationDialog .elev-view-modes{display:flex;align-items:center;gap:5px;border-radius:9px;border:1px solid #D2C79F;background:#F7F1D9;padding:4px}
+#elevationDialog .elev-view-modes button{min-width:66px;background:transparent!important;color:#0D3B66!important;border:1px solid transparent!important;padding:7px 11px;border-radius:7px;font-size:12px;font-weight:750}
+#elevationDialog .elev-view-modes button[aria-pressed="true"]{background:#0D3B66!important;color:#FFF8DE!important;border-color:#0D3B66!important}
+#elevationDialog .elev-view-modes button:hover{border-color:#90A3A9!important}
+#elevationCanvas.elev-pan-mode{cursor:move}
+#elevationCanvas:focus-visible{outline:3px solid #F4D35E;outline-offset:-5px}
+#elevationDialog .elev-position input{width:100%}
+@media(prefers-reduced-motion:reduce){#elevationDialog .elev-playbar{scroll-behavior:auto}}
+ 
+.terrain-rail #lhNavMap:before,.terrain-rail #lhNavMap:after{content:none!important;display:none!important}
+.terrain-rail .lh-quicknav button.lh-quicknav-active{outline:0;box-shadow:none!important;border-color:transparent!important}
+.terrain-rail .lh-quicknav button:focus-visible{outline:2px solid #FAF0CA!important;outline-offset:2px!important}
+.terrain-rail .lh-quicknav button:focus:not(:focus-visible){outline:none!important}
+ 
+#statsDialog .lh-record-hover{position:fixed;z-index:40;width:292px;max-width:calc(100vw - 24px);padding:11px;border:1px solid #CEB95E!important;border-radius:13px;background:#FFFDF7!important;box-shadow:0 15px 36px #071D3580;color:#0D3B66!important;pointer-events:none;text-align:left}
+#statsDialog .lh-record-hover[hidden]{display:none!important}
+#statsDialog .lh-record-hover strong{display:block;font-size:14px;color:#0D3B66!important;line-height:1.35;overflow-wrap:anywhere}
+#statsDialog .lh-record-hover small{display:block;color:#35556B!important;margin:4px 0 8px;font-size:11px;line-height:1.5}
+#statsDialog .lh-record-hover canvas{display:block;width:100%;height:126px;background:#EAF0EA;border-radius:8px;border:1px solid #C7D3D0}
+#statsDialog .lh-record-hover .lh-record-hover-status{font-size:11px;color:#35556B!important;margin:8px 2px 0}
+
+
+.workspace>.terrain-rail{position:relative;z-index:11}
+#statsDialog.lh-integrated-view,#sourceReviewDialog.lh-integrated-view{position:fixed!important;inset:76px 0 0 72px!important;top:76px!important;left:72px!important;right:0!important;bottom:0!important;margin:0!important;padding:0!important;width:calc(100vw - 72px)!important;max-width:none!important;height:calc(100dvh - 76px)!important;max-height:none!important;min-height:0!important;border:0!important;border-radius:0!important;box-shadow:none!important;z-index:9!important;overflow:hidden!important}
+#statsDialog.lh-integrated-view{background:#FAF0CA!important;color:#0D3B66!important}
+#statsDialog.lh-integrated-view .insights-shell{height:100%;display:flex}
+#statsDialog.lh-integrated-view .insights-layout{grid-template-columns:302px minmax(0,1fr)!important;min-height:0;flex:1}
+#statsDialog.lh-integrated-view .insights-topbar{padding:12px 22px;min-height:65px;flex:none}
+#statsDialog.lh-integrated-view .insights-heading .insights-mark{width:36px;height:36px}
+#statsDialog.lh-integrated-view .insights-heading .insights-mark img{width:34px;height:34px}
+#statsDialog.lh-integrated-view .stats-tabs{background:#0D3B66!important;padding:21px 16px;overflow-y:auto}
+#statsDialog.lh-integrated-view .insights-main{background:#FAF0CA!important;scrollbar-gutter:stable}
+#statsDialog.lh-integrated-view .insights-topbar h2{font-size:20px}
+#statsDialog.lh-integrated-view #closeStats span{display:inline!important}
+#sourceReviewDialog.lh-integrated-view{display:grid!important;grid-template-columns:302px minmax(0,1fr);background:#FAF0CA!important;color:#0D3B66!important}
+#sourceReviewDialog:not(.lh-integrated-view) .lh-source-workspace-sidebar{display:none}
+#sourceReviewDialog .lh-source-workspace-main{min-width:0}
+#sourceReviewDialog.lh-integrated-view .lh-source-workspace-main{overflow-y:auto;height:100%;padding:24px 30px 48px;background:#FAF0CA}
+#sourceReviewDialog.lh-integrated-view .lh-source-workspace-sidebar{background:#0D3B66;color:#FAF0CA;padding:32px 23px;display:flex;flex-direction:column;gap:16px}
+#sourceReviewDialog.lh-integrated-view .lh-source-workspace-sidebar h2{color:#FAF0CA;font-size:27px;margin:0}
+#sourceReviewDialog.lh-integrated-view .lh-source-workspace-sidebar p{color:#D5E5ED;font-size:13px;line-height:1.6;margin:0}
+#sourceReviewDialog .lh-source-eyebrow{font-size:10px;font-weight:850;letter-spacing:.15em;color:#F4D35E}
+#sourceReviewDialog .lh-source-sidebar-active{background:#F4D35E;color:#0D3B66;font-size:14px;padding:12px;border-radius:9px;font-weight:800}
+#sourceReviewDialog .lh-source-sidebar-note{margin-top:auto!important;font-size:12px!important}
+#sourceReviewDialog.lh-integrated-view .dialog-head{padding:3px 0 19px;align-items:center}
+#sourceReviewDialog.lh-integrated-view .dialog-head h2{color:#0D3B66}
+#sourceReviewDialog.lh-integrated-view .dialog-head button{background:#0D3B66!important;color:#FAF0CA!important}
+@media(max-width:1100px){#statsDialog.lh-integrated-view .insights-layout{grid-template-columns:230px minmax(0,1fr)!important}#sourceReviewDialog.lh-integrated-view{grid-template-columns:230px minmax(0,1fr)}}
+@media(max-width:880px){#statsDialog.lh-integrated-view,#sourceReviewDialog.lh-integrated-view{top:100px!important;left:0!important;inset:100px 0 0 0!important;width:100vw!important;height:calc(100dvh - 100px)!important}#statsDialog.lh-integrated-view .insights-layout{grid-template-columns:175px minmax(0,1fr)!important}#sourceReviewDialog.lh-integrated-view{grid-template-columns:180px minmax(0,1fr)}}
+ 
+#ridePreviewDialog{background:#FAF0CA!important;color:#0D3B66!important;border:1px solid #A2B6BF!important;box-shadow:0 25px 75px #061D31bb!important}
+#ridePreviewDialog>.dialog-head{background:#0D3B66!important;color:#FAF0CA!important;border-bottom:2px solid #F4D35E!important;border-radius:10px 10px 0 0;padding:19px 22px!important;margin:-2px -2px 14px!important}
+#ridePreviewDialog>.dialog-head h2{color:#FAF0CA!important}
+#ridePreviewDialog>.dialog-head .muted{color:#D4E6EC!important}
+#ridePreviewDialog>.dialog-head button:not(#openActivitySources){background:#1C4A70!important;color:#FFFDF7!important;border:1px solid #6788A1!important}
+#ridePreviewDialog #openActivitySources{background:#F4D35E!important;color:#0D3B66!important;border-color:#D8B34F!important}
+#ridePreviewDialog .ride-preview-details,#ridePreviewDialog .ride-preview-actions{background:#FAF0CA!important;color:#0D3B66!important}
+#ridePreviewDialog .v120-ride-detail,#ridePreviewDialog .ride-detail,#ridePreviewDialog .ride-preview-stat{background:#FFFDF7!important;color:#0D3B66!important;border-color:#C3CFD0!important}
+#ridePreviewDialog .v120-ride-detail strong,#ridePreviewDialog .ride-detail strong,#ridePreviewDialog .ride-preview-stat strong{color:#0D3B66!important}
+#ridePreviewDialog .v120-ride-detail span,#ridePreviewDialog .ride-detail span,#ridePreviewDialog .ride-preview-stat span{color:#47617A!important}
+#ridePreviewDialog .ride-preview-group,#ridePreviewDialog .v120-detail-section{background:#F8F0D9!important;color:#0D3B66!important;border-color:#D2CAAA!important}
+#ridePreviewDialog .ride-preview-group h3,#ridePreviewDialog .v120-detail-section h3{color:#0D3B66!important}
+#ridePreviewDialog .ride-preview-map,#ridePreviewDialog .ride-telemetry{background:#0B304E!important;color:#FFFDF7!important}
+#ridePreviewDialog .ride-telemetry label,#ridePreviewDialog .ride-telemetry p,#ridePreviewDialog .ride-telemetry .muted{color:#E4EDF0!important}
+#ridePreviewDialog .ride-telemetry select{background:#103F64!important;color:#FFFDF7!important;border:1px solid #7898A9!important}
+#ridePreviewDialog #ridePreviewStatus{color:#31536A!important}
+
+
+
+.lh-mini-map{position:relative;width:100%;height:126px;overflow:hidden;border-radius:8px;border:1px solid #B8C8CA;background:#EDF2E9}
+.lh-mini-map .lh-mini-tiles{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.lh-mini-map .lh-mini-tiles img{position:absolute;left:0;top:0;width:256px;height:256px;max-width:none;pointer-events:none;user-select:none}
+.lh-mini-map canvas{position:absolute;inset:0;z-index:1;width:100%!important;height:100%!important;border:0!important;background:transparent!important;pointer-events:none}
+.lh-mini-map .lh-map-credit{position:absolute;right:4px;bottom:3px;background:#FFFDF7e9;color:#0D3B66;font-size:9px;z-index:2;border-radius:3px;padding:2px 5px}
+#statsDialog .lh-record-hover .lh-record-hover-map{height:126px}
+#statsDialog .lh-record-hover canvas{border:0!important;border-radius:0!important;background:transparent!important}
+#elevationDialog .elev-geography{border-radius:10px;border:1px solid #BAC9CA;background:#FFFDF7;overflow:hidden}
+#elevationDialog .elev-geography summary{padding:8px 13px;color:#0D3B66;font-size:13px;font-weight:800;cursor:pointer}
+#elevationDialog .elev-geography summary small{margin-left:12px;font-size:11px;color:#476579;font-weight:500}
+#elevationDialog .lh-elevation-map{height:132px;border-radius:0;border-left:0;border-right:0;border-bottom:0}
+
+
+
+dialog#ridePreviewDialog{background:#FAF0CA!important;color:#0D3B66!important;border-color:#8DA8B6!important}
+#ridePreviewDialog .ride-preview-details{background:#FAF0CA!important}
+#ridePreviewDialog .ride-preview-detail{background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #B8CAD0!important}
+#ridePreviewDialog .ride-preview-detail strong,#ridePreviewDialog .ride-preview-detail b{color:#0D3B66!important}
+#ridePreviewDialog .ride-preview-detail span,#ridePreviewDialog .ride-preview-detail small{color:#35556B!important}
+#ridePreviewDialog .ride-preview-source{background:#FFFDF7!important;border-color:#BCCBCD!important;color:#0D3B66!important}
+#ridePreviewDialog .ride-preview-actions{background:#FAF0CA!important;border-color:#C8D4D3!important}
+#ridePreviewDialog .ride-preview-actions button:not(.primary){background:#0D3B66!important;color:#FAF0CA!important;border-color:#547E9C!important}
+#ridePreviewDialog .ride-preview-actions button.primary{background:#F4D35E!important;color:#0D3B66!important;border-color:#E4B949!important}
+#ridePreviewDialog .v120-telemetry{background:#0B3155!important;color:#FFFDF7!important;border:1px solid #52718B!important}
+#ridePreviewDialog .v120-telemetry-heading strong,#ridePreviewDialog .v120-telemetry-heading p,#ridePreviewDialog .v120-telemetry-heading label,#ridePreviewDialog #telemetryStatus{color:#E8F0F1!important}
+#ridePreviewDialog .v120-telemetry select{background:#153F64!important;border-color:#7895A8!important;color:#FFFDF7!important}
+.terrain-rail .lh-quicknav button.lh-quicknav-active{background:#F4D35E!important;color:#0D3B66!important;border-color:#E6B943!important;box-shadow:none!important}
+.terrain-rail .lh-quicknav button.lh-quicknav-active span{color:#0D3B66!important}
+.terrain-rail .lh-quicknav button.lh-quicknav-active svg{stroke:#0D3B66!important;color:#0D3B66!important}
+#sourceReviewDialog.lh-integrated-view .dialog-head{padding:20px 22px!important;border-radius:11px;background:#0D3B66!important}
+#sourceReviewDialog.lh-integrated-view .dialog-head h2{color:#FAF0CA!important}
+#sourceReviewDialog.lh-integrated-view .dialog-head p{color:#D8E5EC!important}
+#sourceReviewDialog.lh-integrated-view .dialog-head button{background:#F4D35E!important;color:#0D3B66!important;border-color:#D4B54B!important}
+
+
+@media(min-width:901px){
+ body>header{position:fixed!important;top:0!important;left:0!important;width:402px!important;min-width:402px!important;height:91px!important;min-height:91px!important;z-index:16!important;padding:9px 10px!important;background:#0D3B66!important;border-right:1px solid #345A78!important;border-bottom:1px solid #345A78!important;box-shadow:none!important;overflow:hidden!important}
+ body>header .brand{gap:9px!important;min-width:0!important;align-items:flex-start!important;width:100%!important}
+ body>header .logo{width:34px!important;height:34px!important;flex:none!important;margin-top:4px!important}
+ body>header .brand-text{min-width:0!important;flex:1!important;gap:2px!important}
+ body>header h1{font-size:19px!important;line-height:1.15!important;letter-spacing:-.04em!important;color:#FFFDF7!important}
+ body>header .lh-brand-slogan{display:block!important;font-size:10.4px!important;line-height:1.36!important;letter-spacing:0!important;font-weight:450!important;white-space:normal!important;color:#FAF0CA!important}
+ body>header .brand-credit{display:block!important;font-size:11.5px!important;line-height:1.2!important;white-space:normal!important;padding:0!important;margin-top:1px!important}
+ body>header .header-actions{display:none!important}
+ .workspace{height:100vh!important;grid-template-columns:84px 318px minmax(0,1fr)!important}
+ .workspace .terrain-rail{padding-top:95px!important}
+ .workspace>aside{padding-top:96px!important}
+ .workspace>main#map{margin:0!important;min-height:0!important;height:100vh!important;border-radius:0!important}
+ #statsDialog.lh-integrated-view,#sourceReviewDialog.lh-integrated-view{inset:0 0 0 84px!important;top:0!important;left:84px!important;width:calc(100vw - 84px)!important;height:100vh!important}
+ #statsDialog.lh-integrated-view .insights-topbar{margin-left:302px!important;min-height:71px!important}
+ #statsDialog.lh-integrated-view .stats-tabs{padding-top:107px!important}
+ #sourceReviewDialog.lh-integrated-view .lh-source-workspace-sidebar{padding-top:114px!important}
+}
+ 
+.terrain-rail .lh-quicknav{position:relative;z-index:24;overflow:visible!important}
+.terrain-rail .lh-quicknav .lh-nav-entry{position:relative;width:100%;flex:none}
+.terrain-rail .lh-quicknav .lh-nav-entry>button{width:100%;min-width:0}
+.terrain-rail .lh-quicknav .lh-nav-flyout{display:none;position:absolute;top:0;left:100%;width:235px;padding-left:9px;z-index:90;color:#0D3B66}
+.terrain-rail .lh-quicknav .lh-nav-entry:hover>.lh-nav-flyout,.terrain-rail .lh-quicknav .lh-nav-entry:focus-within>.lh-nav-flyout{display:block}
+.terrain-rail .lh-nav-flyout .lh-flyout-panel{padding:11px;background:#FFFDF7;border:1px solid #D9C782;border-radius:13px;box-shadow:0 17px 35px #06203A80;display:grid;gap:5px}
+.terrain-rail .lh-nav-flyout .lh-flyout-panel strong{font-size:12px;padding:2px 8px 7px;color:#0D3B66;border-bottom:1px solid #E7DEC5}
+.terrain-rail .lh-nav-flyout .lh-flyout-panel button{min-height:36px!important;text-align:left!important;display:block!important;font-size:12px!important;line-height:1.25!important;min-width:0!important;padding:8px 10px!important;width:100%;border-radius:7px!important;color:#0D3B66!important;background:transparent!important;border:0!important;box-shadow:none!important}
+.terrain-rail .lh-nav-flyout .lh-flyout-panel button:hover,.terrain-rail .lh-nav-flyout .lh-flyout-panel button:focus-visible{background:#FAF0CA!important;color:#0D3B66!important}
+.terrain-rail .lh-nav-utilities{width:100%;display:grid;gap:8px;margin-top:auto;padding-top:12px;border-top:1px solid #416B8A}
+.terrain-rail .lh-nav-utilities>button{min-height:50px;background:#0D3B66!important;color:#FAF0CA!important;border:1px solid #416B8A!important;border-radius:11px;display:grid;justify-items:center;align-content:center;gap:4px;font-size:10px;font-weight:700}
+.terrain-rail .lh-nav-utilities button:hover,.terrain-rail .lh-nav-utilities button:focus-visible{background:#194B74!important;border-color:#8BA9BE!important;color:#FFFDF7!important}
+.terrain-rail .lh-nav-utilities svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+ 
+.lh-mini-map[data-map-style="dark"]{background:#092B49!important}
+.lh-mini-map[data-map-style="dark"] .lh-mini-tiles img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)!important}
+.lh-mini-map[data-map-style="light"]{background:#EDF2E9!important}
+.lh-mini-map[data-map-style="light"] .lh-mini-tiles img,.lh-mini-map[data-map-style="satellite"] .lh-mini-tiles img{filter:none!important}
+.lh-mini-map[data-map-style="satellite"]{background:#112D38!important}
+#ridePreviewDialog .ride-preview-map #ridePreviewTiles.light{background:#EDF2E9!important}
+#ridePreviewDialog .ride-preview-map #ridePreviewTiles.satellite{background:#112D38!important}
+#ridePreviewDialog .ride-preview-map #ridePreviewTiles.light img,#ridePreviewDialog .ride-preview-map #ridePreviewTiles.satellite img{filter:none!important}
+#ridePreviewDialog .ride-preview-map #ridePreviewTiles.dark img{filter:invert(.90) hue-rotate(180deg) brightness(.72) saturate(.55)!important}
+ 
+#ridePreviewDialog .lh-metric-bucket{background:#FAF0CA!important;border:1px solid #D8CEA9!important;border-radius:11px!important;margin:11px 0!important;padding:12px!important}
+#ridePreviewDialog .lh-metric-header{background:transparent!important;color:#0D3B66!important;border-bottom:1px solid #D6CBA6!important;padding-bottom:9px!important}
+#ridePreviewDialog .lh-metric-header h3,#ridePreviewDialog .lh-metric-header strong{color:#0D3B66!important}
+#ridePreviewDialog .lh-metric-header p{color:#3C5E74!important}
+#ridePreviewDialog .lh-metric-grid{background:transparent!important}
+#ridePreviewDialog .lh-metric-grid .ride-preview-detail{background:#FFFDF7!important;border:1px solid #C6CEC9!important;color:#0D3B66!important;border-radius:9px!important;box-shadow:none!important;min-height:73px!important}
+#ridePreviewDialog .lh-metric-grid .ride-preview-detail span{color:#3C5B70!important}
+#ridePreviewDialog .lh-metric-grid .ride-preview-detail strong{color:#0D3B66!important}
+#ridePreviewDialog .lh-metric-icon{background:#0D3B66!important;color:#FAF0CA!important;border:1px solid #4F7B92!important}
+#ridePreviewDialog #ridePreviewSource{color:#3C5B70!important;background:#FAF0CA!important}
+ 
+
+
+
+
+@media(min-width:901px){
+ :root{--lh-rail-width:84px;--lh-panel-width:318px;--lh-brand-height:112px}
+ body>header{width:calc(var(--lh-rail-width) + var(--lh-panel-width))!important;min-width:0!important;height:var(--lh-brand-height)!important;min-height:var(--lh-brand-height)!important;padding:12px 16px 10px 12px!important;border-right:1px solid #315C7C!important;border-bottom:1px solid #315C7C!important}
+ body>header .brand{gap:11px!important;align-items:flex-start!important}
+ body>header .logo{width:33px!important;height:33px!important;margin-top:2px!important}
+ body>header .brand-text{gap:5px!important}
+ body>header h1{font-size:21px!important;line-height:1.15!important;letter-spacing:-.045em!important}
+ body>header .brand-text>small.lh-brand-slogan{font-size:11px!important;line-height:1.38!important;font-weight:480!important;max-width:310px!important;letter-spacing:0!important}
+ body>header .brand-credit{font-size:12px!important;line-height:1.32!important;font-weight:550!important;max-width:310px!important}
+ .workspace{grid-template-columns:var(--lh-rail-width) var(--lh-panel-width) minmax(0,1fr)!important}
+ .workspace .terrain-rail,.workspace>aside{padding-top:calc(var(--lh-brand-height) + 6px)!important}
+ #statsDialog.lh-integrated-view,#sourceReviewDialog.lh-integrated-view{left:var(--lh-rail-width)!important;inset:0 0 0 var(--lh-rail-width)!important;width:calc(100vw - var(--lh-rail-width))!important}
+ #statsDialog.lh-integrated-view .insights-layout{grid-template-columns:var(--lh-panel-width) minmax(0,1fr)!important}
+ #sourceReviewDialog.lh-integrated-view{grid-template-columns:var(--lh-panel-width) minmax(0,1fr)!important}
+ #statsDialog.lh-integrated-view .insights-topbar{margin-left:var(--lh-panel-width)!important}
+ #statsDialog.lh-integrated-view .stats-tabs{padding-top:calc(var(--lh-brand-height) + 20px)!important}
+ #sourceReviewDialog.lh-integrated-view .lh-source-workspace-sidebar{padding-top:calc(var(--lh-brand-height) + 22px)!important}
+}
+ 
+.terrain-rail .lh-nav-utilities{gap:2px!important;padding:10px 0 0!important;border-top:1px solid #416B8A!important}
+.terrain-rail .lh-nav-utilities>button{width:100%!important;min-width:0!important;min-height:65px!important;background:transparent!important;border:1px solid transparent!important;border-radius:10px!important;box-shadow:none!important;font:inherit!important;font-size:11px!important;line-height:1.15!important;font-weight:650!important;gap:6px!important;color:#FAF0CA!important}
+.terrain-rail .lh-nav-utilities>button svg{width:21px!important;height:21px!important;stroke-width:1.8!important}
+.terrain-rail .lh-nav-utilities>button:hover,.terrain-rail .lh-nav-utilities>button:focus-visible{background:#174C75!important;color:#FFFDF7!important;border-color:transparent!important}
+.terrain-rail .lh-nav-utilities>button:focus-visible{outline:2px solid #F4D35E!important;outline-offset:0!important}
+ 
+.terrain-rail .lh-nav-flyout .lh-flyout-panel{padding:8px!important;gap:3px!important}
+.terrain-rail .lh-nav-flyout .lh-flyout-panel>strong{display:block!important;background:#E6EDDF!important;border-bottom:1px solid #C3D2CA!important;border-radius:7px!important;padding:9px 10px!important;margin-bottom:4px!important;color:#31556E!important;text-transform:uppercase!important;letter-spacing:.075em!important;font-size:10px!important;font-weight:800!important;pointer-events:none!important;cursor:default!important}
+.terrain-rail .lh-nav-flyout .lh-flyout-panel>button{font-weight:680!important}
+ 
+@media(min-width:1100px) and (min-height:620px){
+ dialog#elevationDialog{width:min(1480px,97vw)!important;max-width:97vw!important;height:94dvh!important;max-height:94dvh!important;padding:0!important;overflow:hidden!important}
+ #elevationDialog .elev-shell{height:100%!important;max-height:none!important;overflow:hidden!important;display:flex!important}
+ #elevationDialog .elev-head{padding:10px 17px!important;min-height:61px!important;flex:none!important}
+ #elevationDialog .elev-head h2{font-size:20px!important}
+ #elevationDialog .elev-main{display:grid!important;flex:1!important;min-height:0!important;overflow:hidden!important;padding:10px!important;gap:8px 10px!important;grid-template-columns:minmax(0,1fr) minmax(288px,325px)!important;grid-template-rows:95px auto auto auto auto auto minmax(0,1fr) auto!important;grid-template-areas:'scene geo' 'scene play' 'scene controls' 'scene seek' 'scene data' 'scene legend' 'scene notes' 'scene status'!important}
+ #elevationDialog .elev-stage{grid-area:scene!important;height:100%!important;min-height:0!important;align-self:stretch!important;position:relative!important}
+ #elevationCanvas{height:100%!important;min-height:0!important;width:100%!important}
+ #elevationDialog .elev-geography{grid-area:geo!important;min-height:0!important;overflow:hidden!important}
+ #elevationDialog .elev-geography summary{padding:5px 9px!important;font-size:11px!important}
+ #elevationDialog .elev-geography summary small{display:none!important}
+ #elevationDialog .lh-elevation-map{height:68px!important}
+ #elevationDialog .elev-playbar{grid-area:play!important;display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important;gap:5px!important;padding:7px!important;min-width:0!important}
+ #elevationDialog .elev-playbar>button{min-width:0!important;padding:7px!important;font-size:11px!important;min-height:31px!important}
+ #elevationDialog .elev-playbar label{gap:4px!important;font-size:10px!important}
+ #elevationDialog .elev-playbar select{width:67px!important;min-height:30px!important;padding:4px!important}
+ #elevationDialog .elev-playbar output{grid-column:1!important;align-self:center!important;font-size:11px!important}
+ #elevationDialog .elev-playbar .elev-view-modes{grid-column:2!important;min-width:0!important;padding:2px!important}
+ #elevationDialog .elev-view-modes button{min-width:0!important;width:50%!important;padding:5px!important;font-size:10px!important}
+ #elevationDialog .elev-controls{grid-area:controls!important;display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:7px!important;align-items:end!important}
+ #elevationDialog .elev-controls label{font-size:10px!important;gap:2px!important}
+ #elevationDialog .elev-controls input{margin:0!important}
+ #elevationDialog .elev-controls select{min-height:30px!important;padding:4px 6px!important;font-size:11px!important}
+ #elevationDialog .elev-controls button{height:28px!important;grid-column:1 / -1!important;font-size:11px!important}
+ #elevationDialog .elev-position{grid-area:seek!important;min-height:0!important}
+ #elevationDialog .elev-position label{gap:3px!important;font-size:10px!important}
+ #elevationDialog .elev-details{grid-area:data!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:5px!important}
+ #elevationDialog .elev-details>div{padding:5px 8px!important;border-radius:7px!important}
+ #elevationDialog .elev-details span{font-size:10px!important;margin-bottom:2px!important}
+ #elevationDialog .elev-details strong{font-size:13px!important}
+ #elevationDialog .elev-grade-legend{grid-area:legend!important;gap:5px 9px!important;font-size:10px!important;align-content:start!important}
+ #elevationDialog .elev-grade-legend i{width:10px!important;height:8px!important}
+ #elevationDialog .elev-foot{grid-area:notes!important;min-height:0!important;align-items:flex-start!important;gap:7px!important;font-size:10px!important}
+ #elevationDialog .elev-foot p{font-size:10px!important;line-height:1.3!important}
+ #elevationDialog .elev-foot button{font-size:10px!important;padding:7px!important;white-space:nowrap!important}
+ #elevationDialog #elevationStatus{grid-area:status!important;min-height:0!important;font-size:10px!important;line-height:1.25!important}
+}
+@media(min-width:1100px) and (min-height:620px) and (max-height:770px){
+ #elevationDialog .elev-main{grid-template-rows:84px auto auto auto auto auto minmax(0,1fr) auto!important;gap:5px 8px!important;padding:8px!important}
+ #elevationDialog .lh-elevation-map{height:59px!important}
+ #elevationDialog .elev-details>div{padding:4px 7px!important}
+ #elevationDialog .elev-foot p{font-size:9px!important}
+}
+ 
+#elevationDialog .elev-camera-presets{position:absolute;z-index:4;right:12px;top:11px;display:flex;gap:3px;padding:4px;border-radius:10px;border:1px solid #557790;background:#082841e8;box-shadow:0 6px 19px #06182b55}
+#elevationDialog .elev-camera-presets button{padding:6px 10px!important;background:transparent!important;border:1px solid transparent!important;border-radius:6px!important;color:#FAF0CA!important;font-size:11px!important;font-weight:700!important}
+#elevationDialog .elev-camera-presets button:hover{background:#174C75!important;color:#FFFDF7!important}
+#elevationDialog .elev-camera-presets button[aria-pressed="true"]{background:#F4D35E!important;color:#0D3B66!important;border-color:#F4D35E!important}
+
+
+ 
+#statsDialog .lh-activity-action{position:relative;min-width:0}
+#statsDialog .lh-activity-action>.ride-list-item{width:100%;height:100%;padding-right:60px!important}
+#statsDialog .lh-activity-3d{position:absolute;right:9px;top:50%;transform:translateY(-50%);min-width:40px;height:32px;padding:4px 8px;border-radius:7px;border:1px solid #F4D35E!important;background:#F4D35E!important;color:#0D3B66!important;font-size:11px;font-weight:850;z-index:1;letter-spacing:.02em}
+#statsDialog .lh-activity-3d:hover{background:#FFDE81!important;border-color:#FFDE81!important}
+#statsDialog .lh-activity-3d:focus-visible{outline:3px solid #FFFDF7!important;outline-offset:2px!important}
+
+
+
+#statsDialog .insights-main{--lh-stat-ink:#0D3B66;--lh-stat-sub:#35546C;--lh-stat-paper:#FFFDF7}
+#statsDialog #facts .record-metric,#statsDialog #milestones .record-metric,
+#statsDialog #metricGrid .metric,#statsDialog #facts .lh-help-cardwrap .record-metric,
+#statsDialog #milestones .lh-help-cardwrap .record-metric,
+#statsDialog .insights-main .advanced-summary{
+ background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #C6D1CD!important;box-shadow:inset 0 3px #E3BC4C!important}
+#statsDialog #facts .record-metric strong,#statsDialog #milestones .record-metric strong,
+#statsDialog .insights-main .advanced-summary strong{color:#0D3B66!important;text-shadow:none!important;opacity:1!important}
+#statsDialog #facts .record-metric span,#statsDialog #milestones .record-metric span,
+#statsDialog #facts .record-metric small,#statsDialog #milestones .record-metric small,
+#statsDialog .insights-main .advanced-summary span{color:#35546C!important;opacity:1!important}
+#statsDialog .insights-main .record-metric a,#statsDialog .insights-main .metric a{color:#0D3B66!important}
+#statsDialog .insights-main .details-repair{background:#FFFDF7!important;border-color:#C6D1CD!important}
+#statsDialog .insights-main .details-repair span,#statsDialog .insights-main .details-repair small,
+#statsDialog .insights-main .details-repair p{color:#35546C!important}
+#statsDialog .insights-main .insights-story-kicker,#statsDialog .insights-main .stats-story-kicker,
+#statsDialog .insights-main .insights-section-kicker{color:#755600!important}
+#statsDialog .insights-main .insights-content-card:not(.analytics-card){background:#FFFDF7!important;color:#0D3B66!important}
+#statsDialog .insights-main .insights-content-card:not(.analytics-card) h4,
+#statsDialog .insights-main .insights-content-card:not(.analytics-card) strong{color:#0D3B66!important}
+#statsDialog .insights-main .insights-content-card:not(.analytics-card) p,
+#statsDialog .insights-main .insights-content-card:not(.analytics-card) small{color:#35546C!important}
+ 
+#statsDialog #statsAdvanced .analytics-card{background:#0D3B66!important;color:#FFFDF7!important;border:1px solid #597A90!important}
+#statsDialog #statsAdvanced .analytics-card h4,#statsDialog #statsAdvanced .analytics-card h5,
+#statsDialog #statsAdvanced .analytics-card .analytics-card-head h5,
+#statsDialog #statsAdvanced .analytics-card strong{color:#FFFDF7!important}
+#statsDialog #statsAdvanced .analytics-card p,#statsDialog #statsAdvanced .analytics-card small,
+#statsDialog #statsAdvanced .analytics-card .analytics-card-summary,
+#statsDialog #statsAdvanced .analytics-card .analytics-note{color:#DCE8EA!important}
+#statsDialog #statsAdvanced .analytics-card details,#statsDialog #statsAdvanced .analytics-card summary{
+ background:#153F62!important;color:#FFFDF7!important;border:0!important;box-shadow:none!important;border-radius:6px!important}
+#statsDialog #statsAdvanced .analytics-card summary:hover{background:#245475!important}
+#statsDialog #statsAdvanced .analytics-card svg text{fill:#E9F1EE!important}
+#statsDialog #statsAdvanced .analytics-card .plot-tick,#statsDialog #statsAdvanced .analytics-card .plot-label{fill:#E9F1EE!important}
+#statsDialog .insights-main .stats-table td,#statsDialog .insights-main .data-table td{background:#FFFDF7!important;color:#0D3B66!important}
+#statsDialog .insights-main .stats-table tr:nth-child(even) td,#statsDialog .insights-main .data-table tr:nth-child(even) td{background:#F4F1E3!important;color:#0D3B66!important}
+#statsDialog .insights-main .v121-compare-metric-row{background:#FFFDF7!important;color:#0D3B66!important}
+#statsDialog .insights-main .v121-compare-metric-row .v121-a{color:#0D3B66!important;font-weight:700!important}
+#statsDialog .insights-main .v121-compare-metric-row .v121-b{color:#795300!important;font-weight:750!important}
+#statsDialog .insights-main .v121-compare-metric-row .v121-delta{color:#0D3B66!important}
+#statsDialog .insights-main button:disabled{color:#465F70!important;background:#E8EBE4!important;opacity:1!important}
+#statsDialog .insights-main .stats-page-label,#statsDialog .insights-main .data-summary,
+#statsDialog .insights-main .data-pagination,#statsDialog .insights-main .analytics-guidance{color:#35546C!important}
+#statsDialog .insights-main .stats-sport-card .sport-row,#statsDialog .insights-main .stats-sport-card .bike-row{background:#FFFDF7!important;color:#0D3B66!important}
+#statsDialog .insights-main .stats-sport-card .sport-row *,#statsDialog .insights-main .stats-sport-card .bike-row *{color:#0D3B66!important}
+ 
+#statsDialog .insights-main .metric .muted,#statsDialog .insights-main .metric span,
+#statsDialog .insights-main .record-metric .muted{color:#35546C!important}
+ 
+#sourceReviewDialog:not(.lh-integrated-view){background:#FAF0CA!important;color:#0D3B66!important}
+#sourceReviewDialog:not(.lh-integrated-view) .lh-source-workspace-main{width:100%!important;max-width:none!important;padding:14px 20px 16px!important}
+#sourceReviewDialog:not(.lh-integrated-view) .dialog-head{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:22px!important;width:100%!important;margin:0 0 14px!important;padding:20px 24px!important;border-radius:12px 12px 3px 3px!important;background:#0D3B66!important}
+#sourceReviewDialog:not(.lh-integrated-view) .dialog-head>div{flex:1!important;min-width:0!important}
+#sourceReviewDialog:not(.lh-integrated-view) .dialog-head h2{color:#FFFDF7!important;font-size:23px!important;line-height:1.22!important;margin:0 0 7px!important}
+#sourceReviewDialog:not(.lh-integrated-view) .dialog-head p{color:#DCE8EA!important;font-size:13px!important;line-height:1.5!important;margin:0!important;max-width:63ch!important}
+#sourceReviewDialog:not(.lh-integrated-view) .dialog-head button{flex:none!important;background:#F4D35E!important;color:#0D3B66!important;border-color:#E2BC44!important}
+ 
+#elevationDialog .elev-spatial{min-width:0;min-height:0;display:flex;flex-direction:column;gap:9px}
+#elevationDialog .elev-spatial .elev-geography{flex:none;min-height:0!important}
+#elevationDialog .elev-spatial .elev-geography summary{font-size:12px!important;padding:7px 12px!important}
+#elevationDialog .elev-spatial .lh-elevation-map{height:103px!important}
+#elevationDialog .elev-playbar label,#elevationDialog .elev-controls label,
+#elevationDialog .elev-position label{font-size:12px!important;line-height:1.3!important;font-weight:750!important}
+#elevationDialog .elev-playbar button,#elevationDialog .elev-view-modes button,
+#elevationDialog .elev-controls button{font-size:12px!important}
+#elevationDialog .elev-playbar output,#elevationDialog .elev-details span,
+#elevationDialog .elev-grade-legend,#elevationDialog .elev-foot p,#elevationDialog #elevationStatus{font-size:11.5px!important;line-height:1.38!important}
+#elevationDialog .elev-details strong{font-size:15px!important}
+#elevationDialog .elev-controls select{font-size:12px!important}
+@media(min-width:1100px) and (min-height:620px){
+ #elevationDialog .elev-main{grid-template-columns:minmax(0,1fr) minmax(310px,338px)!important;
+  grid-template-rows:auto auto auto auto auto minmax(0,1fr) auto!important;
+  grid-template-areas:'spatial play' 'spatial controls' 'spatial seek' 'spatial data' 'spatial legend' 'spatial notes' 'spatial status'!important}
+ #elevationDialog .elev-spatial{grid-area:spatial!important;height:100%!important;overflow:hidden!important}
+ #elevationDialog .elev-spatial .elev-stage{grid-area:unset!important;flex:1 1 auto!important;height:auto!important;min-height:220px!important}
+ #elevationDialog .elev-spatial .elev-geography{grid-area:unset!important;height:auto!important;overflow:hidden!important}
+ #elevationDialog .elev-playbar{grid-area:play!important}
+ #elevationDialog .elev-controls{grid-area:controls!important}
+ #elevationDialog .elev-position{grid-area:seek!important}
+ #elevationDialog .elev-details{grid-area:data!important}
+ #elevationDialog .elev-grade-legend{grid-area:legend!important}
+ #elevationDialog .elev-foot{grid-area:notes!important}
+ #elevationDialog #elevationStatus{grid-area:status!important}
+ #elevationDialog .elev-playbar>button{font-size:12px!important}
+ #elevationDialog .elev-controls label{font-size:11.5px!important}
+ #elevationDialog .elev-foot p{font-size:11px!important}
+}
+ 
+#statsDialog .lh-record-hover .lh-hover-elevation[hidden]{display:none!important}
+#statsDialog .lh-record-hover .lh-hover-elevation{padding:6px 8px 4px;margin-top:8px;background:#EFF2E8;border:1px solid #C4D1CA;border-radius:8px}
+#statsDialog .lh-record-hover .lh-hover-elevation-label{font-size:10px!important;color:#0D3B66!important;font-weight:800!important;letter-spacing:.075em}
+#statsDialog .lh-record-hover .lh-hover-elevation canvas{position:static!important;display:block!important;width:100%!important;height:82px!important;border:0!important;pointer-events:none!important;background:transparent!important}
+ 
+#statsDialog .lh-activity-action>.ride-list-item{padding-right:150px!important}
+#statsDialog .lh-activity-action>.lh-activity-3d{right:89px!important;top:50%!important;min-width:42px!important}
+#statsDialog .lh-activity-action>.lh-activity-flyover{position:absolute;right:9px;top:50%;transform:translateY(-50%);height:32px;min-width:74px;padding:4px 7px;border-radius:7px;background:#FFFDF7!important;border:1px solid #AFBDC3!important;color:#0D3B66!important;font-size:11px;font-weight:800;z-index:2}
+#statsDialog .lh-activity-action>.lh-activity-flyover:hover{background:#F4D35E!important;color:#0D3B66!important;border-color:#D9B944!important}
+#statsDialog .lh-activity-action>.lh-activity-flyover:focus-visible{outline:2px solid #F4D35E!important;outline-offset:2px!important}
+
+
+
+#statsDialog .insights-main .lh-activity-action>.ride-list-item{background:#174C75!important;border-color:#5F849B!important;color:#FFFDF7!important}
+#statsDialog .insights-main .lh-activity-action>.ride-list-item strong{color:#FFFDF7!important}
+#statsDialog .insights-main .lh-activity-action>.ride-list-item span{color:#E2EFF2!important}
+#statsDialog .insights-main .lh-activity-action>.ride-list-item:hover{background:#24587A!important;border-color:#F4D35E!important}
+ 
+#sourceReviewDialog:not(.lh-integrated-view) .dialog-head>div{max-width:620px!important}
+ 
+#statsDialog .insights-main .v121-compare-header{background:#0D3B66!important;color:#FFFDF7!important}
+#statsDialog .insights-main .v121-compare-header span{color:#FFFDF7!important}
+#statsDialog .insights-main .v121-compare-metric-row:not(.v121-compare-header){background:#FFFDF7!important;color:#0D3B66!important}
+#statsDialog .insights-main .v121-compare-metric-row:not(.v121-compare-header):nth-child(even){background:#F7F2E0!important}
+#statsDialog .insights-main .v121-compare-metric-row:not(.v121-compare-header)>span{color:#0D3B66!important}
+#statsDialog .insights-main .v121-compare-metric-row:not(.v121-compare-header) .v121-b{color:#765200!important}
+#statsDialog .insights-main .v121-compare-trends{background:#0D3B66!important;border-color:#4D728B!important}
+#statsDialog .insights-main .v121-compare-trend-head strong,#statsDialog .insights-main .v121-compare-trend-head p,#statsDialog .insights-main .v121-compare-trend-head label,#statsDialog .insights-main .v121-compare-legend{color:#FFFDF7!important}
+#statsDialog .insights-main .v121-compare-trend-head select{background:#FFFDF7!important;color:#0D3B66!important}
+
+
+</style><style id="settings-design-styles">
+
+#settingsDialog{background:#F8F0D5!important;color:#0D3B66!important;border:1px solid #C8B97E!important;border-radius:19px!important;width:min(1080px,96vw)!important;max-width:1080px!important;box-shadow:0 30px 90px #071F37A8!important}
+#settingsDialog>.dialog-head{background:#0D3B66!important;color:#FFF9E9!important;border-bottom:3px solid #F4D35E!important;padding:18px 28px!important;min-height:91px!important}
+#settingsDialog .settings-dialog-brand img{display:none!important}
+#settingsDialog .settings-dialog-brand{gap:0!important}
+#settingsDialog>.dialog-head h2{font-size:27px!important;line-height:1.18!important;color:#FFFDF7!important;margin:0 0 5px!important;letter-spacing:-.02em!important}
+#settingsDialog>.dialog-head .muted{font-size:13px!important;line-height:1.45!important;color:#E5EBEE!important;max-width:none!important}
+#settingsDialog .settings-close{background:#214F76!important;border:1px solid #7F9BA9!important;color:#FFF9E9!important;width:38px!important;height:38px!important;font-size:24px!important}
+#settingsDialog .settings-close:hover{background:#F4D35E!important;color:#0D3B66!important;border-color:#F4D35E!important}
+#settingsDialog .settings-layout{background:#F8F0D5!important}
+#settingsDialog .settings-nav{background:#0B3153!important;border-color:#315C7B!important;padding:22px 12px!important;gap:7px!important}
+#settingsDialog .settings-nav-caption{font-size:10px!important;letter-spacing:.15em!important;color:#F4D35E!important;padding:2px 13px 11px!important}
+#settingsDialog .settings-category{background:#18496F!important;border:1px solid #3F6D89!important;border-radius:11px!important;box-shadow:none!important;min-height:64px!important;padding:11px 15px!important;gap:4px!important}
+#settingsDialog .settings-category strong{color:#FFFFFF!important;font-size:14px!important;font-weight:750!important}
+#settingsDialog .settings-category small{color:#D5E5EB!important;font-size:11px!important;line-height:1.3!important}
+#settingsDialog .settings-category:hover{background:#245B83!important;border-color:#B3CBD3!important}
+#settingsDialog .settings-category[aria-selected=true]{background:#F4D35E!important;color:#0D3B66!important;border-color:#C9A738!important;box-shadow:inset 4px 0 #0D3B66!important}
+#settingsDialog .settings-category[aria-selected=true] :is(strong,small){color:#0D3B66!important}
+#settingsDialog .settings-category:before{color:#F4D35E!important}
+#settingsDialog .settings-category[aria-selected=true]:before{color:#0D3B66!important}
+#settingsDialog .settings-panels{background:#F8F0D5!important;color:#0D3B66!important;padding:20px 24px 25px!important}
+#settingsDialog .settings-panel{background:transparent!important;color:#0D3B66!important}
+#settingsDialog .settings-panel-head{background:transparent!important;color:#0D3B66!important;border-bottom:1px solid #D2C69E!important;padding:0 0 15px!important;margin-bottom:15px!important}
+#settingsDialog .settings-panel-head .settings-kicker{color:#795917!important;font-size:11px!important;font-weight:800!important;letter-spacing:.09em!important}
+#settingsDialog .settings-panel-head h2{color:#0D3B66!important;font-size:23px!important;font-weight:800!important}
+#settingsDialog .settings-panel-head>p:last-child{color:#3C596E!important;font-size:13px!important;line-height:1.45!important}
+#settingsDialog .settings-section{background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #DBD0A9!important;border-radius:14px!important;margin:0 0 16px!important;padding:19px 20px 21px!important;box-shadow:0 5px 14px rgba(13,59,102,.045)!important}
+#settingsDialog .settings-panel .settings-section>h2,#settingsDialog .settings-section h3{color:#0D3B66!important;font-size:16px!important;line-height:1.3!important;letter-spacing:0!important;font-weight:800!important}
+#settingsDialog .settings-section :is(p,span,div,li,label,small,.muted,.settings-note,.settings-status,.path-label){color:#35566E!important}
+#settingsDialog .settings-section :is(strong,h2,h3,label,summary){color:#0D3B66!important}
+#settingsDialog .settings-section .settings-actions{background:transparent!important;border-color:#DDD6C1!important;padding:13px 0!important;gap:13px!important}
+#settingsDialog .settings-section .settings-actions small{color:#3E5D70!important;font-size:12px!important;line-height:1.5!important}
+#settingsDialog .settings-section .settings-actions strong{color:#0D3B66!important;font-size:13px!important;line-height:1.4!important}
+#settingsDialog .settings-section .field{background:transparent!important;gap:7px!important;margin-top:14px!important}
+#settingsDialog .settings-section .field>label,#settingsDialog .settings-section label:not(.anomaly-setting){color:#0D3B66!important;font-size:13px!important;font-weight:700!important}
+#settingsDialog .settings-section .field small,#settingsDialog .settings-section .field>small{color:#476277!important;font-size:12px!important;line-height:1.4!important}
+#settingsDialog .settings-section :is(select,input[type=number],input[type=text],input[type=search],input[type=date],input[type=password]){background:#FFFFFF!important;color:#0D3B66!important;border:1px solid #9BB0BC!important;box-shadow:none!important;border-radius:9px!important;min-height:39px!important;font-size:14px!important}
+#settingsDialog .settings-section select option{color:#0D3B66!important;background:#FFFFFF!important}
+#settingsDialog .settings-section input::placeholder{color:#516A7B!important;opacity:1!important}
+#settingsDialog .settings-section :is(select,input,button):focus-visible{outline:3px solid #B78B1E!important;outline-offset:2px!important}
+#settingsDialog .settings-section :is(input[type=checkbox],input[type=range],input[type=radio]){accent-color:#B78813!important}
+#settingsDialog .settings-section :is(button:not(.lh-help-trigger),.settings-actions button){background:#E8F0F3!important;border:1px solid #8AA7B5!important;color:#0D3B66!important;font-size:12px!important;font-weight:800!important;min-height:36px!important}
+#settingsDialog .settings-section button:hover:not(:disabled){background:#F4E7B5!important;border-color:#B88C21!important;color:#0D3B66!important}
+#settingsDialog .settings-section .settings-subdetails{background:#F7F3E6!important;border:1px solid #D4C9A8!important;border-radius:10px!important;padding:2px 13px!important}
+#settingsDialog .settings-section .settings-subdetails summary{color:#0D3B66!important;font-size:13px!important}
+#settingsDialog .settings-section .settings-watch,#settingsDialog .settings-section .garmin-usb-panel{background:#F8F4E6!important;color:#0D3B66!important;border-color:#D4C6A1!important}
+#settingsDialog .settings-section .settings-watch :is(h3,strong),#settingsDialog .settings-section .garmin-usb-panel strong{color:#0D3B66!important}
+#settingsDialog .settings-section .settings-watch .settings-note{color:#35566E!important}
+#settingsDialog .settings-section .speed-threshold-suffix{background:#E8F0F3!important;color:#0D3B66!important;border-color:#9BB0BC!important}
+#settingsDialog .settings-section .local-storage code{color:#0D3B66!important;background:#F4F0E3!important;border-color:#CAC39E!important}
+#settingsDialog .settings-global-status{background:#FFF7DE!important;color:#0D3B66!important;padding:0 22px!important}
+#settingsDialog .settings-savebar{background:#FFF7DE!important;color:#0D3B66!important;border-top:1px solid #D1C396!important;padding:13px 23px!important;box-shadow:0 -5px 13px rgba(13,59,102,.05)!important}
+#settingsDialog .settings-save-state,#settingsDialog .settings-status{color:#36566D!important;font-size:12px!important}
+#settingsDialog .settings-save-state.dirty{color:#77510E!important}
+#settingsDialog .settings-save-state.error,#settingsDialog .settings-status.error{color:#9F302E!important}
+#settingsDialog #saveSettings{background:#F4D35E!important;color:#0D3B66!important;border:1px solid #C8A42B!important;box-shadow:none!important;min-height:38px!important;font-weight:800!important}
+#settingsDialog #saveSettings:hover{background:#FFE289!important;color:#0D3B66!important}
+@media(max-width:800px){#settingsDialog .settings-panels{padding:15px!important}#settingsDialog .settings-section{padding:15px!important}#settingsDialog .settings-nav{padding:10px!important}}
+#settingsDialog .settings-category{padding-left:43px!important}
+#settingsDialog .settings-category:before{left:15px!important;top:20px!important;font-size:17px!important}
+
+#elevationDialog .elev-spatial{gap:8px!important}
+#elevationDialog .elev-spatial .elev-geography{flex:none!important;border:1px solid #96ADB8!important;border-radius:11px!important;background:#FFFDF7!important;overflow:hidden!important}
+#elevationDialog .elev-spatial .elev-geography summary{padding:8px 12px!important;font-size:13px!important;color:#0D3B66!important;background:#FFF9E9!important;border-bottom:1px solid #DBD2AD!important}
+#elevationDialog .elev-spatial .elev-geography summary small{display:inline!important;color:#3F5F75!important;font-size:11px!important}
+#elevationDialog .elev-geo-toolbar{display:flex;align-items:center;gap:6px;justify-content:flex-start;background:#FFFDF7!important;padding:6px 10px!important;border-bottom:1px solid #D6D5BD!important}
+#elevationDialog .elev-geo-toolbar button{background:#E9F0F1!important;color:#0D3B66!important;border:1px solid #91ADB9!important;border-radius:6px!important;font-size:12px!important;font-weight:750!important;padding:5px 9px!important;min-height:29px!important}
+#elevationDialog .elev-geo-toolbar button[aria-pressed=true]{background:#F4D35E!important;color:#0D3B66!important;border-color:#D0AD3D!important}
+#elevationDialog .elev-geo-toolbar button:hover{border-color:#0D3B66!important}
+#elevationDialog .elev-geo-toolbar .elev-geo-zoom{display:flex;gap:4px;margin-left:auto}
+#elevationDialog .elev-geo-zoom button{width:32px!important;font-size:17px!important;padding:2px!important}
+#elevationDialog .elev-spatial .lh-elevation-map{height:clamp(163px,20vh,220px)!important;min-height:163px!important;border-radius:0!important;position:relative!important;cursor:crosshair!important}
+#elevationDialog .elev-geo-hud{position:absolute;top:10px;left:11px;z-index:3;display:flex;flex-direction:column;gap:2px;background:#082944e9;color:#FFFDF7;border:1px solid #738A9B;border-radius:8px;padding:6px 9px;pointer-events:none;max-width:65%}
+#elevationDialog .elev-geo-hud strong{color:#FFF5C7!important;font-size:12px!important;white-space:nowrap}
+#elevationDialog .elev-geo-hud span{color:#E3ECF2!important;font-size:11px!important;white-space:nowrap}
+#elevationDialog .elev-geo-help{padding:5px 9px!important;background:#FFF9E8!important;color:#35556B!important;font-size:11px!important;line-height:1.25!important}
+#elevationDialog .elev-spatial .elev-stage{min-height:235px!important}
+#elevationDialog .lh-mini-tiles,#elevationDialog .lh-mini-tiles img,#elevationDialog .lh-elevation-map canvas{pointer-events:none!important}
+#elevationDialog .elev-stage canvas{touch-action:none}
+@media(max-height:780px){#elevationDialog .elev-spatial .lh-elevation-map{height:165px!important}#elevationDialog .elev-geo-help{font-size:10px!important}}
+</style><style id="spatial-interface-styles">
+
+:root{--lh-depth-blue:#0D3B66;--lh-depth-gold:#F4D35E;--lh-depth-cream:#FAF0CA;--lh-edge:#A6C7D0}
+@media(min-width:1000px) and (hover:hover){
+ .terrain-rail{perspective:780px!important;transform-style:preserve-3d!important}
+ .terrain-rail .lh-nav-entry>button,.terrain-rail .lh-nav-utilities>button{position:relative!important;transform:translate3d(0,0,0)!important;transform-origin:center left!important;transition:transform .2s cubic-bezier(.2,.85,.2,1),box-shadow .2s,border-color .2s!important;box-shadow:inset 0 1px 0 #ffffff21,0 1px 1px #061f35a3!important}
+ .terrain-rail .lh-nav-entry>button:hover,.terrain-rail .lh-nav-utilities>button:hover{transform:translate3d(4px,-2px,13px) rotateY(var(--lh-tilt-y,-6deg)) rotateX(var(--lh-tilt-x,2deg))!important;box-shadow:inset 0 1px 0 #ffffff66,0 7px 0 #092947,0 13px 22px #061f35aa!important}
+ .terrain-rail .lh-nav-entry>button:active,.terrain-rail .lh-nav-utilities>button:active{transform:translate3d(2px,1px,3px)!important;box-shadow:inset 0 1px 5px #061f3588!important}
+ .terrain-rail .lh-nav-flyout{filter:drop-shadow(0 16px 16px #001a3180)}
+ aside>section,aside>.lh-workspace-title{transition:box-shadow .18s,border-color .18s!important}
+ aside>section:hover{box-shadow:inset 3px 0 0 #F4D35E,3px 7px 16px #082a3629!important}
+ .lh-panel-icon{transform:perspective(120px) rotateX(9deg) rotateY(-12deg)!important;box-shadow:2px 3px 0 #c7a63b,4px 5px 8px #08213d30!important}
+ .lh-workspace-title{position:relative;overflow:hidden}
+ #statsDialog .stat-card:hover,.lh-source-bucket:hover{transform:translateY(-2px)!important;box-shadow:0 7px 0 #dfcf9a,0 17px 26px #0b30402e!important;transition:transform .18s,box-shadow .18s!important}
+}
+body>header .brand{isolation:isolate!important;position:relative!important;padding:10px 14px!important;gap:12px!important}
+body>header .brand:before{content:'';position:absolute;z-index:-1;width:58px;height:58px;left:3px;top:11px;border-radius:50%;background:radial-gradient(circle at 37% 27%,#ffda71bb,#d3ac3018 36%,#376c8b17 54%,transparent 70%);border:1px solid #f4d35e25;transform:perspective(150px) rotateY(-30deg);pointer-events:none}
+body>header .brand .logo{filter:drop-shadow(0 3px 0 #032e58) drop-shadow(0 7px 6px #041b3788)!important;transform:perspective(120px) rotateY(-13deg)!important}
+body>header .brand-text{gap:5px!important}
+body>header .brand-text h1{font-size:21px!important;font-weight:850!important;letter-spacing:-.045em!important;text-shadow:0 2px 0 #041f3c!important}
+body>header .brand-text .lh-brand-slogan{font-size:11.5px!important;line-height:1.42!important;max-width:308px!important;color:#F0F3ED!important;font-weight:550!important}
+body>header .brand-credit{font-size:12px!important;color:#E8F0F2!important;letter-spacing:.004em!important;margin-top:2px!important}
+body>header .brand-credit a{color:#F4D35E!important;font-weight:790!important;text-decoration-thickness:1px;text-underline-offset:3px}
+ 
+#settingsDialog .settings-nav{display:flex!important;flex-direction:column!important}
+#settingsDialog .lh-about-rail-separator{margin-top:auto!important;border-top:1px solid #426A85!important;min-height:16px!important}
+#settingsDialog .lh-about-tab{border:1px solid #7894A7!important;background:#154A6E!important}
+#settingsDialog .settings-category:before{display:none!important}  
+#settingsDialog .lh-about-hero{background:linear-gradient(125deg,#103E64,#215A7D 68%,#0D3B66);border:1px solid #6A95AC;border-radius:15px;padding:24px 25px;box-shadow:inset 0 1px #ffffff45,0 8px 16px #0D3B661c;color:#fff}
+#settingsDialog .lh-about-hero .lh-about-edition{color:#F4D35E!important;font-size:11px;font-weight:800;letter-spacing:.12em}
+#settingsDialog .lh-about-hero h3{font-size:24px;margin:8px 0 6px;color:#FFFDF7!important;letter-spacing:-.035em}
+#settingsDialog .lh-about-hero p{color:#E8F1F3!important;line-height:1.5;margin:0;font-size:13px}
+#settingsDialog .lh-about-story{margin-top:15px!important}
+#settingsDialog .lh-about-story p{font-size:13px;line-height:1.6!important}
+#settingsDialog .lh-about-values-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+#settingsDialog .lh-about-values-grid>div{background:#F6F1E1;border:1px solid #D9CDA5;border-radius:10px;padding:13px;box-shadow:0 4px 0 #DFD2A5}
+#settingsDialog .lh-about-values-grid strong{color:#0D3B66!important}
+#settingsDialog .lh-about-values-grid p{color:#35566E!important;font-size:12px;line-height:1.5!important}
+#settingsDialog .lh-about-links a,#settingsDialog .lh-about-story a{color:#0D3B66!important;font-weight:780!important;text-decoration:underline!important}
+ 
+#elevationDialog .elev-stage{position:relative!important}
+#elevationDialog .lh-spatial-telemetry{position:absolute;bottom:12px;left:13px;right:13px;z-index:4;color:#FFFDF7;background:#082944e6;border:1px solid #95B3C5;border-radius:12px;padding:8px 11px 9px;box-shadow:0 8px 26px #07152488,0 0 0 1px #f4d35e2c;backdrop-filter:blur(7px);pointer-events:none}
+#elevationDialog .lh-sensor-title{display:flex;justify-content:space-between;gap:6px;color:#F4D35E;font-weight:800;font-size:10px;letter-spacing:.12em;line-height:1.2}
+#elevationDialog #elevationSensorTime{letter-spacing:0;color:#E4F1F3}
+#elevationDialog .lh-sensor-row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin-top:6px}
+#elevationDialog .lh-sensor-row>div{border-left:2px solid #F4D35E69;padding-left:9px;min-width:0}
+#elevationDialog .lh-sensor-row span{display:block;font-size:10px;color:#C5DBE8;white-space:nowrap}
+#elevationDialog .lh-sensor-row strong{display:block;color:#FFFDF7!important;font-size:clamp(12px,1.18vw,17px)!important;font-variant-numeric:tabular-nums;white-space:nowrap}
+#flyoverDialog .flyover-metrics{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+#flyoverDialog .flyover-metrics>div{min-width:0!important}
+#flyoverDialog .flyover-metrics strong{font-variant-numeric:tabular-nums!important}
+@media(max-height:800px){#elevationDialog .lh-spatial-telemetry{bottom:9px!important;padding:6px 8px!important}#elevationDialog .lh-sensor-row{margin-top:4px!important}#elevationDialog .lh-sensor-row strong{font-size:12px!important}}
+@media(max-width:1100px){#settingsDialog .lh-about-values-grid{grid-template-columns:1fr}#flyoverDialog .flyover-metrics{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+ 
+@media(min-width:1000px) and (hover:hover){
+ #statsDialog #facts .record-metric,#statsDialog #milestones .record-metric,#statsDialog #metricGrid .metric,#statsDialog .insights-activities-card{transform:translate3d(0,0,0)!important;box-shadow:0 3px 0 #D5C99F,0 8px 19px #0D3B6619!important;transition:transform .2s cubic-bezier(.2,.85,.2,1),box-shadow .2s!important;transform-style:preserve-3d}
+ #statsDialog #facts .record-metric:hover,#statsDialog #facts .record-metric:focus-within,#statsDialog #milestones .record-metric:hover,#statsDialog #milestones .record-metric:focus-within,#statsDialog #metricGrid .metric:hover,#statsDialog .insights-activities-card:hover{transform:perspective(1000px) rotateX(1.2deg) translate3d(0,-3px,5px)!important;box-shadow:0 6px 0 #DAC996,0 17px 26px #0D3B662e!important}
+ #settingsDialog .settings-section{box-shadow:0 4px 0 #ded4ad,0 10px 24px #0D3B6610!important}
+}
+@media(prefers-reduced-motion:reduce){.terrain-rail .lh-nav-entry>button,.terrain-rail .lh-nav-utilities>button,aside>section,#statsDialog .record-metric,#statsDialog #metricGrid .metric{transition:none!important;transform:none!important}}
+</style>
+<style id="spatial-clarity-styles">
+ 
+body>header .brand:before{display:none!important}
+body>header .brand .logo{transform:none!important;filter:drop-shadow(0 2px 3px #061B32AA)!important;object-fit:contain!important;object-position:center!important;image-rendering:auto!important;perspective:none!important}
+body>header .brand{transform:none!important}
+ 
+#elevationDialog .lh-spatial-telemetry{position:relative!important;grid-area:sensors!important;display:block!important;inset:auto!important;bottom:auto!important;left:auto!important;right:auto!important;background:transparent!important;box-shadow:none!important;border:0!important;padding:0!important;color:#0D3B66!important;backdrop-filter:none!important;pointer-events:auto!important;min-width:0!important}
+#elevationDialog .lh-sensor-title{font-size:11.5px!important;letter-spacing:.035em!important;color:#0D3B66!important;margin:0 0 6px!important}
+#elevationDialog #elevationSensorTime{color:#35556B!important;font-size:10px!important}
+#elevationDialog .lh-sensor-row{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:5px!important;margin:0!important}
+#elevationDialog .lh-sensor-row>div{border:1px solid #D3C79D!important;border-radius:7px!important;background:#FFFDF7!important;padding:6px 8px!important;box-shadow:0 2px 0 #E6DDBA!important;min-height:42px!important}
+#elevationDialog .lh-sensor-row span{color:#35556B!important;font-size:10px!important;line-height:1.25!important}
+#elevationDialog .lh-sensor-row strong{color:#0D3B66!important;font-size:14px!important;line-height:1.25!important}
+@media(min-width:1100px) and (min-height:620px){
+ #elevationDialog .elev-main{grid-template-rows:auto auto auto auto auto auto minmax(0,1fr) auto!important;grid-template-areas:'spatial play' 'spatial controls' 'spatial seek' 'spatial data' 'spatial sensors' 'spatial legend' 'spatial notes' 'spatial status'!important}
+ #elevationDialog .elev-stage{min-height:260px!important}
+ #elevationDialog .elev-spatial{gap:7px!important}
+ #elevationDialog .elev-details{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+ #elevationDialog .elev-details div{padding:5px 8px!important}
+ #elevationDialog .elev-details span{font-size:10px!important;margin-bottom:2px!important}
+ #elevationDialog .elev-details strong{font-size:14px!important}
+ #elevationDialog .elev-spatial .lh-elevation-map{height:clamp(160px,21vh,250px)!important}
+ #elevationDialog .elev-grade-legend{font-size:10px!important;gap:6px!important}
+ #elevationDialog .elev-foot p{font-size:10px!important}
+}
+@media(max-height:810px) and (min-width:1100px){
+ #elevationDialog .lh-sensor-row>div{min-height:36px!important;padding:4px 7px!important}
+ #elevationDialog .elev-playbar,#elevationDialog .elev-controls{row-gap:3px!important}
+ #elevationDialog .elev-spatial .lh-elevation-map{height:160px!important}
+}
+ 
+#statsDialog .v120-chart-card[style*="background"],#statsDialog .v120-chart-panel[style*="background"]{color:#FFFDF7!important}
+#statsDialog .lh-insight-dark,#statsDialog .lh-insight-dark :is(p,small,span,em,strong,label){color:#FFFDF7!important}
+#statsDialog .v120-chart-panel .muted,#statsDialog .chart-caption,#statsDialog .insights-report-chart .muted{color:#DCE9F0!important}
+#statsDialog .metric-grid .metric[style*="background:#0D3B66"]{color:#FFFDF7!important}
+ 
+#settingsDialog .lh-about-hero{background-color:#0D3B66!important;background-image:linear-gradient(125deg,#103E64,#215A7D 68%,#0D3B66)!important}
+ 
+#settingsDialog .settings-panel a:not(.settings-danger a){color:#0D3B66!important;text-decoration:underline!important;text-decoration-thickness:1.5px!important;text-underline-offset:2px!important}
+#settingsDialog .settings-panel a:hover{color:#092947!important}
+ 
+#statsDialog .v120-compare-pickers label,#statsDialog .v121-compare-browse,
+#statsDialog .v121-compare-browse span{color:#0D3B66!important}
+#statsDialog .v120-compare-pickers :is(select,input){color:#FFFDF7!important;background:#0D3B66!important;border:1px solid #42708F!important}
+#statsDialog .v120-compare-pickers :is(select,input)::placeholder{color:#D7E7EA!important}
+#statsDialog #statAccuracy{color:#DCE9F0!important}
+ 
+#statsDialog .record-metric[style*="background-color: rgb(13, 59, 102)"]{color:#FFFDF7!important}
+ 
+</style>
+<style id="journey-quality-styles">
+ 
+body>header .brand,body>header .brand .logo{border:0!important;border-radius:0!important;clip-path:none!important;background:transparent!important;box-shadow:none!important;transform:none!important;filter:none!important;perspective:none!important}
+body>header .brand::before,body>header .brand::after{content:none!important;display:none!important}
+body>header .brand .logo{object-fit:contain!important;width:39px!important;height:43px!important;min-width:39px!important;padding:0!important;margin:0!important;mix-blend-mode:normal!important}
+body>header .brand-text{padding-left:1px!important}
+#statsDialog .insights-heading{gap:0!important}
+#statsDialog .insights-topbar .insights-heading h2{margin-left:0!important}
+ 
+#statsDialog .lh-activity-action>.lh-activity-3d{min-width:66px!important;right:92px!important;color:#FFFDF7!important;background:#0D3B66!important;border:1px solid #C6D7DC!important;box-shadow:none!important;outline:0!important;filter:none!important}
+#statsDialog .lh-activity-action>.lh-activity-flyover{right:8px!important;min-width:78px!important;outline:0!important;box-shadow:none!important;filter:none!important}
+#statsDialog .lh-activity-action>.lh-activity-3d:hover,#statsDialog .lh-activity-action>.lh-activity-flyover:hover{background:#F4D35E!important;color:#0D3B66!important;border-color:#BD941F!important;box-shadow:0 2px 0 #A78837!important;outline:0!important;filter:none!important;transform:translateY(-50%)!important}
+#statsDialog .lh-activity-action>.lh-activity-3d:focus-visible,#statsDialog .lh-activity-action>.lh-activity-flyover:focus-visible{outline:2px solid #F4D35E!important;outline-offset:2px!important}
+#statsDialog .lh-activity-action>.ride-list-item{padding-right:168px!important}
+ 
+.lh-journey-entry{background:linear-gradient(135deg,#103E64,#184E73)!important;color:#FFFDF7!important;border:1px solid #7293A6!important;border-radius:14px!important;padding:14px!important;box-shadow:0 5px 0 #092947!important}
+.lh-journey-entry .lh-journey-head{display:flex;align-items:center;gap:11px}
+.lh-journey-entry .lh-journey-head strong{display:block;font-size:17px;color:#FFFDF7!important}
+.lh-journey-entry .lh-journey-head small{display:block;font-size:12px;color:#D7E5E9!important}
+#lhJourneyDescription{font-size:12px;line-height:1.45;color:#EDF2F4!important;margin:10px 0!important}
+aside section.lh-journey-entry>button{display:flex;justify-content:space-between;align-items:center;width:100%;background:#F4D35E!important;color:#0D3B66!important;font-weight:800!important;border:1px solid #C59E33!important;border-radius:8px;padding:10px 12px}
+.lh-journey-symbol{font-size:30px;line-height:1;font-weight:800;color:#F4D35E;display:inline-grid;place-items:center;width:37px;height:37px;background:#224F72;border:1px solid #66899F;border-radius:8px;transform:skewY(-9deg)}
+#lhJourneySpace[hidden],#lhJourneyEmpty[hidden]{display:none!important}
+#lhJourneySpace{position:absolute;inset:0;z-index:25;display:grid;grid-template-rows:auto minmax(0,1fr) auto;padding:18px;gap:12px;background:radial-gradient(ellipse at 64% 28%,#225174 0%,#0E3452 45%,#082842 100%);color:#FFFDF7;overflow:hidden}
+#lhJourneySpace .lh-journey-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}
+#lhJourneySpace .lh-journey-title{display:flex;align-items:center;gap:12px;min-width:0}
+#lhJourneySpace .lh-journey-title small{display:block;color:#F4D35E;font-weight:850;font-size:10px;letter-spacing:.15em}
+#lhJourneySpace h2{font-size:25px;line-height:1.1;margin:2px 0 3px;color:#FFFDF7}
+#lhJourneySpace .lh-journey-title p{margin:0;color:#DDE9F0;font-size:12px}
+#lhJourneyExit,#lhJourneyReset{background:#F4D35E!important;color:#0D3B66!important;border:1px solid #E5BB3C!important;padding:9px 12px;border-radius:8px;font-weight:800;white-space:nowrap}
+#lhJourneySpace .lh-journey-stage{position:relative;min-height:0;border:1px solid #6788A1;border-radius:14px;overflow:hidden;background:#092C48;box-shadow:inset 0 0 50px #071B33,0 6px 22px #071D2F5A}
+#lhJourneyCanvas{width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+#lhJourneyCanvas:active{cursor:grabbing}
+#lhJourneySpace .lh-journey-hint{position:absolute;left:14px;top:12px;background:#092947e8;color:#FFFDF7;font-size:11px;border-radius:6px;padding:6px 9px;pointer-events:none}
+#lhJourneySpace .lh-journey-empty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:420px;text-align:center;padding:18px 26px;color:#0D3B66;background:#FAF0CA;border:1px solid #D8BC69;border-radius:12px;font-size:14px}
+#lhJourneySpace .lh-journey-console{display:flex;justify-content:space-between;gap:14px;align-items:center;min-width:0;background:#FAF0CA;color:#0D3B66;border:1px solid #C2B48D;border-radius:12px;padding:11px 15px}
+#lhJourneySpace .lh-journey-legend{flex:1;min-width:160px;display:grid;gap:4px}
+#lhJourneySpace .lh-journey-legend strong{font-size:13px;color:#0D3B66}
+#lhJourneySpace .lh-journey-legend span{font-size:11px;color:#35556B}
+#lhJourneySpace .lh-journey-gradient{height:6px;border-radius:10px;max-width:290px;background:linear-gradient(90deg,#3CA5C4,#6CC3BC,#F4D35E,#FFCB7E)}
+#lhJourneySpace .lh-journey-controls{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}
+#lhJourneySpace .lh-journey-controls button{background:#0D3B66;color:#FFFDF7;border:1px solid #1B5379;border-radius:7px;padding:8px 10px;font-size:12px;font-weight:750}
+#lhJourneySpace .lh-journey-controls button[aria-pressed=true]{background:#F4D35E!important;color:#0D3B66!important;border-color:#B18A27}
+#lhJourneySpace .lh-journey-controls label{display:flex;gap:6px;align-items:center;color:#0D3B66;font-size:12px;font-weight:750}
+#lhJourneySpace .lh-journey-controls input{width:100px;accent-color:#0D3B66}
+#lhJourneySpace button:focus-visible,#lhJourneyCanvas:focus-visible{outline:2px solid #F4D35E!important;outline-offset:2px!important}
+@media(max-width:1100px){#lhJourneySpace .lh-journey-console{flex-direction:column;align-items:stretch}#lhJourneySpace .lh-journey-controls{justify-content:flex-start}#lhJourneySpace{padding:10px}}
+@media(prefers-reduced-motion:reduce){#lhJourneySpace *{transition:none!important;animation:none!important}}
+
+
+#lhJourneySpace .lh-journey-stage{isolation:isolate;border:1px solid #6F99AE;box-shadow:inset 0 1px 0 #C9E5EB66,inset 0 0 52px #021528a8,0 8px 0 #06243D,0 15px 32px #041525b0!important}
+#lhJourneySpace .lh-journey-hint{z-index:3;border:1px solid #648CA2;background:#092947ea;font-size:12px!important}
+#lhJourneySpace .lh-journey-compass{z-index:5;position:absolute;right:17px;top:15px;display:flex;flex-direction:column;align-items:center;gap:2px;padding:9px 9px 10px!important;min-width:112px;min-height:154px;background:linear-gradient(155deg,#1B5075,#092947)!important;border:1px solid #8BB2C3!important;border-radius:13px!important;color:#FFFDF7!important;box-shadow:inset 0 1px 0 #ffffff33,0 5px 0 #051F38,0 12px 21px #03152699!important;cursor:pointer;transform:none!important}
+#lhJourneySpace .lh-journey-compass:hover{background:linear-gradient(155deg,#245F84,#0C3658)!important;box-shadow:inset 0 1px 0 #ffffff65,0 7px 0 #051F38,0 14px 23px #031526aa!important;transform:translateY(-2px)!important}
+#lhJourneySpace .lh-journey-compass:active{transform:translateY(1px)!important;box-shadow:inset 0 2px 5px #031526bb,0 2px 0 #051F38!important}
+#lhJourneySpace .lh-compass-heading{font-size:9px;font-weight:900;letter-spacing:.11em;color:#F4D35E!important;white-space:nowrap}
+#lhJourneySpace .lh-compass-bearing{font-size:13px;font-weight:850;color:#FFFDF7!important;font-variant-numeric:tabular-nums;white-space:nowrap}
+#lhJourneySpace .lh-compass-reset{font-size:9px;color:#E4EFF2!important;white-space:nowrap}
+#lhJourneyCompassDial{transform-box:view-box;transform-origin:45px 45px;transition:transform .12s linear}
+#lhJourneySpace .lh-journey-inspector{position:absolute;bottom:14px;left:14px;z-index:4;max-width:min(330px,calc(100% - 160px));border:1px solid #658BA4;border-left:3px solid #F4D35E;border-radius:9px;padding:10px 12px;display:grid;gap:3px;pointer-events:none;background:#082842e9;box-shadow:0 7px 24px #0515229c}
+#lhJourneySpace .lh-journey-inspector .lh-inspector-kicker{color:#F4D35E!important;font-size:9px;font-weight:850;letter-spacing:.12em}
+#lhJourneySpace .lh-journey-inspector strong{font-size:14px;color:#FFFDF7!important}
+#lhJourneySpace .lh-journey-inspector span:last-child{font-size:11px;line-height:1.4;color:#D5E8EE!important}
+#lhJourneySpace .lh-journey-legend{gap:4px!important}
+#lhJourneySpace .lh-journey-gradient{height:9px!important;max-width:360px!important;border:1px solid #9EA9AC;box-shadow:inset 0 1px 3px #09294758,0 2px 0 #B8A36A75}
+#lhJourneySpace .lh-journey-key-labels{display:flex;justify-content:space-between;max-width:360px;gap:12px}
+#lhJourneySpace .lh-journey-key-labels span{font-size:10px!important;color:#35556B!important;font-weight:750}
+#lhJourneySpace .lh-journey-palette-name{color:#0D3B66!important;font-weight:750;font-size:11px!important}
+#lhJourneySpace .lh-journey-console{border:1px solid #D7BF7B!important;box-shadow:0 5px 0 #A8A18B70,0 13px 25px #081E3455!important}
+#lhJourneySpace .lh-journey-controls button{border-bottom:3px solid #06243D!important;box-shadow:inset 0 1px 0 #ffffff44!important}
+#lhJourneySpace .lh-journey-controls button:hover{transform:translateY(-1px);filter:brightness(1.09)}
+ 
+
+body>header .brand{background:linear-gradient(142deg,#205278 0%,#0D3B66 57%,#092F53 100%)!important;border-right:1px solid #4B7896!important;border-bottom:3px solid #071F37!important;box-shadow:inset 0 1px 0 #ffffff2b,inset 5px 0 0 #F4D35E4d,0 5px 14px #0921354d!important;transform:none!important;position:relative!important}
+body>header .brand .logo{width:52px!important;height:58px!important;min-width:52px!important;object-fit:contain!important;transform:none!important;filter:drop-shadow(0 5px 4px #03182baf)!important;clip-path:none!important;border:0!important;border-radius:0!important}
+body>header .brand-text h1{font-size:22px!important;letter-spacing:-.035em!important;text-shadow:0 2px 0 #052D50!important}
+body>header .brand-text .lh-brand-slogan{color:#F5F6EE!important;font-size:11px!important;line-height:1.34!important}
+body>header .brand-credit{font-size:11px!important;color:#ECF1F2!important}
+.terrain-rail .lh-nav-entry>button{border-bottom:3px solid #051F37!important;box-shadow:inset 0 1px 0 #ffffff31,0 3px 0 #062238,0 7px 12px #031d3159!important;transform-style:preserve-3d!important}
+.terrain-rail .lh-nav-entry>button svg{filter:drop-shadow(1px 2px 0 #04233e80);transform:translateZ(8px);transition:transform .16s ease!important}
+.terrain-rail .lh-nav-entry>button:hover svg{transform:translateZ(12px) translateY(-1px)!important}
+.terrain-rail .lh-nav-entry>button.lh-quicknav-active{box-shadow:inset 0 1px 0 #fff3bd,0 3px 0 #BA9429,0 8px 17px #041c2f88!important;border-bottom-color:#BE992C!important}
+@media(max-height:690px){#lhJourneySpace .lh-journey-compass{min-height:130px;right:10px;top:8px;padding:5px!important}#lhJourneySpace .lh-journey-compass svg{width:59px;height:59px}}
+@media(prefers-reduced-motion:reduce){#lhJourneyCompassDial,#lhJourneySpace .lh-journey-compass,.terrain-rail .lh-nav-entry>button svg{transition:none!important}}
+
+
+#statsDialog .insights-main{--lh-readable-ink:#0D3B66;--lh-readable-muted:#35556B;--lh-readable-paper:#FFFDF7}
+#statsDialog .data-studio .data-filters,
+#statsDialog .data-studio .data-columns{background:#FFFDF7!important;border:1px solid #D4D0B9!important;border-radius:8px!important;box-shadow:none!important;padding:14px 16px!important}
+#statsDialog .data-studio .data-filters label,
+#statsDialog .data-studio .data-columns summary,
+#statsDialog .data-studio .data-column-choices label{color:#0D3B66!important;font-size:13px!important;line-height:1.4!important;opacity:1!important}
+#statsDialog .data-studio :is(input[type=search],input[type=date],select){background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #A3B3BB!important;border-radius:7px!important}
+#statsDialog .data-studio #dataClear,
+#statsDialog .data-studio #dataResetColumns{background:#F4D35E!important;color:#0D3B66!important;border:1px solid #C6A83B!important;border-radius:7px!important;font-weight:750!important}
+#statsDialog .data-studio .data-column-choices{gap:4px 14px!important}
+#statsDialog .data-studio .data-column-choices label{background:transparent!important;border:0!important;border-radius:0!important;padding:4px!important;box-shadow:none!important;display:flex;gap:8px!important}
+#statsDialog .data-studio .data-column-choices input{accent-color:#0D3B66!important}
+#statsDialog .data-studio .data-scroll{background:#FFFDF7!important;border:1px solid #C5CFCF!important;border-radius:8px!important;scrollbar-color:#557E98 #FFFDF7!important}
+#statsDialog #dataTable{border-collapse:collapse!important;border-spacing:0!important}
+#statsDialog #dataTable th{background:#0D3B66!important;border:0!important;border-bottom:2px solid #F4D35E!important}
+#statsDialog #dataTable th button{color:#FFFDF7!important;background:transparent!important;border:0!important;border-radius:0!important;box-shadow:none!important;font-weight:750!important;padding:11px 12px!important}
+#statsDialog #dataTable td,#statsDialog #dataTable tr:nth-child(even) td{background:#FFFDF7!important;color:#0D3B66!important;border-bottom:1px solid #DEE3DC!important;padding:10px 12px!important}
+#statsDialog #dataTable tr:nth-child(even) td{background:#F4F4EC!important}
+#statsDialog #dataTable tr:hover td{background:#F5E9C6!important}
+#statsDialog #dataTable td :is(a,button),
+#statsDialog #dataTable td.data-name button{display:inline!important;padding:0!important;margin:0!important;background:transparent!important;color:#0D3B66!important;border:0!important;border-radius:0!important;text-decoration:underline!important;text-underline-offset:3px!important;font-weight:700!important;box-shadow:none!important}
+#statsDialog #dataTable .data-excluded{color:#7D4A00!important;font-weight:700!important}
+#statsDialog .data-studio :is(.data-summary,.data-note,.data-pagination,#dataPageStatus){color:#35556B!important;opacity:1!important}
+#statsDialog .data-studio .data-pagination button{border-radius:7px!important;box-shadow:none!important}
+ 
+#statsDialog #statsYearbook :is(.metric,.v120-card,.yearbook-card,.record-metric,.sport-row,.bike-row){background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #D0D9D5!important;box-shadow:none!important}
+#statsDialog #statsYearbook :is(.metric,.v120-card,.yearbook-card,.record-metric,.sport-row,.bike-row) :is(strong,h2,h3,h4,h5,b){color:#0D3B66!important;text-shadow:none!important;opacity:1!important}
+#statsDialog #statsYearbook :is(.metric,.v120-card,.yearbook-card,.record-metric,.sport-row,.bike-row) :is(p,span,small,label,.muted){color:#35556B!important;opacity:1!important}
+#statsDialog #statsYearbook .v120-card :is(table,td,th){color:#0D3B66!important}
+#statsDialog #statsYearbook .v120-card :is(a,button){color:#0D3B66!important}
+#statsDialog #statsYearbook .v120-card button.primary{background:#F4D35E!important;color:#0D3B66!important}
+#statsDialog #statsYearbook :is(.v120-toolbar label,#yearbookStatus){color:#35556B!important}
+ 
+
+#statsDialog #statsAdvanced .advanced-graph,
+#statsDialog #statsAdvanced .advanced-graph-grid>.advanced-graph{background:#FFFDF7!important;border:0!important;border-radius:0!important;box-shadow:none!important;padding:16px 12px!important;color:#0D3B66!important;border-bottom:1px solid #D3D5CB!important}
+#statsDialog #statsAdvanced .advanced-graph :is(h5,strong,label){color:#0D3B66!important;opacity:1!important}
+#statsDialog #statsAdvanced .advanced-graph :is(p,span,small,summary,.muted){color:#35556B!important;opacity:1!important}
+#statsDialog #statsAdvanced .advanced-graph svg text,
+#statsDialog #statsAdvanced .advanced-graph svg .plot-tick,
+#statsDialog #statsAdvanced .advanced-graph svg .plot-label{fill:#0D3B66!important;opacity:1!important}
+#statsDialog #statsAdvanced .advanced-table{background:#FFFDF7!important;color:#0D3B66!important;border:0!important}
+#statsDialog #statsAdvanced .advanced-table summary{background:#F1EEDC!important;color:#0D3B66!important;border-radius:5px!important;padding:8px 10px!important}
+#statsDialog #statsAdvanced .advanced-table :is(td,th){color:#0D3B66!important;border-color:#D9DDD6!important}
+ 
+#statsDialog #statsAnalytics .analytics-card{background:#FFFDF7!important;color:#0D3B66!important;border:1px solid #CED5CD!important;box-shadow:none!important}
+#statsDialog #statsAnalytics .analytics-card :is(h4,h5,strong,label){color:#0D3B66!important;opacity:1!important}
+#statsDialog #statsAnalytics .analytics-card :is(p,small,span,.muted,.analytics-card-summary){color:#35556B!important;opacity:1!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-plot{background:#FFFDF7!important;border-radius:6px!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-plot :is(.plot-tick,.plot-label){fill:#35556B!important;opacity:1!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-plot .plot-line-new{stroke:#0D3B66!important;stroke-width:3.2!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-plot .plot-dot-new{fill:#0D3B66!important;stroke:#FFFDF7!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-plot .plot-area-new{fill:#F4D35E!important;opacity:.24!important}
+#statsDialog #statsAnalytics .analytics-card :is(.analytics-table,.analytics-card-tools){border-color:#D5D9CC!important;color:#0D3B66!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-table summary{background:#F3F0E7!important;color:#0D3B66!important;border:0!important}
+#statsDialog #statsAnalytics .analytics-card .analytics-card-buttons button{background:#0D3B66!important;color:#FFFDF7!important}
+ 
+#statsDialog #statsOverview :is(.details-repair,.insights-content-card,.sport-row,.bike-row) :is(.muted,small,p){color:#35556B!important}
+#statsDialog .insights-main .coverage,#statsDialog .insights-main .coverage *{color:#0D3B66!important;opacity:1!important}
+#statsDialog .insights-main .v121-compare-metric-row :is(.v121-a,.v121-b,.v121-delta){opacity:1!important}
+#statsDialog .insights-main .v121-compare-metric-row .v121-b{color:#755000!important}
+#statsDialog .insights-main .insights-footer :is(p,span,.muted,small){color:#35556B!important}
+ 
+#statsDialog .insights-main :is(details.analytics-table,details.advanced-table,details.data-columns) summary{color:#0D3B66!important}
+#statsDialog .insights-main .stats-story-section>p.muted{color:#35556B!important}
+
+
+#statsDialog .insights-main #statsData #dataTable td,
+#statsDialog .insights-main #statsData #dataTable tr:nth-child(odd) td{background:#FFFDF7!important;color:#0D3B66!important;border-bottom:1px solid #DEE3DC!important}
+#statsDialog .insights-main #statsData #dataTable tr:nth-child(even) td{background:#F4F4EC!important;color:#0D3B66!important}
+#statsDialog .insights-main #statsData #dataTable tr:hover td{background:#F5E9C6!important}
+#statsDialog .insights-main #statsData #dataTable td.data-name button,
+#statsDialog .insights-main #statsData #dataTable td :is(a,button){color:#0D3B66!important;background:transparent!important;border:0!important;padding:0!important;border-radius:0!important;box-shadow:none!important;text-decoration:underline!important;text-underline-offset:3px!important}
+
+ 
+body>header .brand{
+  background:linear-gradient(180deg,#113F6A 0%,#103C65 60%,#0D365C 100%)!important;
+  border:0!important;border-right:1px solid #3D6783!important;
+  border-bottom:1px solid #426B89!important;
+  box-shadow:inset 0 1px 0 #F7F5E71F,inset 0 -3px 0 #062B4B5C!important;
+  transform:none!important;isolation:isolate!important;
+}
+body>header .brand::before,body>header .brand::after{content:none!important;display:none!important}
+body>header .brand .logo{width:55px!important;height:60px!important;min-width:55px!important;
+  transform:none!important;background:transparent!important;filter:drop-shadow(0 4px 4px #031c3199)!important}
+body>header .brand-text h1{font-size:21px!important;letter-spacing:-.045em!important;text-shadow:0 1px 0 #042946}
+body>header .brand-credit{background:none!important;border:0!important;padding:0!important;box-shadow:none!important}
+.workspace>aside .lh-workspace-title::after{content:none!important;display:none!important}
+#lhJourneySpace .lh-journey-controls #lhJourneyDetail{background:#E8EFE9!important;color:#0D3B66!important;border:1px solid #92AABD!important;
+  min-width:65px;font-size:12px!important}
+#lhJourneySpace .lh-journey-controls #lhJourneyDetail[aria-pressed="true"]{background:#F4D35E!important;color:#0D3B66!important;border-color:#BE982D!important}
+#lhJourneySpace .lh-journey-console{background:linear-gradient(#FFF8DE,#FAF0CA)!important}
+#lhJourneySpace .lh-journey-hint{font-size:12px!important;line-height:1.4}
+ 
+#lhJourneySpace .lh-journey-stage{background:#0A2B48!important}
+#lhJourneySpace .lh-journey-inspector{border-left:3px solid #F4D35E!important}
+ 
+
+.terrain-rail .lh-nav-entry>button{border-radius:12px!important;transition:transform .14s ease,box-shadow .14s ease,background .14s ease!important}
+.terrain-rail .lh-nav-entry>button:hover{transform:translateY(-2px)!important;box-shadow:inset 0 1px 0 #ffffff4D,0 5px 0 #061F36,0 10px 16px #06172888!important}
+.terrain-rail .lh-nav-entry>button:active{transform:translateY(1px)!important;box-shadow:inset 0 2px 5px #031B30AA,0 1px 0 #061F36!important}
+.terrain-rail .lh-nav-entry>button:focus-visible,#lhJourneyDetail:focus-visible{outline:3px solid #F4D35E!important;outline-offset:2px!important}
+@media(prefers-reduced-motion:reduce){.terrain-rail .lh-nav-entry>button{transition:none!important;transform:none!important}}
+
+
+ 
+body>header{justify-content:space-between!important;column-gap:clamp(18px,4vw,55px)!important}
+body>header .brand{background:transparent!important;border:0!important;border-radius:0!important;box-shadow:none!important;
+ padding:0!important;margin:0!important;min-width:0!important;max-width:100%!important;width:100%!important;
+ flex:1 1 auto!important;align-items:center!important;gap:13px!important;isolation:auto!important}
+body>header .brand::before,body>header .brand::after{display:none!important;content:none!important}
+body>header .brand .logo{width:52px!important;height:52px!important;min-width:52px!important;filter:none!important;box-shadow:none!important;transform:none!important;background:none!important}
+body>header .brand-text{min-width:0!important;gap:3px!important;align-items:flex-start!important;padding:0!important}
+body>header .brand-text h1{font-size:21px!important;line-height:1.06!important;margin:0!important;text-shadow:none!important}
+body>header .brand-text>.lh-brand-slogan{max-width:100%!important;line-height:1.35!important;margin:0!important}
+body>header .brand-credit{margin:0!important;line-height:1.35!important}
+body>header .header-actions{flex:0 1 auto!important;min-width:0!important;flex-wrap:wrap!important;justify-content:flex-end!important}
+ 
+#statsDialog .insights-main .stats-sport-card .sport-summary{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:2px!important;min-width:0!important}
+#statsDialog .insights-main .stats-sport-card .sport-row{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(86px,max-content)!important;
+ align-items:start!important;column-gap:14px!important;row-gap:4px!important;width:100%!important;min-width:0!important;margin-right:0!important;box-sizing:border-box!important}
+#statsDialog .insights-main .stats-sport-card .sport-row span{min-width:0!important;white-space:normal!important;overflow-wrap:anywhere!important;word-break:normal!important;overflow:visible!important;text-overflow:clip!important;line-height:1.45!important}
+#statsDialog .insights-main .stats-sport-card .sport-row strong{max-width:100%!important;min-width:0!important;white-space:normal!important;text-align:right!important;line-height:1.45!important;overflow-wrap:normal!important}
+#statsDialog .insights-main .stats-sport-card .sport-row.bike-row{margin-left:0!important;padding-left:14px!important}
+ 
+
+@media(min-width:881px){
+ .workspace>.terrain-rail{grid-column:1!important;grid-row:1!important}
+ .workspace>aside{grid-column:2!important;grid-row:1!important}
+ .workspace>main#map{grid-column:3!important;grid-row:1!important}
+ #lhCalendarWorkspace{grid-column:3 / -1!important;grid-row:1!important;height:100vh!important;max-height:100vh!important}
+}
+@media(max-width:880px){
+ .workspace>.terrain-rail{grid-column:1!important;grid-row:1!important}
+ .workspace>aside{grid-column:2!important;grid-row:1!important}
+ .workspace>main#map{grid-column:1 / -1!important;grid-row:2!important}
+ #lhCalendarWorkspace{grid-column:1 / -1!important;grid-row:2!important;min-height:75vh!important;height:auto!important;max-height:none!important}
+}
+ 
+
+@media(min-width:901px){
+ .terrain-rail .lh-quicknav{gap:7px!important;margin-top:12px!important}
+ .terrain-rail .lh-quicknav button{min-height:59px!important;gap:5px!important;padding:7px 3px!important}
+ .workspace{grid-template-rows:minmax(0,1fr)!important}
+ .workspace>aside{min-height:0!important;max-height:100vh!important}
+ .workspace>.terrain-rail{height:100vh!important;max-height:100vh!important;min-height:0!important}
+}
+@media(max-width:880px){
+ .workspace>.terrain-rail{height:auto!important;min-height:69px!important;max-height:none!important;
+  padding:7px 9px!important;order:0!important;align-items:center!important;gap:0!important}
+ .terrain-rail .lh-quicknav{display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr))!important;
+  flex:1 1 auto!important;gap:5px!important;width:100%!important;min-width:0!important;align-items:stretch!important}
+ .terrain-rail .lh-quicknav .lh-nav-entry{min-width:0!important;width:auto!important}
+ .terrain-rail .lh-quicknav .lh-nav-entry>button{min-height:57px!important;max-height:67px!important;
+  padding:5px 1px!important;gap:3px!important;font-size:9px!important}
+ .terrain-rail .lh-quicknav .lh-nav-entry>button span{font-size:9px!important}
+ .terrain-rail .lh-nav-utilities{display:none!important}
+ #lhCalendarWorkspace{order:1!important}
+ .workspace>main#map{order:2!important}
+ .workspace>aside{order:3!important}
+ .workspace:has(#lhCalendarWorkspace:not([hidden]))>main#map,
+ .workspace:has(#lhCalendarWorkspace:not([hidden]))>aside{display:none!important}
+}
+ 
+#lhCalendarWorkspace[hidden]{display:none!important}
+#lhCalendarWorkspace{grid-column:3 / -1;grid-row:1;z-index:8;position:relative;min-width:0;min-height:0;height:100%;overflow:auto;
+ background:radial-gradient(ellipse at 97% 0,#F4D35E28,transparent 34%),linear-gradient(145deg,#F8F5E9,#F0F3EC 63%,#E6EEEC);color:#123753;
+ padding:clamp(17px,2.5vw,37px);scrollbar-color:#B4C7C2 transparent}
+.workspace:has(#lhCalendarWorkspace:not([hidden]))>.terrain-rail{z-index:12!important}
+.lh-cal-shell{max-width:1360px;margin:0 auto;min-width:0}
+.lh-cal-top{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap;padding-bottom:19px;border-bottom:1px solid #CBD9D5}
+.lh-cal-eyebrow{font-size:11px;font-weight:850;letter-spacing:.17em;color:#477483;text-transform:uppercase}
+.lh-cal-top h2{font-size:clamp(27px,3.4vw,43px);line-height:1.08;letter-spacing:-.055em;margin:6px 0 7px;color:#0D3B66}
+.lh-cal-top p{color:#526B7A;font-size:13px;line-height:1.5;margin:0;max-width:620px}
+.lh-cal-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#lhCalFocus{min-width:185px;padding:11px;border:1px solid #B4C7C8;color:#0D3B66;background:#FFFCF4;border-radius:11px;font-weight:700}
+#lhCalendarWorkspace button{font:inherit;color:#0D3B66}
+#lhCalendarWorkspace button:focus-visible,#lhCalendarWorkspace select:focus-visible{outline:3px solid #C4971F!important;outline-offset:3px}
+.lh-cal-segment{display:flex;gap:3px;border-radius:12px;padding:4px;background:#DCE7E2;border:1px solid #B8CCC5}
+.lh-cal-segment button{border:0!important;background:transparent!important;padding:9px 14px!important;font-size:12px!important;font-weight:800!important;border-radius:9px!important;box-shadow:none!important}
+#lhCalendarWorkspace .lh-cal-segment button[aria-pressed=false]{color:#0D3B66!important;opacity:1!important}
+.lh-cal-segment button[aria-pressed=true]{background:#0D3B66!important;color:#FFFDF3!important;box-shadow:0 3px 0 #082741!important}
+#lhCalBack{border:1px solid #96B2BA!important;border-radius:10px!important;background:#FFFDF7!important;padding:11px 13px!important;font-size:12px!important;font-weight:800!important}
+.lh-cal-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;margin:20px 0}
+.lh-cal-metric{min-width:0;background:#FFFDF7;border:1px solid #CBD8D0;border-radius:14px;padding:14px 16px;box-shadow:0 4px 0 #C9D8D082,0 12px 20px #0B34500A}
+.lh-cal-metric strong{display:block;font-size:clamp(18px,2vw,26px);letter-spacing:-.045em;color:#0D3B66;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.lh-cal-metric span{display:block;color:#5D7380;font-size:11px;font-weight:750;margin-top:4px}
+.lh-cal-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(260px,1fr);gap:18px;align-items:start;min-width:0}
+.lh-cal-board,.lh-cal-aside section{background:#FFFDF8;border:1px solid #C8D8D3;border-radius:17px;padding:clamp(13px,1.9vw,22px);box-shadow:0 7px 0 #C9D8D08A,0 18px 30px #0C385013;min-width:0}
+.lh-cal-board-head{display:flex;justify-content:space-between;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:18px}
+.lh-cal-board-head strong{font-size:clamp(19px,2.5vw,27px);letter-spacing:-.045em;color:#0D3B66}
+.lh-cal-navigation{display:flex;gap:7px;align-items:center}
+.lh-cal-navigation button{min-width:36px;min-height:36px;padding:7px!important;border:1px solid #ACC5C6!important;border-radius:9px!important;background:#E9F1EE!important;font-weight:900!important}
+.lh-cal-navigation #lhCalToday{font-size:11px!important;padding:8px 10px!important}
+.lh-cal-weekdays,.lh-cal-days{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px}
+.lh-cal-weekdays{margin-bottom:7px}.lh-cal-weekdays span{font-size:10px;font-weight:800;text-align:center;color:#537181;padding:4px 0}
+.lh-cal-days button{min-width:0;min-height:clamp(57px,6.1vw,91px);display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;
+ gap:3px;padding:9px!important;border:1px solid #DFE7E3!important;background:#F6F8F4!important;border-radius:10px!important;
+ box-shadow:inset 0 1px #FFF!important;text-align:left!important;transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease!important}
+#lhCalendarWorkspace #lhCalBack,#lhCalendarWorkspace #lhCalToday,#lhCalendarWorkspace #lhCalLatest,
+#lhCalendarWorkspace .lh-cal-navigation button,#lhCalendarWorkspace .lh-cal-day-list button,
+#lhCalendarWorkspace .lh-cal-year-mini button{color:#0D3B66!important;opacity:1!important}
+#lhCalendarWorkspace .lh-cal-days button{color:#0D3B66!important;opacity:1!important}
+#lhCalendarWorkspace .lh-cal-days button[aria-pressed=true]{color:#FFFDF7!important}
+#lhCalMiniMonths{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+.lh-cal-year-mini button{display:flex!important;flex-direction:column!important;align-items:stretch!important;
+ justify-content:flex-start!important;gap:0!important;white-space:normal!important;line-height:1.2!important}
+.lh-cal-year-mini button strong,.lh-cal-year-mini button small{max-width:100%!important;min-width:0!important;
+ overflow-wrap:anywhere!important;white-space:normal!important;line-height:1.25!important}
+.lh-cal-year-mini .lh-cal-mini-dots{width:100%!important;min-width:0!important;align-self:stretch!important}
+.lh-cal-days button[data-active=true]{background:linear-gradient(155deg,#FFF6DC,#FFFDF7)!important;border-color:#E4CA7D!important;box-shadow:inset 0 2px #FFF6D8,0 3px 0 #DFCCA0!important}
+.lh-cal-days button:hover{transform:translateY(-2px);box-shadow:0 5px 0 #BFD2CB!important;border-color:#6A9D9C!important}
+.lh-cal-days button[aria-pressed=true]{background:#0D3B66!important;border-color:#0D3B66!important;box-shadow:0 4px 0 #082741!important;color:#FFFDF7!important}
+.lh-cal-day-number{font-size:12px;font-weight:900;font-variant-numeric:tabular-nums}
+.lh-cal-day-amount{font-size:10px;font-weight:850;color:#8A601B;line-height:1.24;overflow-wrap:anywhere}
+.lh-cal-days button[aria-pressed=true] .lh-cal-day-amount{color:#F4D35E}
+.lh-cal-day-distance{color:#526D7C;font-size:9px;font-weight:750;overflow-wrap:anywhere}
+.lh-cal-days button[aria-pressed=true] .lh-cal-day-distance{color:#DFE9ED}
+.lh-cal-empty-cell{min-height:55px}
+.lh-cal-aside{display:grid;gap:17px;min-width:0}
+.lh-cal-aside section h3{margin:0 0 5px;color:#0D3B66;font-size:16px;letter-spacing:-.02em}
+.lh-cal-aside section p{margin:0 0 12px;color:#526C7A;font-size:11px;line-height:1.5}
+.lh-cal-year-mini{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.lh-cal-year-mini button{border:1px solid #CADAD4!important;border-radius:10px!important;background:#F4F7F2!important;padding:8px 6px!important;text-align:left!important;min-width:0;box-shadow:0 2px 0 #D7E1DD!important}
+.lh-cal-year-mini button:hover,.lh-cal-year-mini button[aria-pressed=true]{border-color:#B89335!important;background:#FFF2C9!important}
+.lh-cal-year-mini strong{font-size:11px;color:#0D3B66;display:block}
+.lh-cal-year-mini small{font-size:9px;color:#617A83;display:block;line-height:1.4;margin:3px 0 6px}
+.lh-cal-mini-dots{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:2px}
+.lh-cal-mini-dots i{height:5px;border-radius:2px;background:#DEE7E2}
+.lh-cal-mini-dots i[data-level='1']{background:#DCC779}.lh-cal-mini-dots i[data-level='2']{background:#F4B44C}.lh-cal-mini-dots i[data-level='3']{background:#DA6352}
+.lh-cal-day-list{display:grid;gap:9px;max-height:340px;overflow:auto}
+.lh-cal-ride{padding:11px;border:1px solid #CBDDD3;border-radius:11px;background:#F6F8F3;min-width:0}
+.lh-cal-ride strong{display:block;color:#123C57;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.lh-cal-ride small{display:block;color:#587482;font-size:10px;line-height:1.5;margin:4px 0 8px}
+.lh-cal-ride-actions{display:flex;flex-wrap:wrap;gap:5px}
+.lh-cal-ride-actions button,#lhCalLatest{font-size:10px!important;border:1px solid #92ADB7!important;background:#E5EFED!important;padding:7px 9px!important;border-radius:8px!important;font-weight:800!important}
+.lh-cal-ride-actions button:first-child{background:#0D3B66!important;color:#FFFDF7!important}
+#lhCalLatest{margin-top:10px!important;width:100%;font-size:11px!important}
+.lh-cal-no-ride{font-size:12px;color:#607884;line-height:1.6;padding:10px 0}
+.lh-cal-year-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.lh-cal-year-grid .lh-cal-year-mini button{padding:15px!important;min-height:145px}
+.lh-cal-year-grid .lh-cal-year-mini strong{font-size:15px}
+.lh-cal-year-grid .lh-cal-mini-dots i{height:9px}
+.lh-cal-note{margin:15px 0 0;color:#5C7582;font-size:11px;line-height:1.6}
+@media(max-width:1170px){.lh-cal-layout{grid-template-columns:minmax(0,1fr)}.lh-cal-aside{grid-template-columns:1fr 1fr}.lh-cal-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:880px){#lhCalendarWorkspace{grid-column:1 / -1;grid-row:2;height:auto;min-height:77vh;padding:17px}.lh-cal-aside{grid-template-columns:1fr}.lh-cal-year-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:570px){body>header .brand{max-width:100%!important;flex-basis:100%!important}body>header .brand .logo{width:48px!important;height:48px!important;min-width:48px!important}#lhCalendarWorkspace{padding:11px}.lh-cal-top h2{font-size:25px}.lh-cal-metrics{gap:6px}.lh-cal-metric{padding:9px}.lh-cal-metric strong{font-size:17px}.lh-cal-weekdays,.lh-cal-days{gap:3px}.lh-cal-days button{padding:5px!important;min-height:59px}.lh-cal-day-number{font-size:11px}.lh-cal-day-amount,.lh-cal-day-distance{font-size:8px}.lh-cal-year-grid{grid-template-columns:1fr 1fr}.lh-cal-aside section,.lh-cal-board{padding:11px}}
+@media(prefers-reduced-motion:reduce){.lh-cal-days button{transition:none!important}.lh-cal-days button:hover{transform:none!important}}
+
+
+ 
+#statsDialog,#lhCalendarWorkspace{--lh-ink:#0D3B66;--lh-edge:#BBD0CC;--lh-light:#FFFDF8;--lh-lift:0 3px 0 #C5D6D1,0 10px 19px #0B345015,inset 0 1px 0 #FFFFFF;--lh-lift-hover:0 6px 0 #B9CDC6,0 18px 26px #0B34501F,inset 0 1px 0 #FFFFFF}
+ 
+#statsDialog .insights-main article.stats-sport-card{padding:21px 24px 23px!important;overflow:visible!important}
+#statsDialog .insights-main .stats-sport-card #sportSummary{gap:8px!important;min-width:0!important;width:100%!important}
+#statsDialog .insights-main .stats-sport-card #sportSummary .sport-row{grid-template-columns:minmax(0,1fr) minmax(96px,max-content)!important;gap:5px 22px!important;
+ align-items:center!important;box-sizing:border-box!important;max-width:100%!important;width:100%!important;min-width:0!important;
+ margin:0!important;padding:12px 18px!important;border:1px solid #D6E3DD!important;border-radius:10px!important;
+ background:linear-gradient(155deg,#FFFEFA,#F3F8F3)!important;line-height:1.5!important;min-height:45px!important}
+#statsDialog .insights-main .stats-sport-card #sportSummary .sport-row.bike-row{width:calc(100% - 16px)!important;margin-left:16px!important;
+ padding:10px 18px!important;border-left:3px solid #94B5B4!important;background:#F8FAF6!important;min-height:40px!important}
+#statsDialog .insights-main .stats-sport-card #sportSummary .sport-row span{font-size:13px!important;line-height:1.5!important;color:#244B66!important}
+#statsDialog .insights-main .stats-sport-card #sportSummary .sport-row strong{font-size:13px!important;font-weight:800!important;color:#0D3B66!important;
+ text-align:right!important;line-height:1.5!important;overflow-wrap:anywhere!important;padding-left:7px!important;max-width:100%!important;justify-self:end!important}
+ 
+#lhCalendarWorkspace{padding:clamp(16px,2vw,28px)!important}
+#lhCalendarWorkspace .lh-cal-shell{max-width:1480px!important}
+#lhCalendarWorkspace .lh-cal-top{padding-bottom:13px!important;gap:14px!important}
+#lhCalendarWorkspace .lh-cal-top h2{font-size:clamp(26px,2.7vw,37px)!important}
+#lhCalendarWorkspace .lh-cal-metrics{margin:12px 0 16px!important;gap:10px!important}
+#lhCalendarWorkspace .lh-cal-metric{padding:10px 15px!important}
+#lhCalendarWorkspace .lh-cal-layout{grid-template-columns:minmax(0,1.56fr) minmax(295px,.93fr)!important;gap:16px!important;align-items:start!important}
+#lhCalendarWorkspace .lh-cal-aside{display:flex!important;flex-direction:column!important;gap:16px!important;min-width:0!important}
+#lhCalendarWorkspace .lh-cal-day-panel{order:0!important;min-width:0!important}
+#lhCalendarWorkspace .lh-cal-year-details{order:1!important;min-width:0!important;display:block;border:1px solid #C8D8D3!important;
+ border-radius:16px!important;background:#FFFDF8!important;box-shadow:var(--lh-lift)!important;overflow:hidden}
+#lhCalendarWorkspace .lh-cal-year-details>summary{display:flex!important;align-items:center!important;justify-content:space-between!important;cursor:pointer!important;
+ gap:12px!important;padding:15px 17px!important;list-style:none!important;color:#0D3B66!important}
+#lhCalendarWorkspace .lh-cal-year-details>summary::-webkit-details-marker{display:none}
+#lhCalendarWorkspace .lh-cal-year-details>summary strong{display:block;color:#0D3B66;font-size:14px;font-weight:850}
+#lhCalendarWorkspace .lh-cal-year-details>summary small{display:block;color:#526C7A;font-size:11px;margin-top:3px}
+#lhCalendarWorkspace .lh-cal-year-details[open] .lh-cal-expand-indicator{transform:rotate(180deg)}
+#lhCalendarWorkspace .lh-cal-expand-indicator{font-size:17px;transition:transform .15s}
+#lhCalendarWorkspace .lh-cal-year-details-inner{padding:0 16px 18px!important;border-top:1px solid #D5E0DA!important}
+#lhCalendarWorkspace .lh-cal-year-details-inner>p{font-size:11px;color:#536D7C;line-height:1.45}
+#lhCalendarWorkspace .lh-cal-day-eyebrow{color:#8D661C;font-size:10px;font-weight:900;letter-spacing:.105em;margin-bottom:9px}
+#lhCalendarWorkspace .lh-cal-day-panel h3{font-size:clamp(17px,1.45vw,22px)!important;line-height:1.2!important;margin:0 0 9px!important}
+#lhCalendarWorkspace .lh-cal-day-panel>p{font-size:12px!important;line-height:1.5!important}
+#lhCalendarWorkspace .lh-cal-day-list{max-height:min(66vh,650px)!important;overflow:auto!important;gap:10px!important}
+#lhCalendarWorkspace .lh-cal-ride{padding:13px 14px!important;background:#F5F9F5!important;border-color:#BBD2CE!important}
+#lhCalendarWorkspace .lh-cal-ride strong{font-size:13px!important;line-height:1.45!important;letter-spacing:0!important}
+#lhCalendarWorkspace .lh-cal-ride small{font-size:11px!important;line-height:1.6!important;margin:5px 0 10px!important}
+#lhCalendarWorkspace .lh-cal-ride-actions{gap:8px!important}
+#lhCalendarWorkspace .lh-cal-ride-actions button{min-height:34px!important;font-size:11px!important;padding:7px 11px!important;
+ box-shadow:0 2px 0 #BFCFCA!important;background:#EAF1ED!important;color:#0D3B66!important}
+ 
+#lhCalendarWorkspace .lh-cal-day-list .lh-cal-ride-actions button:first-child{background:#0D3B66!important;border-color:#082B4A!important;
+ color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important;opacity:1!important;box-shadow:0 3px 0 #07263E!important}
+#lhCalendarWorkspace .lh-cal-day-list .lh-cal-ride-actions button:first-child:hover{background:#164F7B!important}
+#lhCalendarWorkspace .lh-cal-segment button[aria-pressed="true"]{background:#0D3B66!important;color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important;opacity:1!important}
+#lhCalendarWorkspace .lh-cal-navigation button,#lhCalendarWorkspace .lh-cal-segment button[aria-pressed="false"],
+#lhCalendarWorkspace #lhCalLatest{color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important}
+#lhCalendarWorkspace .lh-cal-days button{min-height:clamp(60px,4.8vw,74px)!important;padding:8px!important}
+#lhCalendarWorkspace .lh-cal-board-head{margin-bottom:12px!important}
+#lhCalendarWorkspace .lh-cal-note{margin-top:10px!important}
+#lhCalendarWorkspace .lh-cal-layout:has(.lh-cal-year-grid) .lh-cal-year-details{display:none!important}
+ 
+#statsDialog .insights-main :is(.insights-content-card,.metric),
+#lhCalendarWorkspace :is(.lh-cal-board,.lh-cal-day-panel,.lh-cal-metric){box-shadow:var(--lh-lift)!important;
+ background-image:linear-gradient(160deg,#FFFDF9,#F8FAF4)!important;border-color:var(--lh-edge)!important}
+#statsDialog .insights-main #metricGrid .metric{transition:transform .16s ease,box-shadow .16s ease!important}
+#statsDialog .insights-main #metricGrid .metric:hover{transform:translateY(-2px);box-shadow:var(--lh-lift-hover)!important}
+#statsDialog .stats-tabs button,#lhCalendarWorkspace :is(.lh-cal-navigation button,.lh-cal-segment button),
+.terrain-rail .lh-quicknav button{transition:transform .14s ease,box-shadow .14s ease,background-color .14s ease!important}
+#statsDialog .stats-tabs button:hover,.terrain-rail .lh-quicknav button:hover{transform:translateY(-1px)}
+#statsDialog .stats-tabs button:active,.terrain-rail .lh-quicknav button:active,
+#lhCalendarWorkspace :is(.lh-cal-navigation button,.lh-cal-segment button):active{transform:translateY(2px)!important;box-shadow:0 1px 0 #B8C8C2!important}
+ 
+#statsDialog .lh-dashboard-controls{display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap;
+ padding:14px 18px;margin:2px 0 20px;border:1px solid #9EBDCA;border-radius:15px;
+ background:linear-gradient(155deg,#F6FAF5 0%,#EEF6F1 100%);box-shadow:0 4px 0 #C3D7D1,0 12px 26px #0B345015,inset 0 1px #FFFFFF}
+#statsDialog .lh-dashboard-controls-copy{display:flex;flex-direction:column;gap:3px;min-width:210px;flex:1 1 230px}
+#statsDialog .lh-dashboard-controls-copy .lh-dashboard-kicker{font-size:10px;font-weight:900;letter-spacing:.13em;color:#627E8D}
+#statsDialog .lh-dashboard-controls-copy>strong{font-size:16px;color:#0D3B66}
+#statsDialog .lh-dashboard-controls-copy>span:last-child{color:#526E7A;font-size:11px;line-height:1.45}
+#statsDialog .lh-dashboard-controls-actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+#statsDialog .lh-dashboard-controls-actions button,#statsDialog .lh-dashboard-editor button{
+ min-height:35px;padding:8px 12px;border:1px solid #93B3BE!important;border-radius:9px!important;
+ background:#FFFEF8!important;color:#0D3B66!important;font-size:12px!important;font-weight:750!important;line-height:1.3!important;
+ box-shadow:0 3px 0 #B7CCC7!important}
+#statsDialog .lh-dashboard-controls-actions button[aria-pressed="true"]{border-color:#D7BA6D!important;background:#FFF0BF!important}
+#statsDialog .lh-dashboard-controls-actions button:hover,#statsDialog .lh-dashboard-editor button:hover{transform:translateY(-1px);box-shadow:0 4px 0 #A8C0BD!important}
+#statsDialog .lh-dashboard-controls-actions button:active,#statsDialog .lh-dashboard-editor button:active{transform:translateY(2px)!important;box-shadow:0 1px 0 #A8C0BD!important}
+#statsDialog .lh-dashboard-editor{background:#FFFEF9;border:1px solid #B5CAC8;border-radius:15px;padding:18px;
+ margin:-6px 0 22px;box-shadow:0 4px 0 #C8D8D1,0 13px 19px #0C385014}
+#statsDialog .lh-dashboard-editor[hidden],#statsDialog .lh-dashboard-empty[hidden]{display:none!important}
+#statsDialog .lh-dashboard-editor-head{display:flex;justify-content:space-between;gap:15px;align-items:start;flex-wrap:wrap;margin-bottom:12px}
+#statsDialog .lh-dashboard-editor-head strong{font-size:15px;color:#0D3B66}
+#statsDialog .lh-dashboard-editor-head p{max-width:590px;font-size:11px;color:#486D7C;line-height:1.55;margin:4px 0 0}
+#statsDialog .lh-dashboard-editor-rows{display:grid;gap:8px}
+#statsDialog .lh-dashboard-editor-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;
+ min-width:0;border:1px solid #D4E1DA;background:#F6F9F4;border-radius:10px;padding:10px 12px}
+#statsDialog .lh-dashboard-editor-row.lh-drag-target{outline:2px solid #CEAC4E;outline-offset:1px}
+#statsDialog .lh-dashboard-editor-row>label{display:flex;align-items:center;gap:10px;min-width:0;color:#0D3B66;font-weight:800;font-size:13px}
+#statsDialog .lh-dashboard-editor-row>label>span{overflow-wrap:anywhere}
+#statsDialog .lh-dashboard-editor-row input[type="checkbox"]{width:18px;height:18px;accent-color:#0D3B66;flex:none}
+#statsDialog .lh-dashboard-editor-row-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+#statsDialog .lh-dashboard-editor-row-actions button{min-height:31px!important;min-width:34px;padding:6px 9px!important}
+#statsDialog .lh-dashboard-editor-row-actions button[aria-pressed="true"]{background:#FFF0BF!important;border-color:#D6B158!important}
+#statsDialog .lh-dashboard-editor-row-actions button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+#statsDialog .lh-dashboard-editor-row[draggable="true"]{cursor:grab}
+#statsDialog .lh-dashboard-empty{padding:24px;border:1px dashed #A9C4C0;border-radius:12px;color:#35556B!important;background:#F7FAF6}
+#statsDialog .stats-story-heading{display:flex;align-items:flex-start;gap:10px;justify-content:space-between}
+#statsDialog .lh-dash-pin{flex:none!important;width:37px;min-width:37px;height:37px;min-height:37px;padding:0!important;border-radius:9px!important;
+ border:1px solid #B8CAC4!important;background:linear-gradient(#FFFDF6,#F2F7F1)!important;color:#5B7383!important;
+ font-size:21px!important;line-height:1!important;box-shadow:0 3px 0 #CFDBD4!important}
+#statsDialog .lh-dash-pin[aria-pressed="true"]{color:#856017!important;background:#FFF0BF!important;border-color:#D5B969!important;box-shadow:0 3px 0 #D7C28C!important}
+#statsDialog .lh-dash-pin:hover{transform:translateY(-2px);box-shadow:0 5px 0 #C3D1C8!important}
+#statsDialog .lh-dash-favorite .stats-story-heading>.lh-dash-pin{background:#FFF0BF!important}
+#statsDialog .lh-dash-favorite{border-left:3px solid #E0B85B!important;padding-left:clamp(13px,1.5vw,21px)!important}
+@media(max-width:1200px){#lhCalendarWorkspace .lh-cal-layout{grid-template-columns:minmax(0,1.45fr) minmax(270px,1fr)!important}}
+@media(max-width:1100px){#lhCalendarWorkspace .lh-cal-layout{grid-template-columns:minmax(0,1fr)!important}
+ #lhCalendarWorkspace .lh-cal-aside{display:grid!important;grid-template-columns:minmax(0,1fr)!important}
+ #lhCalendarWorkspace .lh-cal-day-panel{order:0!important}#lhCalendarWorkspace .lh-cal-year-details{order:1!important}}
+@media(max-width:620px){#statsDialog .lh-dashboard-controls-actions{width:100%;justify-content:stretch}
+ #statsDialog .lh-dashboard-controls-actions button{flex:1 1 auto}
+ #statsDialog .lh-dashboard-editor-row{grid-template-columns:minmax(0,1fr);gap:10px}
+ #statsDialog .lh-dashboard-editor-row-actions{justify-content:flex-start}
+ #statsDialog .insights-main article.stats-sport-card{padding:14px 12px!important}
+ #statsDialog .insights-main .stats-sport-card #sportSummary .sport-row{grid-template-columns:minmax(0,1fr) minmax(79px,max-content)!important;padding:10px 11px!important;gap:7px!important}
+ #statsDialog .insights-main .stats-sport-card #sportSummary .sport-row.bike-row{margin-left:9px!important;width:calc(100% - 9px)!important;padding:10px 11px!important}
+ #lhCalendarWorkspace .lh-cal-days button{min-height:57px!important}}
+@media(prefers-reduced-motion:reduce){#statsDialog .lh-dashboard-controls-actions button,
+ #statsDialog .lh-dashboard-editor button,#statsDialog .insights-main #metricGrid .metric,
+ #lhCalendarWorkspace .lh-cal-expand-indicator{transition:none!important}
+ #statsDialog :is(.lh-dashboard-controls-actions button,.lh-dashboard-editor button,#metricGrid .metric):hover{transform:none!important}}
+
+
+ 
+#statsDialog .lh-dashboard-controls-actions button:not(.primary),
+#statsDialog .lh-dashboard-editor button:not(.primary){background:#FFFEF8!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border-color:#93B3BE!important}
+#statsDialog .lh-dashboard-controls-actions button:not(.primary)[aria-pressed="true"],
+#statsDialog .lh-dashboard-editor button:not(.primary)[aria-pressed="true"]{background:#FFF0BF!important;border-color:#D6B158!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important}
+#statsDialog .lh-dashboard-controls-actions button:not(.primary):hover,
+#statsDialog .lh-dashboard-editor button:not(.primary):hover{background:#EDF6F1!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border-color:#5F99A3!important}
+#statsDialog .lh-dash-pin:not(.primary){background:linear-gradient(#FFFDF6,#F2F7F1)!important;color:#55748A!important;-webkit-text-fill-color:#55748A!important;border-color:#B8CAC4!important}
+#statsDialog .lh-dash-pin:not(.primary)[aria-pressed="true"]{background:#FFF0BF!important;color:#8A5D12!important;-webkit-text-fill-color:#8A5D12!important;border-color:#D5B969!important}
+#statsDialog .lh-dash-pin:not(.primary):hover{background:#FFF1C6!important;color:#704A0B!important;-webkit-text-fill-color:#704A0B!important}
+#lhCalendarWorkspace .lh-cal-ride-actions{flex-wrap:nowrap!important}
+@media(max-width:520px){#lhCalendarWorkspace .lh-cal-ride-actions{flex-wrap:wrap!important}}
+
+
+ 
+ 
+@media(max-width:880px){
+ #statsDialog.lh-integrated-view,#sourceReviewDialog.lh-integrated-view{
+  top:var(--lh-mobile-rail-bottom,210px)!important;
+  inset:var(--lh-mobile-rail-bottom,210px) 0 0 0!important;
+  height:calc(100dvh - var(--lh-mobile-rail-bottom,210px))!important;
+  max-height:calc(100dvh - var(--lh-mobile-rail-bottom,210px))!important}
+}
+#statsDialog .insights-main .lh-dash-card .lh-dash-card-star:not(.primary){background:#FFF9E7!important;border-color:#D4B86A!important;color:#936B1E!important;-webkit-text-fill-color:#936B1E!important;box-shadow:0 2px 0 #DACDAA!important}
+#statsDialog .insights-main .lh-dash-card .lh-dash-card-star[aria-pressed="true"]:not(.primary){background:#F7E1A3!important;color:#725013!important;-webkit-text-fill-color:#725013!important}
+#statsDialog .insights-main .lh-dash-card .lh-dash-card-star:hover:not(.primary){background:#FFF0C5!important;box-shadow:0 3px 0 #D5C395!important}
+
+#statsDialog .lh-dash-card.lh-dash-drag-target{border-color:#D5AC4B!important;outline:2px solid #E7CA82;outline-offset:2px}
+
+.terrain-rail .lh-quicknav button#lhNavOverview{min-height:58px!important}
+@media(max-width:760px){.terrain-rail .lh-quicknav{grid-template-columns:repeat(6,minmax(0,1fr))!important;gap:4px!important}
+ .terrain-rail .lh-quicknav button{padding:5px 2px!important}}
+#statsDialog .stats-tabs{overflow-y:auto!important;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#658CA4 transparent}
+#statsDialog .lh-insights-nav-label{padding:12px 12px 5px;font-size:10px;letter-spacing:.14em;font-weight:900;color:#B9D3DE!important}
+#statsDialog .stats-tabs button{min-height:53px!important}
+#statsDialog .stats-panel.lh-insight-collection{max-width:1200px;margin-inline:auto}
+#statsDialog .stats-panel.lh-insight-collection>.stats-story-section{border-top:0!important;margin-top:0!important;padding-top:8px!important}
+#statsDialog #statsOverview>.stats-story-section{display:none!important}
+#statsDialog .lh-dashboard-board-head{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:18px 0 17px;flex-wrap:wrap}
+#statsDialog .lh-dashboard-board-head .lh-dashboard-board-eyebrow{color:#7B602A;font-size:10px;font-weight:850;letter-spacing:.12em}
+#statsDialog .lh-dashboard-board-head h4{margin:5px 0 3px;font-size:clamp(22px,2.6vw,32px);font-weight:870;letter-spacing:-.025em;color:#0D3B66!important}
+#statsDialog .lh-dashboard-board-head p{margin:0;font-size:12px;line-height:1.5;color:#506D7B;max-width:620px}
+#statsDialog #lhDashBoardCount{font-size:11px;color:#426476;font-weight:780;white-space:nowrap}
+#statsDialog .lh-dashboard-canvas{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:stretch;perspective:1200px}
+#statsDialog .lh-dash-card{--lh-light-x:27%;--lh-light-y:5%;position:relative;min-width:0;min-height:172px;overflow:hidden;display:flex;flex-direction:column;align-items:stretch;isolation:isolate;
+ padding:15px 17px 18px;border:1px solid #BFCFC9;border-bottom-color:#AFC3BE;border-radius:17px;
+ background:linear-gradient(153deg,#FFFFFF,#F4F8F4 78%);color:#0D3B66!important;
+ box-shadow:inset 0 1px 0 #FFFFFF,0 4px 0 #CDDAD3,0 12px 24px #0D3B6616;transition:transform .21s cubic-bezier(.2,.72,.3,1),box-shadow .21s,border-color .21s;transform:translateY(0);transform-style:preserve-3d}
+#statsDialog .lh-dash-card::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(ellipse at var(--lh-light-x) var(--lh-light-y),#FAE29B38,transparent 57%);opacity:.66;transition:opacity .2s}
+#statsDialog .lh-dash-card::after{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:linear-gradient(#F4D35E,#B8CED5 80%);opacity:.7}
+#statsDialog .lh-dash-card:hover{transform:translate3d(0,-3px,3px);border-color:#93B6B7;box-shadow:inset 0 1px #FFFFFF,0 6px 0 #B8CDC6,0 20px 29px #0D3B6622}
+#statsDialog .lh-dash-card:focus-within{border-color:#638FA5;box-shadow:0 0 0 2px #B2D7D1,0 4px 0 #C8D6D0}
+#statsDialog .lh-dash-card-favorite::after{background:linear-gradient(#E0B14D,#F7DF9A)}
+#statsDialog .lh-dash-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:27px;margin-bottom:13px}
+#statsDialog .lh-dash-card-category{font-size:10px;letter-spacing:.105em;text-transform:uppercase;font-weight:900;color:#587484!important}
+#statsDialog .lh-dash-card-star{flex:none;width:29px;min-width:29px;height:29px;min-height:29px;border:1px solid #BED0C8!important;background:#F7FAF3!important;color:#796C4A!important;-webkit-text-fill-color:#796C4A!important;border-radius:8px;padding:0!important;font-size:19px!important;line-height:1!important;box-shadow:0 2px 0 #CED8D1!important}
+#statsDialog .lh-dash-card-star[aria-pressed="true"]{background:#FFF0BF!important;color:#8B5E18!important;-webkit-text-fill-color:#8B5E18!important}
+#statsDialog .lh-dash-card-star:hover{transform:translateY(-1px);box-shadow:0 3px 0 #C6D7D0!important}
+#statsDialog .lh-dash-card-star:active{transform:translateY(1px)!important;box-shadow:0 1px 0 #C6D7D0!important}
+#statsDialog .lh-dash-card-star[hidden]{display:none!important}
+#statsDialog .lh-dash-card-value{display:block;min-width:0;margin:4px 0 8px;color:#0D3B66!important;font-size:clamp(24px,2.5vw,36px);line-height:1.12;letter-spacing:-.045em;font-weight:870;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+#statsDialog .lh-dash-card h5{color:#214B66!important;font-size:13px;line-height:1.4;font-weight:800;margin:0;overflow-wrap:anywhere;letter-spacing:0}
+#statsDialog .lh-dash-card p{font-size:11px;line-height:1.5;color:#536F7C!important;margin:9px 0 0;overflow-wrap:anywhere}
+#statsDialog .lh-dash-card-link{align-self:flex-start;min-height:31px;margin-top:auto;padding:7px 11px!important;background:#0D3B66!important;color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important;border:1px solid #062B4B!important;border-radius:8px!important;font-weight:750!important;font-size:11px!important;box-shadow:0 2px 0 #092740!important}
+#statsDialog .lh-dash-card-link:hover{background:#174D75!important}
+#statsDialog .lh-dash-chart-card{grid-column:span 2;min-height:240px}
+#statsDialog .lh-dash-chart-card h5{font-size:16px;margin:0 0 10px}
+#statsDialog .lh-dash-chart-card .lh-dash-chart-content{display:flex;flex-direction:column;gap:6px;min-width:0;padding:0!important;margin:auto 0 0!important}
+#statsDialog .lh-dash-chart-card .chart-row{min-width:0}
+#statsDialog .lh-dashboard-editor-tools{display:flex;align-items:end;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 12px}
+#statsDialog .lh-dash-search-label{display:flex;flex-direction:column;gap:5px;flex:1 1 240px;font-weight:780;color:#0D3B66!important;font-size:11px}
+#statsDialog #lhDashSearch{width:100%;height:39px;min-height:39px;border:1px solid #9BB9BF;border-radius:9px;background:#FFFDF8;color:#0D3B66!important;padding:8px 12px;font-size:13px}
+#statsDialog .lh-dash-priority{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:740;color:#315C70!important;margin-bottom:7px}
+#statsDialog .lh-dash-priority input{width:17px;height:17px;accent-color:#0D3B66}
+#statsDialog .lh-dashboard-editor-rows{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:46vh;overflow-y:auto;padding:2px 4px 4px 1px;scrollbar-width:thin}
+#statsDialog .lh-dashboard-editor-row{min-width:0;padding:9px 11px!important;gap:6px!important;cursor:grab}
+#statsDialog .lh-dashboard-editor-row>label{font-size:12px!important;line-height:1.25!important}
+#statsDialog .lh-dashboard-editor-label{display:flex;flex-direction:column;min-width:0;gap:3px}
+#statsDialog .lh-dashboard-editor-label>span{font-size:12px;color:#0D3B66;overflow-wrap:anywhere}
+#statsDialog .lh-dashboard-editor-label>small{color:#63808C;font-size:10px;font-weight:650}
+#statsDialog .lh-dashboard-editor-row-actions button{font-size:14px!important}
+#statsDialog .lh-dash-editor-noresults{grid-column:1/-1;color:#567282!important;margin:6px 0}
+#statsDialog .lh-dashboard-controls{background:linear-gradient(145deg,#F5FAF5,#E9F3F1)!important}
+#statsDialog .lh-dashboard-controls .lh-dashboard-controls-copy>strong{font-size:17px!important}
+@media(min-width:1500px){#statsDialog .lh-dashboard-canvas{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:1100px){#statsDialog .lh-dashboard-canvas{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:900px){#statsDialog .lh-dashboard-editor-rows{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:620px){#statsDialog .stats-tabs{display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;gap:6px!important;max-height:70px!important;height:70px!important;min-height:70px!important;flex:0 0 70px!important;overflow-x:auto!important;overflow-y:hidden!important;padding:8px 10px!important;scroll-snap-type:x proximity}
+ #statsDialog .stats-tabs button{flex:0 0 151px!important;width:151px!important;min-width:151px!important;max-width:151px!important;min-height:51px!important;height:53px!important;max-height:53px!important;flex-direction:row!important;justify-content:center!important;align-items:center!important;gap:6px!important;padding:8px 10px!important;scroll-snap-align:start}
+ #statsDialog .stats-tabs button strong{font-size:11px!important;line-height:1.2!important;white-space:nowrap!important;letter-spacing:-.1px!important}
+ #statsDialog .stats-tabs button small{display:none!important}
+ #statsDialog .stats-tabs button .insights-nav-symbol{width:18px!important;height:18px!important;flex:none!important;font-size:16px!important}
+ #statsDialog .lh-insights-nav-label{display:none!important}
+ #statsDialog .lh-dashboard-canvas{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+ #statsDialog .lh-dash-card{min-height:156px;padding:12px!important}
+ #statsDialog .lh-dash-card-value{font-size:clamp(21px,5.6vw,28px)}
+ #statsDialog .lh-dash-chart-card{grid-column:1/-1}
+ #statsDialog .lh-dashboard-board-head h4{font-size:23px}}
+@media(max-width:390px){#statsDialog .lh-dashboard-canvas{grid-template-columns:minmax(0,1fr)}
+ #statsDialog .lh-dash-chart-card{grid-column:auto}}
+@media(prefers-reduced-motion:reduce){#statsDialog .lh-dash-card,#statsDialog .lh-dash-card-star{transition:none!important;transform:none!important}
+ #statsDialog .lh-dash-card:hover{transform:none!important;box-shadow:0 4px 0 #CDDAD3,0 12px 24px #0D3B6616!important}}
+
+
+ 
+.terrain-rail .lh-quicknav .lh-nav-entry>button.lh-quicknav-active,
+.terrain-rail .lh-quicknav .lh-nav-entry>button.lh-quicknav-active:hover{
+ background:#F4D35E!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border-color:#E3C055!important}
+.terrain-rail .lh-quicknav .lh-nav-entry>button.lh-quicknav-active span,
+.terrain-rail .lh-quicknav .lh-nav-entry>button.lh-quicknav-active svg{color:#0D3B66!important;stroke:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important}
+.terrain-rail .lh-quicknav .lh-nav-entry>button:not(.lh-quicknav-active):hover{
+ background:#245779!important;color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important}
+.terrain-rail .lh-quicknav .lh-nav-entry>button:not(.lh-quicknav-active):hover span,
+.terrain-rail .lh-quicknav .lh-nav-entry>button:not(.lh-quicknav-active):hover svg{color:#FFFFFF!important;stroke:#FFFFFF!important}
+
+#statsDialog #statsOverview>.stats-story-section{display:block!important}
+#statsDialog .lh-legacy-tabs,#statsDialog .lh-legacy-tabs *{display:none!important}
+#statsDialog.lh-integrated-view .insights-layout{grid-template-columns:280px minmax(0,1fr)!important}
+#statsDialog.lh-integrated-view .insights-topbar{margin-left:318px!important}
+#statsDialog.lh-integrated-view .stats-tabs.lh-context-rail{display:flex!important;flex-direction:column!important;gap:0!important;align-items:stretch!important;padding:calc(var(--lh-brand-height,80px) + 22px) 14px 18px!important;overflow-y:auto!important;min-width:0}
+#statsDialog .lh-context-head{padding:3px 10px 23px;border-bottom:1px solid #496E87;margin-bottom:16px;min-width:0}
+#statsDialog .lh-context-kicker{display:block;font-size:10px;letter-spacing:.15em;font-weight:850;color:#F4D35E!important;margin-bottom:9px}
+#statsDialog #lhContextHeading{color:#FFFDF7!important;font-size:24px;line-height:1.15;letter-spacing:-.035em;margin:0 0 9px!important;font-weight:850}
+#statsDialog #lhContextDescription{color:#D8E5EA!important;line-height:1.52;font-size:12px;margin:0!important;max-width:235px}
+#statsDialog .lh-context-links{display:flex;flex-direction:column;gap:7px;min-width:0}
+#statsDialog .stats-tabs button.lh-context-link{width:100%!important;min-width:0!important;max-width:none!important;height:auto!important;min-height:54px!important;display:grid!important;grid-template-columns:30px 1fr 10px!important;align-items:center!important;gap:9px!important;padding:10px 12px!important;border:1px solid #4C7897!important;border-bottom:3px solid #0A2946!important;border-radius:10px!important;background:#1B4A70!important;color:#F5F6EC!important;-webkit-text-fill-color:#F5F6EC!important;text-align:left!important;transition:transform .15s ease,box-shadow .15s ease,background .15s ease!important;transform:translateY(0);box-shadow:inset 0 1px #FFFFFF2B,0 2px 4px #05223B35!important}
+#statsDialog .stats-tabs button.lh-context-link:hover{background:#265D85!important;transform:translateY(-2px)!important;box-shadow:inset 0 1px #FFFFFF55,0 4px 0 #0A2946,0 9px 14px #041D3388!important}
+#statsDialog .stats-tabs button.lh-context-link:active{transform:translateY(1px)!important;box-shadow:inset 0 1px 4px #041D3399!important}
+#statsDialog .stats-tabs button.lh-context-link:focus-visible{outline:3px solid #F4D35E!important;outline-offset:2px!important}
+#statsDialog .stats-tabs button.lh-context-link[aria-current=location]{background:#F4D35E!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border-color:#E8C653!important;box-shadow:inset 0 1px #FFF6CF,0 3px 0 #A98425!important}
+#statsDialog .stats-tabs .lh-context-index,#statsDialog .stats-tabs .lh-context-label,#statsDialog .stats-tabs .lh-context-chevron{color:inherit!important;-webkit-text-fill-color:inherit!important}
+#statsDialog .stats-tabs .lh-context-index{font-size:11px!important;font-variant-numeric:tabular-nums;font-weight:900;opacity:.82}
+#statsDialog .stats-tabs .lh-context-label{min-width:0;font-size:13px!important;line-height:1.3!important;font-weight:750;overflow-wrap:anywhere}
+#statsDialog .stats-tabs .lh-context-chevron{font-size:22px!important;line-height:1!important;opacity:.78;text-align:right}
+#statsDialog .stats-panel [id]{scroll-margin-top:22px}
+@media(min-width:901px){
+ .workspace>.terrain-rail{display:flex!important;flex-direction:column!important;overflow:hidden!important}
+ .terrain-rail .lh-quicknav{display:flex!important;flex-direction:column!important;gap:4px!important;flex:1 1 auto!important;min-height:0!important;margin-top:5px!important;padding:5px 5px 12px!important;overflow-x:hidden!important;overflow-y:auto!important;scrollbar-width:thin!important;scrollbar-color:#527B96 transparent}
+ .terrain-rail .lh-quicknav .lh-nav-entry>button{min-height:48px!important;height:50px!important;max-height:50px!important;padding:4px 1px!important;gap:3px!important}
+ .terrain-rail .lh-quicknav .lh-nav-entry>button svg{height:18px!important;width:18px!important}
+ .terrain-rail .lh-quicknav .lh-nav-entry>button span{font-size:9px!important;line-height:1.1!important}
+ .terrain-rail .lh-nav-utilities{flex:0 0 auto!important;padding-top:7px!important;gap:4px!important}
+ .terrain-rail .lh-nav-utilities>button{min-height:45px!important}
+}
+@media(max-width:1100px) and (min-width:881px){
+ #statsDialog.lh-integrated-view .insights-layout{grid-template-columns:212px minmax(0,1fr)!important}
+ #statsDialog.lh-integrated-view .insights-topbar{margin-left:318px!important}
+ #statsDialog.lh-integrated-view .stats-tabs.lh-context-rail{padding-left:9px!important;padding-right:9px!important}
+}
+@media(max-width:880px){
+ .terrain-rail .lh-quicknav{display:flex!important;flex-flow:row nowrap!important;grid-template-columns:none!important;gap:5px!important;overflow-x:auto!important;overflow-y:hidden!important;scrollbar-width:thin!important;overscroll-behavior-x:contain!important;padding:0 2px 5px!important;justify-content:flex-start!important;touch-action:pan-x}
+ .terrain-rail .lh-quicknav .lh-nav-entry{flex:0 0 77px!important;width:77px!important;min-width:77px!important}
+ .terrain-rail .lh-quicknav .lh-nav-entry>button{height:58px!important;min-height:58px!important;max-height:58px!important;font-size:9px!important}
+ #statsDialog.lh-integrated-view .insights-layout{grid-template-columns:180px minmax(0,1fr)!important}
+ #statsDialog.lh-integrated-view .insights-topbar{margin-left:0!important}
+ #statsDialog.lh-integrated-view .stats-tabs.lh-context-rail{padding:15px 10px!important}
+ #statsDialog .lh-context-head{padding:2px 4px 13px;margin-bottom:10px}
+ #statsDialog #lhContextHeading{font-size:20px}
+ #statsDialog .stats-tabs button.lh-context-link{grid-template-columns:20px 1fr 8px!important;gap:5px!important;padding:9px 7px!important;min-height:48px!important}
+ #statsDialog .stats-tabs .lh-context-label{font-size:11px!important}
+}
+@media(max-width:620px){
+ #statsDialog.lh-integrated-view .insights-layout{display:flex!important;flex-direction:column!important}
+ #statsDialog.lh-integrated-view .stats-tabs.lh-context-rail{display:block!important;height:auto!important;min-height:0!important;max-height:118px!important;overflow-x:auto!important;overflow-y:hidden!important;white-space:nowrap!important;padding:8px 10px!important;flex:0 0 auto!important;border-bottom:1px solid #315775!important}
+ #statsDialog .lh-context-head{display:none!important}
+ #statsDialog .lh-context-links{display:flex!important;flex-flow:row nowrap!important;align-items:center!important;gap:7px!important}
+ #statsDialog .stats-tabs button.lh-context-link{flex:0 0 auto!important;display:flex!important;align-items:center!important;width:auto!important;min-width:96px!important;max-width:195px!important;min-height:46px!important;height:46px!important;padding:8px 10px!important;gap:6px!important}
+ #statsDialog .stats-tabs .lh-context-chevron{display:none!important}
+}
+@media(prefers-reduced-motion:reduce){#statsDialog .stats-tabs button.lh-context-link:hover,#statsDialog .stats-tabs button.lh-context-link:active{transform:none!important;transition:none!important}}
+
+
+ 
+
+@media (min-width:881px) {
+ :root {
+  --lh-rail-width:84px;
+  --lh-panel-width:318px;
+  --lh-brand-height:104px;
+ }
+ body>header {
+  width:calc(var(--lh-rail-width) + var(--lh-panel-width))!important;
+  min-width:0!important;
+  height:var(--lh-brand-height)!important;
+  min-height:var(--lh-brand-height)!important;
+  max-height:var(--lh-brand-height)!important;
+  padding:10px 12px!important;
+  display:flex!important;
+  align-items:center!important;
+  box-sizing:border-box!important;
+ }
+ body>header .brand {width:100%!important;min-width:0!important;align-items:center!important}
+ body>header .brand-text {min-width:0!important;flex:1 1 auto!important}
+ .workspace {
+  grid-template-columns:var(--lh-rail-width) var(--lh-panel-width) minmax(0,1fr)!important;
+ }
+ .workspace>aside {
+  width:var(--lh-panel-width)!important;
+  min-width:0!important;
+ }
+ .workspace>.terrain-rail,
+ .workspace>aside {
+  padding-top:calc(var(--lh-brand-height) + 6px)!important;
+ }
+ #statsDialog.lh-integrated-view .insights-topbar {
+  margin-left:var(--lh-panel-width)!important;
+  height:var(--lh-brand-height)!important;
+  min-height:var(--lh-brand-height)!important;
+  max-height:var(--lh-brand-height)!important;
+  align-items:center!important;
+  box-sizing:border-box!important;
+ }
+ #statsDialog.lh-integrated-view .insights-layout,
+ #sourceReviewDialog.lh-integrated-view {
+  grid-template-columns:var(--lh-panel-width) minmax(0,1fr)!important;
+ }
+ #statsDialog.lh-integrated-view .stats-tabs.lh-context-rail {
+  padding:22px 14px 18px!important;
+ }
+ #sourceReviewDialog.lh-integrated-view .lh-source-workspace-sidebar {
+  padding-top:calc(var(--lh-brand-height) + 22px)!important;
+ }
+}
+
+
+ 
+@media (min-width:881px) and (max-width:900px) {
+ body>header {
+  position:fixed!important;top:0!important;left:0!important;
+  z-index:16!important;overflow:hidden!important;
+ }
+ body>header .header-actions {display:none!important}
+ .workspace {height:100dvh!important}
+ #statsDialog.lh-integrated-view,
+ #sourceReviewDialog.lh-integrated-view {
+  top:0!important;left:var(--lh-rail-width)!important;
+  inset:0 0 0 var(--lh-rail-width)!important;
+  width:calc(100vw - var(--lh-rail-width))!important;
+  height:100dvh!important;max-height:none!important;
+ }
+}
+
+#lhCalendarWorkspace{display:flex;flex-direction:column;padding:0!important}
+#lhCalendarWorkspace .lh-cal-pagebar{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;flex:none;gap:16px;min-width:0;min-height:84px;padding:14px 22px;box-sizing:border-box;background:#0D3B66!important;border-bottom:2px solid #F4D35E!important;color:#FAF0CA!important}
+#lhCalendarWorkspace .lh-cal-pagebar-copy{min-width:0}
+#lhCalendarWorkspace .lh-cal-pagebar h2{margin:0!important;color:#FAF0CA!important;font-size:20px!important;font-weight:800;letter-spacing:-.025em;line-height:1.2}
+#lhCalendarWorkspace .lh-cal-pagebar p{margin:5px 0 0!important;color:#FAF0CA!important;font-size:12px!important;line-height:1.4}
+#lhCalendarWorkspace #lhCalBack{display:inline-flex;align-items:center;justify-content:center;gap:9px;flex:none;min-width:94px;min-height:42px;padding:9px 14px!important;background:#174C75!important;border:1px solid #66829C!important;border-radius:9px!important;color:#FAF0CA!important;-webkit-text-fill-color:#FAF0CA!important;font-size:12px!important;font-weight:800!important;line-height:1.2}
+#lhCalendarWorkspace #lhCalBack:hover{background:#245C87!important;border-color:#A3C2D4!important}
+#lhCalendarWorkspace #lhCalBack svg{display:block;flex:none}
+#lhCalendarWorkspace .lh-cal-shell{width:100%;max-width:1480px!important;box-sizing:border-box;flex:none;margin:0 auto;padding:clamp(16px,2vw,28px)!important}
+@media(min-width:881px){#lhCalendarWorkspace .lh-cal-pagebar{height:var(--lh-brand-height,104px);min-height:var(--lh-brand-height,104px);max-height:var(--lh-brand-height,104px)}}
+@media(min-width:881px){body:has(#lhCalendarWorkspace:not([hidden])){overflow:hidden!important}.workspace:has(#lhCalendarWorkspace:not([hidden])){height:100dvh!important;max-height:100dvh!important;overflow:hidden!important;grid-template-rows:minmax(0,1fr)!important}.workspace:has(#lhCalendarWorkspace:not([hidden]))>.terrain-rail{min-height:0!important;max-height:100dvh!important;overflow-y:auto!important}}
+@media(max-width:620px){#lhCalendarWorkspace .lh-cal-pagebar{padding:12px 15px;min-height:77px}#lhCalendarWorkspace .lh-cal-pagebar h2{font-size:18px!important}#lhCalendarWorkspace .lh-cal-pagebar p{font-size:11px!important}#lhCalendarWorkspace #lhCalBack{min-width:42px;width:42px;padding:9px!important}#lhCalendarWorkspace #lhCalBack span{display:none}}
+
+@media(min-width:881px){
+ .workspace:has(#lhCalendarWorkspace:not([hidden])){grid-template-columns:var(--lh-rail-width,84px) minmax(0,1fr)!important}
+ .workspace:has(#lhCalendarWorkspace:not([hidden]))>aside,
+ .workspace:has(#lhCalendarWorkspace:not([hidden]))>main#map{display:none!important}
+ #lhCalendarWorkspace:not([hidden]){grid-column:2/-1!important;grid-row:1!important}
+ #lhCalendarWorkspace .lh-cal-pagebar{width:calc(100% - var(--lh-panel-width,318px))!important;margin-left:var(--lh-panel-width,318px)!important}
+ #lhCalendarWorkspace .lh-cal-shell{max-width:1680px!important}
+}
+
+.terrain-rail .lh-quicknav{gap:11px!important;padding-top:9px!important}
+.terrain-rail .lh-nav-utilities{gap:10px!important}
+@media(min-width:901px){.terrain-rail .lh-quicknav{gap:10px!important;scroll-padding-block:10px!important}.terrain-rail .lh-quicknav .lh-nav-entry>button{min-height:50px!important;height:50px!important;max-height:50px!important}}
+@media(max-width:880px){.terrain-rail .lh-quicknav{gap:9px!important}}
+.terrain-rail .lh-quicknav .lh-nav-entry>button span{font-size:10px!important;line-height:1.2!important;overflow-wrap:normal!important}
+.workspace>aside .lh-eyebrow{font-size:12px!important;letter-spacing:.1em!important}
+.workspace>aside .lh-workspace-title p{font-size:14px!important;line-height:1.55!important;max-width:290px!important}
+.workspace>aside :is(.muted,.foot,.status,.bike-layer-note,#tileNotice,small,.terrain-sidebar-caption){font-size:12px!important;line-height:1.55!important}
+.workspace>aside :is(label,.field label,.toggle){font-size:12px!important;line-height:1.45!important}
+.workspace>aside .stats .stat span{font-size:11px!important;line-height:1.45!important}
+.workspace>aside section :is(p,li){font-size:12.5px!important;line-height:1.6!important}
+#statsDialog .lh-dashboard-controls .lh-dashboard-kicker,#statsDialog .lh-dash-card-category,#statsDialog .lh-dashboard-board-eyebrow,#statsDialog .lh-dash-search-label{font-size:11px!important;line-height:1.45!important}
+#statsDialog .lh-dashboard-editor-label>small,#statsDialog .lh-dashboard-board-head #lhDashBoardCount{font-size:11px!important;line-height:1.45!important}
+#statsDialog .analytics-card-summary,#statsDialog .analytics-table-note{font-size:13px!important;line-height:1.5!important}
+#lhCalendarWorkspace .lh-cal-note,#lhCalendarWorkspace .lh-cal-aside section p{font-size:12px!important;line-height:1.6!important}
+#lhCalendarWorkspace .lh-cal-ride small,#lhCalendarWorkspace .lh-cal-year-mini small{font-size:11px!important;line-height:1.5!important}
+#lhCalendarWorkspace .lh-cal-day-amount,#lhCalendarWorkspace .lh-cal-day-distance{font-size:10px!important;line-height:1.25!important}
+
+#statsDialog #lhContextDescription{font-size:13px!important;line-height:1.5!important}
+#statsDialog .lh-dashboard-board-head p,#statsDialog .lh-dashboard-controls .lh-dashboard-controls-copy>span:last-child{font-size:13px!important;line-height:1.5!important}
+#statsDialog .lh-dash-card p,#statsDialog .lh-dash-card-link{font-size:12px!important}
+#statsDialog #statsOverview #lhDashSearch{background:#FFFEFA!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border-color:#91ABB3!important;caret-color:#0D3B66!important}
+#statsDialog #statsOverview #lhDashSearch::placeholder{color:#557080!important;-webkit-text-fill-color:#557080!important;opacity:1!important}
+#statsDialog #statsOverview #lhDashSearch:focus{background:#FFFFFF!important;outline:3px solid #F4D35E!important;outline-offset:1px!important}
+#statsDialog #statsAnalytics .analytics-table{background:#FFFEF8!important;border:1px solid #B9CDC9!important;border-radius:10px!important;padding:10px 12px!important;color:#153F5F!important}
+#statsDialog #statsAnalytics .analytics-table summary{color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;background:#F1F6F1!important;font-size:14px!important;padding:9px 11px!important;border-radius:7px!important;font-weight:800!important}
+#statsDialog #statsAnalytics .analytics-table table{width:100%!important;border-collapse:collapse!important;background:#FFFDF8!important;color:#0D3B66!important;font-size:13px!important}
+#statsDialog #statsAnalytics .analytics-table thead th{background:#E5EEEA!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;font-size:13px!important;border-bottom:1px solid #B9CDC9!important}
+#statsDialog #statsAnalytics .analytics-table tbody td{background:#FFFEFA!important;color:#254B64!important;-webkit-text-fill-color:#254B64!important;border-bottom:1px solid #DEE7E1!important;font-size:13px!important}
+#statsDialog #statsAnalytics .analytics-table tbody tr:nth-child(even) td{background:#F1F6F2!important}
+#statsDialog #statsAnalytics .analytics-table .analytics-table-note{font-size:13px!important;color:#365E72!important;-webkit-text-fill-color:#365E72!important}
+#statsDialog .lh-dash-chart-card .lh-dash-chart-content{background:transparent!important;border:0!important;box-shadow:none!important;outline:0!important;padding:12px 0 5px!important;margin-top:10px!important}
+#statsDialog .lh-dash-chart-card .lh-dash-chart-content .chart-row{border:0!important;box-shadow:none!important;outline:0!important;background:transparent!important}
+#statsDialog .lh-dash-chart-card{margin-bottom:26px!important}
+#statsDialog .lh-overview-section{min-width:0;margin-bottom:29px!important}
+#statsDialog .lh-overview-section[hidden],#statsDialog .lh-overview-section [hidden],#statsDialog .lh-overview-cards-disclosure [hidden]{display:none!important}
+#statsDialog #statsOverview > .lh-overview-section[hidden],#statsDialog #statsOverview .lh-overview-section [hidden]{display:none!important}
+#statsDialog .lh-overview-section+.lh-overview-section{margin-top:26px!important;padding-top:21px!important;border-top:1px solid #95B6B2!important}
+#statsDialog .lh-overview-section .stats-story-kicker{display:block!important;margin:0 0 9px!important}
+#statsDialog .lh-overview-section .stats-story-heading{margin:0 0 20px!important}
+#statsDialog .lh-overview-section .stats-story-heading h4{margin:0 0 8px!important}
+#statsDialog .lh-overview-section .stats-story-heading p{line-height:1.6!important;font-size:13px!important}
+#statsDialog .lh-overview-section .stats-record-group[hidden],#statsDialog .lh-overview-section .stats-metric-group[hidden],#statsDialog .lh-overview-section .insights-trends-grid[hidden]{display:none!important}
+#statsDialog .lh-overview-editor-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;margin:15px 0 26px}
+#statsDialog .lh-overview-section-editor-head{grid-column:1/-1;margin-bottom:0}
+#statsDialog .lh-overview-section-editor-head h5{font-size:19px;margin:0 0 5px;color:#0D3B66!important}
+#statsDialog .lh-overview-section-editor-head p{margin:0;font-size:13px;line-height:1.5;color:#466A7A!important}
+#statsDialog .lh-overview-section-editor-item{align-self:start;border:1px solid #C5D8D1;border-radius:12px;padding:11px 12px;background:#F8FAF6;box-shadow:0 2px 0 #D1DDD5;min-width:0}
+#statsDialog .lh-overview-section-editor-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+#statsDialog .lh-overview-section-editor-row label,#statsDialog .lh-overview-card-editor-row label{display:flex;align-items:center;gap:8px;min-width:0;flex:1;font-size:13px;font-weight:780;color:#0D3B66!important}
+#statsDialog .lh-overview-section-editor-row label strong{overflow-wrap:anywhere}
+#statsDialog .lh-overview-section-editor-item input[type=checkbox]{flex:none;width:17px;height:17px;accent-color:#D1A533}
+#statsDialog .lh-overview-section-editor-actions{display:flex;gap:5px;flex:none}
+#statsDialog .lh-overview-section-editor-actions button{min-width:31px!important;min-height:31px!important;padding:4px 7px!important;font-size:15px!important;line-height:1!important;background:#FFFDF7!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border:1px solid #9AB7C0!important;border-radius:7px!important}
+#statsDialog .lh-overview-section-editor-actions button:disabled{opacity:.5!important}
+#statsDialog .lh-overview-cards-disclosure{margin:11px 0 0;border-top:1px solid #D5E3DD;padding:9px 0 0}
+#statsDialog .lh-overview-cards-disclosure>summary{font-size:12px;font-weight:800;color:#1F5A78!important;cursor:pointer;line-height:1.5;padding:5px 0}
+#statsDialog .lh-overview-cards-body{max-height:34vh;overflow:auto;padding:9px 3px 4px;display:grid;gap:13px}
+#statsDialog .lh-overview-cards-group h6{font-size:12px;color:#36576A;margin:3px 0 5px}
+#statsDialog .lh-overview-cards-group p{font-size:12px;line-height:1.5;color:#56717D;margin:4px 0}
+#statsDialog .lh-overview-card-editor-row{display:flex;gap:7px;align-items:center;justify-content:space-between;padding:7px 2px;border-top:1px solid #E2EBE7}
+#statsDialog .lh-overview-card-editor-row label{font-size:12px!important;font-weight:650!important;line-height:1.45}
+#statsDialog .lh-overview-card-editor-row label span{overflow-wrap:anywhere}
+#statsDialog .lh-overview-editor-hint{color:#587481!important;font-size:12px!important;line-height:1.5!important;margin:9px 0 0!important}
+#statsDialog .lh-overview-editor-label{font-size:16px;color:#0D3B66;margin:22px 0 11px;padding-top:16px;border-top:1px solid #D4E0DC}
+@media(max-width:1040px){#statsDialog .lh-overview-editor-sections{grid-template-columns:1fr}}
+@media(max-width:620px){#statsDialog .lh-overview-section-editor-row{align-items:flex-start}#statsDialog .lh-overview-cards-body{max-height:44vh}}
+@media(prefers-reduced-motion:reduce){#statsDialog .lh-overview-section-editor-actions button,.terrain-rail .lh-nav-entry>button{transition:none!important}}
+
+
+#statsDialog #statsAnalytics details.analytics-table>summary{display:block!important;list-style:none!important;counter-increment:none!important;padding-left:13px!important;position:relative!important}
+#statsDialog #statsAnalytics details.analytics-table>summary::marker{content:''!important}
+#statsDialog #statsAnalytics details.analytics-table>summary::-webkit-details-marker{display:none!important}
+#statsDialog #statsAnalytics details.analytics-table>summary::before{content:'▸'!important;position:static!important;display:inline-block!important;width:18px!important;color:#0D3B66!important;font-size:12px!important;counter-increment:none!important}
+#statsDialog #statsAnalytics details.analytics-table[open]>summary::before{content:'▾'!important}
+#statsDialog #statsOverview .insights-content-card .stat-chart,#statsDialog #statsOverview .insights-content-card .weekday-chart{border:0!important;outline:0!important;box-shadow:none!important;background:transparent!important;border-radius:0!important;padding:4px 0!important;margin:10px 0 0!important}
+#statsDialog #statsOverview .insights-content-card .chart-row{border:0!important;box-shadow:none!important;background:transparent!important}
+#statsDialog #statsOverview .insights-trends-grid .insights-content-card{min-width:0!important}
+#statsDialog #statsYearbook #yearbookDetails button{background:#174D74!important;color:#FFFDF7!important;-webkit-text-fill-color:#FFFDF7!important;border:1px solid #426E8A!important;border-radius:8px!important;font-size:13px!important;font-weight:750!important;opacity:1!important;min-height:36px!important;padding:8px 13px!important}
+#statsDialog #statsYearbook #yearbookDetails button:hover{background:#24628D!important;color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important}
+#statsDialog .lh-overview-studio{display:grid;grid-template-columns:minmax(245px,.8fr) minmax(0,1.6fr);gap:18px;align-items:start;margin-top:18px}
+#statsDialog .lh-overview-editor-sections{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:9px!important;margin:0!important;align-content:start}
+#statsDialog .lh-overview-sidebar-caption{font-size:12px!important;font-weight:800!important;letter-spacing:.09em;color:#3F6072!important;margin:0 0 4px!important}
+#statsDialog .lh-overview-studio-section{border:1px solid #CEDCD8;background:#FAFCF8;border-radius:12px;padding:11px;min-width:0;box-shadow:0 2px 0 #DCE6DD}
+#statsDialog .lh-overview-studio-section.lh-overview-studio-selected{border-color:#B28C36;background:#FFF5D5;box-shadow:0 3px 0 #E2C976}
+#statsDialog .lh-overview-studio-section-top{display:flex;align-items:center;gap:9px}
+#statsDialog .lh-overview-studio-select{flex:1!important;min-width:0!important;border:0!important;box-shadow:none!important;background:transparent!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;text-align:left!important;display:grid!important;gap:3px!important;padding:3px!important}
+#statsDialog .lh-overview-studio-select strong{font-size:14px!important;color:#0D3B66!important}
+#statsDialog .lh-overview-studio-select small{font-size:12px!important;color:#466478!important}
+#statsDialog .lh-overview-studio-section-top input{flex:0 0 18px;width:18px;height:18px;accent-color:#D0A32E}
+#statsDialog .lh-overview-studio-section-actions{display:flex;justify-content:flex-end;align-items:center;gap:5px;margin-top:7px}
+#statsDialog .lh-overview-studio-section-actions button,#statsDialog .lh-overview-section-editor-actions button{background:#FFFDF7!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border:1px solid #9BB4BB!important;border-radius:7px!important;min-height:33px!important;padding:6px 10px!important;font-size:12px!important;font-weight:800!important}
+#statsDialog .lh-overview-studio-section-actions button:hover,#statsDialog .lh-overview-section-editor-actions button:hover{background:#E1F0EE!important}
+#statsDialog .lh-overview-studio-section-actions button:disabled,#statsDialog .lh-overview-section-editor-actions button:disabled{opacity:.35!important}
+#statsDialog .lh-overview-picker{border:1px solid #C4D8D4;background:#FFFEFB;border-radius:13px;padding:16px;min-width:0}
+#statsDialog .lh-overview-picker-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding-bottom:11px;border-bottom:1px solid #D8E3DF;margin-bottom:12px}
+#statsDialog .lh-overview-picker-heading span{font-size:11px!important;letter-spacing:.09em!important;font-weight:800!important;color:#507080!important}
+#statsDialog .lh-overview-picker-heading h5{font-size:20px!important;margin:4px 0 5px!important;color:#0D3B66!important}
+#statsDialog .lh-overview-picker-heading p{font-size:13px!important;margin:0!important;line-height:1.5!important;color:#476779!important}
+#statsDialog .lh-overview-picker-heading>strong{font-size:12px!important;white-space:nowrap!important;color:#0D3B66!important}
+#statsDialog .lh-overview-cards-list{display:grid;gap:13px;min-width:0}
+#statsDialog .lh-overview-studio-group{border:1px solid #DDE7E2;border-radius:9px;padding:10px;min-width:0}
+#statsDialog .lh-overview-studio-group-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
+#statsDialog .lh-overview-studio-group h6{font-size:14px!important;margin:0!important;color:#123F63!important}
+#statsDialog .lh-overview-studio-card{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 0;border-top:1px solid #EDF0EB;min-width:0}
+#statsDialog .lh-overview-studio-card label{display:flex;gap:10px;align-items:center;min-width:0;flex:1;color:#0D3B66!important;font-size:13px!important;line-height:1.4!important;font-weight:650!important}
+#statsDialog .lh-overview-studio-card label span{overflow-wrap:anywhere}
+#statsDialog .lh-overview-studio-card input{width:17px;height:17px;flex:none;accent-color:#D0A32E}
+#statsDialog .lh-overview-studio .lh-dashboard-editor-rows{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:5px!important;margin-top:11px}
+#statsDialog .lh-overview-studio .lh-dashboard-editor-row{min-width:0!important}
+#statsDialog .lh-overview-edit-entry{margin-left:auto!important;flex:none!important;align-self:flex-start!important;padding:8px 12px!important;min-height:34px!important;background:#F4D35E!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;border:1px solid #CCA736!important;border-radius:8px!important;font-size:12px!important;font-weight:800!important}
+#statsDialog .lh-overview-edit-entry:hover{background:#FFE27D!important}
+#statsDialog #statsOverview .stats-story-heading,#statsDialog #statsOverview .lh-dashboard-board-head{display:flex!important;align-items:flex-start!important;justify-content:space-between!important;gap:14px!important}
+#statsDialog #lhDashGlancePicker .lh-dash-search-label{display:block!important;margin-bottom:10px}
+#statsDialog #lhDashGlancePicker #lhDashSearch{width:100%!important;display:block!important;margin-top:6px!important}
+@media(max-width:1100px){#statsDialog .lh-overview-studio{grid-template-columns:minmax(0,1fr)!important}#statsDialog .lh-overview-editor-sections{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:630px){#statsDialog .lh-overview-editor-sections{grid-template-columns:minmax(0,1fr)!important}#statsDialog .lh-overview-picker-heading{flex-wrap:wrap!important}#statsDialog .lh-overview-edit-entry{padding:7px 9px!important}}
+
+#statsDialog #statsOverview button.lh-overview-edit-entry,#statsDialog #statsOverview button.lh-overview-edit-entry:hover,#statsDialog #statsOverview button.lh-overview-edit-entry:focus-visible{background:#F4D35E!important;border:1px solid #C5A337!important;box-shadow:0 2px 0 #D2B44F!important;color:#0D3B66!important;-webkit-text-fill-color:#0D3B66!important;font-size:12px!important;line-height:1.25!important;font-weight:800!important;text-shadow:none!important;opacity:1!important}
+#statsDialog #statsOverview #lhDashEditor [hidden]{display:none!important}
+
+#statsDialog .lh-overview-picker-select-label{display:flex;align-items:center;gap:9px;margin:9px 0 11px!important;font-weight:800!important;font-size:12px!important;color:#365B70!important}
+#statsDialog #lhOverviewQuickSelect{display:block!important;min-width:0!important;max-width:100%!important;background:#164D76!important;color:#FFFDF7!important;-webkit-text-fill-color:#FFFDF7!important;border:1px solid #6792AA!important;border-radius:8px!important;font-size:13px!important;font-weight:700!important;padding:7px 26px 7px 10px!important;min-height:38px!important}
+@media(max-width:1100px){#statsDialog .lh-overview-picker{order:-1!important}#statsDialog .lh-overview-editor-sections{order:1!important}}
+@media(max-width:630px){#statsDialog .lh-overview-picker-select-label{align-items:flex-start;flex-direction:column!important;gap:4px!important}#statsDialog #lhOverviewQuickSelect{width:100%!important}}
+
+@media (min-width:881px) {
+ body:has(#statsDialog[open].lh-integrated-view)>header,
+ body:has(#sourceReviewDialog[open].lh-integrated-view)>header,
+ body:has(#lhCalendarWorkspace:not([hidden]))>header {
+  border-bottom:2px solid #F4D35E!important;
+  height:var(--lh-brand-height)!important;
+  min-height:var(--lh-brand-height)!important;
+  max-height:var(--lh-brand-height)!important;
+  box-sizing:border-box!important;
+ }
+ #statsDialog.lh-integrated-view .insights-topbar,
+ #lhCalendarWorkspace:not([hidden]) .lh-cal-pagebar {
+  height:var(--lh-brand-height)!important;
+  min-height:var(--lh-brand-height)!important;
+  max-height:var(--lh-brand-height)!important;
+  border-bottom:2px solid #F4D35E!important;
+  box-sizing:border-box!important;
+ }
+}
+#statsDialog .stats-panel>section.stats-story-section {
+ border-bottom:0!important;
+ padding-bottom:0!important;
+ margin-bottom:28px!important;
+}
+#statsDialog .stats-panel:not(#statsOverview)>section.stats-story-section+section.stats-story-section {
+ border-top:1px solid #B6C8C1!important;
+ padding-top:26px!important;
+}
+#statsDialog #statsOverview section.stats-metric-group,
+#statsDialog #statsOverview section.stats-record-group {
+ border:0!important;
+ padding-bottom:0!important;
+ margin-bottom:20px!important;
+}
+#statsDialog #statsOverview>.lh-overview-section {
+ border:0!important;
+ padding:0!important;
+ margin:0 0 32px!important;
+}
+#statsDialog #statsOverview>.lh-overview-section:not([hidden])~.lh-overview-section:not([hidden]) {
+ border-top:1px solid #B6C8C1!important;
+ padding-top:26px!important;
+}
+#statsDialog .stats-footer {
+ border-top:1px solid #B6C8C1!important;
+ margin-top:26px!important;
+ padding-top:24px!important;
+}
 </style></head>
-<body><header><div class="brand"><img class="logo" src="/logo.png" alt="LibreHeatmaps route heatmap"><div class="brand-text"><div class="brand-title-row"><h1>LibreHeatmaps</h1><span class="brand-credit">In collaboration with <a href="https://trailsidecycles.com/" target="_blank" rel="noopener noreferrer">Trailside Cycles</a></span></div><small>Free, open-source GPS heatmaps. Your data stays local. Your history stays yours.</small></div></div><div class="header-actions"><button class="primary stats-header" id="statsTop">Activity statistics</button><button id="openSettings" title="Adjust appearance and manage your local activity data">Settings</button><button id="shutdown" title="Stop the local application">Exit app</button></div></header>
+<body><header><div class="brand"><img class="logo" src="/logo.png" alt="LibreHeatmaps route heatmap"><div class="brand-text"><div class="brand-title-row"><h1>LibreHeatmaps</h1></div><small class="lh-brand-slogan">Free, open-source GPS heatmaps. Your data stays local. Your history stays yours.</small><span class="brand-credit">In collaboration with <a href="https://trailsidecycles.com/" target="_blank" rel="noopener noreferrer">Trailside Cycles</a></span></div></div><div class="header-actions"><button class="primary stats-header" id="statsTop">Activity statistics</button><button id="headerSources" title="Preferred source for each activity measurement" type="button">Data sources</button><button id="openSettings" title="Adjust appearance and manage your local activity data">Settings</button><button id="shutdown" title="Stop the local application">Exit app</button></div></header>
 <svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute;overflow:hidden;pointer-events:none" xmlns="http://www.w3.org/2000/svg"><defs><filter id="lh-bike-tint" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB"><feFlood id="bikeTintFlood" flood-color="#54dc96" result="bike-color"/><feComposite in="bike-color" in2="SourceAlpha" operator="in"/></filter></defs></svg>
-<div class="workspace"><aside>
-<section><h2>Import activities</h2><div class="muted">Import your complete Strava or Garmin account ZIP without extraction, or choose activities.csv or individual FIT, GPX, TCX and GPS tracks. You can also drag and drop files anywhere onto this window.</div><button class="primary full" id="import">Import GPS files or account ZIP</button><input id="file" type="file" accept=".zip,.csv,.fit,.fit.gz,.gpx,.gpx.gz,.tcx,.tcx.gz,.gps" multiple><div class="status" id="importStatus">Your activities remain on your computer. No uploads to external services.</div><div id="garminHomeProgress" class="garmin-home-progress" role="status" aria-live="polite" hidden><strong>Garmin full-history import</strong><span id="garminHomeDetails">Waiting for Garmin Connect…</span><small id="garminHomeHeatStatus">Updating the heatmap after every 50 new rides</small></div><div class="stats"><div class="stat"><strong id="activityCount">0</strong><span>Activities</span></div><div class="stat"><strong id="pointCount">0</strong><span>Route points</span></div></div></section>
-<section><h2>Map view</h2><label class="toggle" for="onlineTiles">Online map tiles <input id="onlineTiles" type="checkbox" checked></label><div class="muted privacy-notice" id="tileNotice">Online basemaps load map tiles from third-party providers. Your Strava files and statistics stay local.</div><div class="row"><button data-map="dark" class="primary">Dark</button><button data-map="light">Light</button><button data-map="satellite">Satellite</button></div><label class="toggle">Show all routes <input type="checkbox" id="routes" checked></label><label class="toggle">Heatmap layer <input type="checkbox" id="heat" checked></label><div class="field"><label>Route definition <output id="definitionValue">78%</output></label><input type="range" id="definition" min="15" max="100" value="78"></div><div class="field"><label>Glow radius <output id="radiusValue">5 px</output></label><input type="range" id="radius" min="2" max="24" value="5"></div><div class="field"><label>Intensity <output id="intensityValue">120%</output></label><input type="range" id="intensity" min="10" max="200" value="120"></div><div class="field"><label>Transparency <output id="opacityValue">84%</output></label><input type="range" id="opacity" min="10" max="100" value="84"></div></section>
-<section class="bike-panel"><div class="bike-panel-heading"><h2>Cycle paths</h2><label class="toggle" for="bikeRoutes"><span>Show</span><input id="bikeRoutes" type="checkbox"></label></div>
+<div class="workspace"><div class="terrain-rail">
+<nav class="lh-quicknav" aria-label="Workspace navigation">
+<div class="lh-nav-entry"><button type="button" id="lhNavMap" class="lh-quicknav-active" title="Explore maps"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 7 7-3 5 2 6-2v13l-6 3-5-2-7 3zM10 4v14M15 6v14"/></svg><span>Explore</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavOverview" title="Overview"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="5" rx="1.5"/><rect x="13" y="10" width="8" height="11" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/></svg><span>Overview</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavAnalytics" title="Analytics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 18h18M5 15l4-5 4 3 6-8"/><circle cx="19" cy="5" r="1"/></svg><span>Analytics</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavAdvanced" title="Advanced data"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-6M10 19V5M16 19v-9M22 19V7"/><path d="M2 21h21"/></svg><span>Advanced</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavCompare" title="Compare activities"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16l-4-4M20 7l-4 4M20 17H4l4-4M4 17l4 4"/></svg><span>Compare</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavYearbook" title="Year in review"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M7 2v4M17 2v4M3 9h18M7 13h4M7 17h8"/></svg><span>Year in review</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavActivities" title="Activities"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17 8 9l4 4 3-7 6 11M3 20h18"/></svg><span>Activities</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavData" title="Data explorer"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10M15 10v10M3 15h18"/></svg><span>Data explorer</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavReview" title="Review anomalies"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 21h20zM12 9v5M12 17v.1"/></svg><span>Review</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavCalendar" title="Activity calendar" aria-label="Activity calendar"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18M8 14h2v2H8zM14 14h2v2h-2z"/></svg><span>Calendar</span></button></div>
+<div class="lh-nav-entry"><button type="button" id="lhNavSources" title="Data sources"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg><span>Sources</span></button></div>
+</nav><div class="lh-nav-utilities"><button type="button" id="lhRailSettings" title="Settings" aria-label="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M4.9 4.9l2.1 2.1m10 10 2.1 2.1M2 12h3m14 0h3M4.9 19.1 7 17m10-10 2.1-2.1"/></svg><span>Settings</span></button><button type="button" id="lhRailExit" title="Exit LibreHeatmaps" aria-label="Exit LibreHeatmaps"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v10M5.1 5.1a9 9 0 1 0 13.8 0"/></svg><span>Exit</span></button></div></div><aside>
+<div class="lh-workspace-title"><span class="lh-eyebrow">MAP CONTROLS</span><h2>Explore routes</h2><p>Filter, import, and explore your recorded activities.</p></div>
+
+<section class="lh-journey-entry" aria-labelledby="lhJourneyEntryTitle"><div class="lh-journey-head"><span class="lh-journey-symbol" aria-hidden="true">▱</span><div><strong id="lhJourneyEntryTitle">Journey Space</strong><small>3D travel-frequency landscape</small></div></div><p id="lhJourneyDescription">Lift your recorded journeys into a spatial view. Height shows how often roads are traveled.</p><button id="lhJourneyEnter" type="button">Explore in 3D <span aria-hidden="true">↗</span></button></section>
+<section class="lh-import-panel"><div class="lh-panel-heading"><span class="lh-panel-icon" aria-hidden="true">↥</span><h2>Import activities</h2></div><div class="muted">Import your complete Strava or Garmin account ZIP without extraction, or choose activities.csv or individual FIT, GPX, TCX, KML, KMZ, GeoJSON, GPS and coordinate CSV tracks. You can also drag and drop files anywhere onto this window.</div><button class="primary full" id="import">Import GPS files or account ZIP</button><input id="file" type="file" accept=".zip,.csv,.fit,.fit.gz,.gpx,.gpx.gz,.tcx,.tcx.gz,.kml,.kml.gz,.kmz,.geojson,.geojson.gz,.gps" multiple><div class="status" id="importStatus">Your activities remain on your computer. No uploads to external services.</div><div id="garminHomeProgress" class="garmin-home-progress" role="status" aria-live="polite" hidden><strong>Garmin full-history import</strong><span id="garminHomeDetails">Waiting for Garmin Connect…</span><small id="garminHomeHeatStatus">Updating the heatmap after every 50 new rides</small></div><div class="stats"><div class="stat"><strong id="activityCount">0</strong><span>Activities</span></div><div class="stat"><strong id="pointCount">0</strong><span>Route points</span></div></div></section>
+<section class="lh-map-panel"><div class="lh-panel-heading"><span class="lh-panel-icon" aria-hidden="true">◈</span><h2>Map layers</h2></div><label class="toggle" for="onlineTiles">Online map tiles <input id="onlineTiles" type="checkbox" checked></label><div class="muted privacy-notice" id="tileNotice">Online basemaps load map tiles from third-party providers. Your Strava files and statistics stay local.</div><div class="row"><button data-map="dark" class="primary">Dark</button><button data-map="light">Light</button><button data-map="satellite">Satellite</button></div><label class="toggle">Show all routes <input type="checkbox" id="routes" checked></label><label class="toggle">Heatmap layer <input type="checkbox" id="heat" checked></label><div class="field"><label>Route definition <output id="definitionValue">78%</output></label><input type="range" id="definition" min="15" max="100" value="78"></div><div class="field"><label>Glow radius <output id="radiusValue">5 px</output></label><input type="range" id="radius" min="2" max="24" value="5"></div><div class="field"><label>Intensity <output id="intensityValue">120%</output></label><input type="range" id="intensity" min="10" max="200" value="120"></div><div class="field"><label>Transparency <output id="opacityValue">84%</output></label><input type="range" id="opacity" min="10" max="100" value="84"></div></section>
+<section class="activity-focus-panel"><div class="lh-panel-heading"><span class="lh-panel-icon" aria-hidden="true">◇</span><h2>Activity focus</h2></div><div class="field"><label for="activityFocus">Show activities for</label><select id="activityFocus"><option value="cycling">Cycling · default</option><option value="foot">Running &amp; walking</option><option value="all">All GPS activities</option></select></div><p id="activityFocusNote" class="muted">Cycling-first view. Nothing is removed from your library.</p></section>
+<section class="bike-panel"><div class="bike-panel-heading"><h2>Cycle paths</h2><label class="toggle" for="bikeRoutes"><span>Show</span><input id="bikeRoutes" type="checkbox" checked></label></div>
 <div id="bikeLayerControls" hidden><div class="bike-tint-control"><label for="bikeTintColor">Overlay color</label><input id="bikeTintColor" type="color" value="#54dc96" aria-label="Cycle path overlay color"><output id="bikeTintColorValue" for="bikeTintColor">#54DC96</output></div></div>
-<p class="bike-layer-note" id="bikeLayerStatus" role="status" aria-live="polite">Optional cycling paths; off by default.</p></section>
-<section><h2>Filter activities</h2><div class="field"><label for="sport">Activity type</label><select id="sport"><option value="">All activity types</option></select></div><div class="field"><label for="search">Activity name</label><input type="search" id="search" placeholder="Search activities..."></div><div class="field"><label>Date range</label><div class="row"><input id="dateFrom" type="date" aria-label="Start date"><input id="dateTo" type="date" aria-label="End date"></div><div id="dateRange"></div></div><button class="full subtle" id="clear">Clear filters</button></section>
-<section><h2>Heatmap Time Machine</h2><div class="muted">See how your routes grew, year by year.</div><button type="button" id="openTimeMachine" class="primary full">Explore your timeline</button></section><section><h2>Activity insights</h2><div class="muted">Explore your habits, totals, streaks, yearly trends, personal records, and data coverage.</div><button class="primary full stats-cta" id="statsButton">Open activity statistics</button></section>
+<p class="bike-layer-note" id="bikeLayerStatus" role="status" aria-live="polite">Cycle paths are shown by default; turn Show off to hide them.</p></section>
+<section class="lh-filter-panel"><div class="lh-panel-heading"><span class="lh-panel-icon" aria-hidden="true">⌕</span><h2>Explore & filter</h2></div><div class="field"><label for="sport">Activity type</label><select id="sport"><option value="">All activity types</option></select></div><div class="field"><label for="search">Activity name</label><input type="search" id="search" placeholder="Search activities..."></div><div class="field"><label>Date range</label><div class="row"><input id="dateFrom" type="date" aria-label="Start date"><input id="dateTo" type="date" aria-label="End date"></div><div id="dateRange"></div></div><button class="full subtle" id="clear">Clear filters</button></section>
+<button type="button" id="statsButton" hidden tabindex="-1" aria-hidden="true" style="display:none"></button>
 <section><h2>Export</h2><button class="full" id="gpx">Download filtered GPX</button><button class="full" id="png">Create heatmap PNG</button><p class="foot">GPX uses evenly sampled route coordinates. PNG opens a capture editor where you can pan, zoom, change the framing and save the route overlay. Third-party map imagery is never exported.</p></section>
-<div class="foot">Your GPS tracks and statistics are stored locally. Online map tiles are enabled by default and contact third-party map providers; turning them off keeps your map requests local.</div>
-</aside><main id="map"><div id="tiles" class="dark"></div><div id="bikeTiles" aria-hidden="true"></div><canvas id="overlay"></canvas><div id="interaction"></div><div id="heatVisitTooltip" role="status" aria-live="off" hidden></div><div class="maptop" id="mapCaption"><span class="map-caption-title">Your GPS heatmap</span><span id="mapDetail">Import a GPS archive to begin</span><button id="clearRide" type="button" hidden>Show all activities</button></div><div class="tools" role="group" aria-label="Map zoom controls"><button id="plus" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button id="minus" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><button id="fit" type="button" title="Fit selected activity, or your recorded routes; use + and − to adjust zoom" aria-label="Fit activity or routes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="3"/></svg></button></div><div class="legend">LESS TRAVELED · MORE TRAVELED<div class="bar" id="legendBar"></div><span id="legendLabel">Purple → red → orange → white</span><label class="legend-select" for="legendPalette"><span>Heat colors</span><select id="legendPalette" aria-label="Heatmap color scale"><option value="classic">Classic glow</option><option value="ember">Ember</option><option value="violet">Violet</option><option value="ocean">Ocean</option><option value="forest">Forest</option></select></label></div><div class="attribution" id="attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></div><div class="empty" id="empty"><div class="panel"><strong>Explore everywhere you’ve been</strong><span>Import a Strava or Garmin account ZIP, or GPS tracks, to see your routes on an interactive heatmap. No GIS tools or Python packages required.</span></div></div><div id="busy" class="hidden">Loading map data…</div></main></div><div id="dropTarget" hidden role="status" aria-live="polite"><div><strong>Drop activity files to import</strong><span>FIT · GPX · TCX · GPS · Strava/Garmin ZIP · activities.csv</span></div></div><dialog id="statsDialog" aria-labelledby="insightsTitle">
+
+</aside><main id="map"><div id="tiles" class="dark"></div><div id="bikeTiles" aria-hidden="true"></div><canvas id="overlay"></canvas><div id="interaction" tabindex="0" role="button" aria-label="Interactive map. Click a point to explore nearby GPS activities. Drag to pan, scroll to zoom, or press Enter to inspect the map center."></div><div id="heatVisitTooltip" role="status" aria-live="off" hidden></div><div class="maptop" id="mapCaption"><span class="map-caption-title">Your GPS heatmap</span><span id="mapDetail">Import a GPS archive to begin</span><button id="clearRide" type="button" hidden>Show all activities</button></div><div class="tools" role="group" aria-label="Map zoom and place controls"><button id="plus" type="button" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button><button id="minus" type="button" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><button id="fit" type="button" title="Fit selected activity, or your recorded routes; use + and − to adjust zoom" aria-label="Fit activity or routes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+<div class="lh-time-lens" id="timeLens" aria-label="Explore activity history by year and month">
+  <div class="lh-time-top"><strong>Time Lens</strong>
+    <div id="timeLensBody" class="lh-time-body">
+      <div class="lh-time-period"><label for="timeLensYearSelect">Year</label><button id="timeLensPrev" type="button" title="Previous year" aria-label="Previous year">‹</button><select id="timeLensYearSelect" aria-label="Choose year"></select><button id="timeLensNext" type="button" title="Next year" aria-label="Next year">›</button></div>
+      <div class="lh-time-period"><label for="timeLensMonth">Month</label><button id="timeLensMonthPrev" type="button" title="Previous month" aria-label="Previous month">‹</button><select id="timeLensMonth" aria-label="Choose month"><option value="0">All months</option><option value="1">January</option><option value="2">February</option><option value="3">March</option><option value="4">April</option><option value="5">May</option><option value="6">June</option><option value="7">July</option><option value="8">August</option><option value="9">September</option><option value="10">October</option><option value="11">November</option><option value="12">December</option></select><button id="timeLensMonthNext" type="button" title="Next month" aria-label="Next month">›</button></div>
+      <label class="lh-time-mode">View <select id="timeLensMode" aria-label="Time period mode"><option value="through">Through date</option><option value="year">Selected period</option></select></label>
+      <div class="lh-time-actions"><button id="timeLensPlay" type="button">Play</button><button id="timeLensAll" type="button">All</button></div>
+    </div>
+    <button id="timeLensMore" type="button" aria-expanded="false" aria-controls="timeLensDetail">Details</button>
+    <button id="timeLensCollapse" type="button" aria-expanded="true" aria-controls="timeLensBody">Hide</button>
+  </div>
+  <div id="timeLensDetail" class="lh-time-detail" hidden><div class="lh-time-travel"><input id="timeLensYear" type="range" aria-label="Scrub history year" min="2020" max="2026" value="2026" step="1" disabled><output id="timeLensYearLabel" for="timeLensYear">—</output></div><span id="timeLensDescription">All recorded years</span><div id="timeLensStatus" role="status" aria-live="polite" class="lh-time-status"></div></div>
+</div>
+<div id="placePin" class="lh-place-pin" hidden aria-hidden="true"></div>
+<section id="placeInspector" class="lh-place-inspector" aria-label="Place visits inspector" hidden><div class="lh-place-heading"><div><span class="lh-place-kicker">PLACE LENS</span><h2>Nearby activities</h2><span id="placeCoordinates" class="lh-place-coordinates">Click a point on the map</span></div><button id="placeClose" type="button">Close</button></div><p id="placeHint">Select any point on your heatmap to discover recorded visits.</p><label for="placeRadius">Search nearby <select id="placeRadius"><option value="100">100 metres</option><option value="250" selected>250 metres</option><option value="500">500 metres</option><option value="1000">1 kilometre</option></select></label><div id="placeResults" aria-live="polite"></div></section>
+<div class="legend">LESS TRAVELED · MORE TRAVELED<div class="bar" id="legendBar"></div><span id="legendLabel">Purple → red → orange → white</span><label class="legend-select" for="legendPalette"><span>Heat colors</span><select id="legendPalette" aria-label="Heatmap color scale"><option value="classic">Classic glow</option><option value="ember">Ember</option><option value="violet">Violet</option><option value="ocean">Ocean</option><option value="forest">Forest</option></select></label></div><div class="attribution" id="attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">© OpenStreetMap contributors</a></div><div class="empty" id="empty"><div class="panel"><strong>Explore everywhere you’ve been</strong><span>Import a Strava or Garmin account ZIP, or GPS tracks, to see your routes on an interactive heatmap. No GIS tools or Python packages required.</span></div></div><section id="lhJourneySpace" class="lh-journey-space" hidden aria-labelledby="lhJourneyTitle"><div class="lh-journey-bar"><div class="lh-journey-title"><span class="lh-journey-symbol" aria-hidden="true">▱</span><div><small>SPATIAL EXPLORATION</small><h2 id="lhJourneyTitle">Journey Space</h2><p>The geography of where you've traveled—raised by recorded visit frequency.</p></div></div><button type="button" id="lhJourneyExit">Return to heatmap</button></div><div class="lh-journey-stage"><canvas id="lhJourneyCanvas" tabindex="0" role="img" aria-label="A spatial view of recorded routes, with height representing visit frequency. Drag to rotate, Shift-drag to pan, scroll to zoom."></canvas><div class="lh-journey-hint">Drag to orbit · Shift+drag to pan · Scroll to zoom</div><button type="button" id="lhJourneyCompass" class="lh-journey-compass" title="Align Journey Space north up" aria-label="Compass rose — align north up"><span class="lh-compass-heading">NORTH / BEARING</span><svg viewBox="0 0 90 90" width="77" height="77" aria-hidden="true" focusable="false"><circle cx="45" cy="45" r="39" fill="#092947" stroke="#89B1C1" stroke-width="1.5"/><circle cx="45" cy="45" r="33" fill="none" stroke="#527D97" stroke-width=".8" stroke-dasharray="2 3"/><g stroke="#D8EBEF" stroke-width="1.5"><path d="M45 6v9 M45 75v9 M6 45h9 M75 45h9"/></g><g id="lhJourneyCompassDial"><path d="M45 17 L36 48 L45 43Z" fill="#F4D35E" stroke="#FFF6D8" stroke-width="1"/><path d="M45 17 L54 48 L45 43Z" fill="#FFCB7E"/><path d="M45 74 L36 43 L45 49Z" fill="#6BB6CA"/><path d="M45 74 L54 43 L45 49Z" fill="#367D9D"/><circle cx="45" cy="45" r="5" fill="#FAF0CA" stroke="#0D3B66" stroke-width="1.5"/><g font-family="system-ui,sans-serif" font-size="11" font-weight="900" text-anchor="middle" fill="#FFFDF7"><text x="45" y="12" fill="#F4D35E">N</text><text x="82" y="49">E</text><text x="45" y="88">S</text><text x="8" y="49">W</text></g></g></svg><span class="lh-compass-bearing" id="lhJourneyBearing">037° NE</span><span class="lh-compass-reset">Click · North up</span></button><div class="lh-journey-inspector" id="lhJourneyInspector" role="status" aria-live="polite"><span class="lh-inspector-kicker">SPATIAL KEY</span><strong id="lhJourneyInspectCount">Select a route segment</strong><span id="lhJourneyInspectMessage">Height and color both represent recorded visits. Click a raised route to inspect its passage count.</span></div><div class="lh-journey-empty" id="lhJourneyEmpty" hidden>No matching GPS routes at this map location. Pan the 2D heatmap or change the filters, then return to Journey Space.</div></div><div class="lh-journey-console"><div class="lh-journey-legend"><strong>Recorded travel frequency</strong><span>Higher structures = more visits, not altitude</span><div class="lh-journey-gradient" aria-hidden="true"></div><div class="lh-journey-key-labels"><span>Fewer visits</span><span>More visits</span></div><span id="lhJourneyPaletteName" class="lh-journey-palette-name">Heatmap palette · Classic glow</span><span id="lhJourneySummary" role="status">Waiting for local route data…</span></div><div class="lh-journey-controls"><button type="button" id="lhJourneyLeft" aria-label="Rotate left">◀</button><button type="button" id="lhJourneyTop" aria-pressed="false">Top</button><button type="button" id="lhJourneyOrbit" aria-pressed="true">3D</button><button type="button" id="lhJourneyRight" aria-label="Rotate right">▶</button><label>Depth <input id="lhJourneyHeight" type="range" min="0.3" max="2.5" step="0.1" value="1.3"></label><label for="lhJourneySupport">Ground fill <input id="lhJourneySupport" aria-label="Opacity of color below the raised trails" type="range" min="0" max="1" step="0.05" value="0.25"><output id="lhJourneySupportValue" for="lhJourneySupport">25%</output></label><button type="button" id="lhJourneyDetail" aria-pressed="false" title="Switch between clean route lines and detailed elevation walls">Details</button><button type="button" id="lhJourneyReset">Reset view</button></div></div></section><div id="busy" class="hidden">Loading map data…</div></main><section id="lhCalendarWorkspace" hidden aria-labelledby="lhCalHeading">
+ <div class="lh-cal-pagebar"><div class="lh-cal-pagebar-copy"><h2 id="lhCalHeading">Activity calendar</h2><p>Every recorded ride has its place in your story</p></div><button id="lhCalBack" type="button" aria-label="Close activity calendar"><svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M5 5 L19 19 M19 5 L5 19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Close</span></button></div>
+ <div class="lh-cal-shell">
+  <div class="lh-cal-top"><div><div class="lh-cal-eyebrow">Your rides · through time</div><h2>Explore your riding history</h2><p>Find the days you rode, explore a whole year, and open an actual GPS journey. Calculated privately from your local activity library.</p></div>
+   <div class="lh-cal-actions"><label for="lhCalFocus" class="lh-cal-eyebrow">Activity focus</label><select id="lhCalFocus" aria-label="Calendar activity focus"><option value="cycling">Cycling</option><option value="foot">Running &amp; walking</option><option value="all">All GPS activities</option></select><div class="lh-cal-segment" aria-label="Calendar view"><button id="lhCalMonthView" type="button" aria-pressed="true">Month</button><button id="lhCalYearView" type="button" aria-pressed="false">Year</button></div></div>
+  </div>
+  <div class="lh-cal-metrics" id="lhCalMetrics" aria-live="polite"></div>
+  <div class="lh-cal-layout"><div class="lh-cal-board"><div class="lh-cal-board-head"><strong id="lhCalTitle">Activity history</strong><div class="lh-cal-navigation"><button id="lhCalPrev" type="button" aria-label="Previous month or year">‹</button><button id="lhCalToday" type="button">Latest activity</button><button id="lhCalNext" type="button" aria-label="Next month or year">›</button></div></div><div id="lhCalBoardBody" aria-live="polite"></div><p class="lh-cal-note">Each highlighted date is a recorded activity day. Distance and moving time use data already available in your library; missing time is not estimated.</p></div>
+   <div class="lh-cal-aside" role="complementary" aria-label="Selected activity and yearly history"><section class="lh-cal-day-panel"><div class="lh-cal-day-eyebrow">SELECTED DAY · RECORDED RIDES</div><h3 id="lhCalDayTitle">Select a day</h3><p id="lhCalDaySummary">Choose a highlighted date to see and open its rides right here.</p><div id="lhCalRides" class="lh-cal-day-list"></div><button id="lhCalLatest" type="button">Jump to latest activity</button></section><details class="lh-cal-year-details" id="lhCalYearDetails"><summary><span><strong>Year at a glance</strong><small>Jump to any month in this year</small></span><span class="lh-cal-expand-indicator" aria-hidden="true">▾</span></summary><div class="lh-cal-year-details-inner"><p>Color intensity indicates recorded activity days.</p><div id="lhCalMiniMonths" class="lh-cal-year-mini"></div></div></details></div>
+  </div>
+ </div>
+</section></div><div id="dropTarget" hidden role="status" aria-live="polite"><div><strong>Drop activity files to import</strong><span>FIT · GPX · TCX · KML · KMZ · GeoJSON · GPS CSV · account ZIP</span></div></div><dialog id="statsDialog" aria-labelledby="insightsTitle">
   <div class="insights-shell">
     <div class="insights-topbar">
-      <div class="insights-heading"><div class="insights-mark" aria-hidden="true"><img src="/logo.png" alt="" width="46" height="46"></div><div><h2 id="insightsTitle">Activity insights</h2><p>Every journey adds another line to your story</p></div></div>
+      <div class="insights-heading"><div><h2 id="insightsTitle">Activity insights</h2><p>Every journey adds another line to your story</p></div></div>
       <button id="closeStats" type="button" aria-label="Close activity insights"><svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path d="M5 5 L19 19 M19 5 L5 19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Close</span></button>
     </div>
     <div class="insights-layout">
-      <nav aria-label="Activity insights sections" class="stats-tabs" role="tablist" aria-orientation="vertical">
+      <nav aria-label="Sections within the current view" class="stats-tabs lh-context-rail">
+        <div class="lh-context-head"><span class="lh-context-kicker">IN THIS VIEW</span><h3 id="lhContextHeading">Overview</h3><p id="lhContextDescription">Jump directly to what matters.</p></div>
+        <div id="lhContextLinks" class="lh-context-links" aria-label="Jump to a section"></div>
         
-        <button aria-controls="statsOverview" aria-selected="true" data-stats-tab="overview" id="tabOverview" role="tab" type="button"><span class="insights-nav-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span><strong>Overview</strong><small>The big picture</small></span></button>
+        <div class="lh-legacy-tabs" hidden aria-hidden="true"><button id="tabOverview" data-stats-tab="overview" role="tab" type="button" aria-controls="statsOverview" tabindex="-1"></button>
         <button aria-controls="statsAnalytics" aria-selected="false" data-stats-tab="analytics" id="tabAnalytics" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">◔</span><span><strong>Analytics</strong><small>Patterns &amp; speed</small></span></button>
         <button aria-controls="statsAdvanced" aria-selected="false" data-stats-tab="advanced" id="tabAdvanced" role="tab" tabindex="-1" type="button" hidden><span class="insights-nav-symbol" aria-hidden="true">◈</span><span><strong>Advanced data</strong><small>Garmin &amp; weather</small></span></button>
-        <button aria-controls="statsCompare" aria-selected="false" data-stats-tab="compare" id="tabCompare" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">⇆</span><span><strong>Compare rides</strong><small>Side-by-side routes</small></span></button>
+        <button aria-controls="statsCompare" aria-selected="false" data-stats-tab="compare" id="tabCompare" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">⇆</span><span><strong>Compare activities</strong><small>Side-by-side routes</small></span></button>
         <button aria-controls="statsYearbook" aria-selected="false" data-stats-tab="yearbook" id="tabYearbook" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">◷</span><span><strong>Year in review</strong><small>Annual highlights</small></span></button>
         
         <button aria-controls="statsActivities" aria-selected="false" data-stats-tab="activities" id="tabActivities" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18c3-1 2-6 6-6s3 5 7 3 2-8 3-9"/><circle cx="4" cy="18" r="1.5"/><circle cx="20" cy="6" r="1.5"/></svg></span><span><strong>Activities</strong><small>Individual routes</small></span></button>
         <button aria-controls="statsData" aria-selected="false" data-stats-tab="data" id="tabData" role="tab" tabindex="-1" type="button"><span class="insights-nav-symbol" aria-hidden="true">▦</span><span><strong>Data explorer</strong><small>Filter &amp; compare rows</small></span></button>
         <button aria-controls="statsReview" aria-selected="false" data-stats-tab="review" id="tabReview" role="tab" tabindex="-1" type="button" hidden><span class="insights-nav-symbol" aria-hidden="true">◇</span><span><strong>Review anomalies</strong><small id="reviewNavCount">Flagged rides</small></span></button>
-        <div class="insights-nav-privacy"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M12 2 4 6v5c0 5 3.4 8.4 8 11 4.6-2.6 8-6 8-11V6z" fill="none" stroke="currentColor" stroke-width="1.7"/></svg><span>Activity data stored locally</span></div>
+        </div>
       </nav>
       <div class="insights-main" id="insightsMain">
         <div class="insights-intro">
@@ -5486,12 +8631,33 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
           <summary><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 7h16M7 12h10M10 17h4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><strong>Filter your activities</strong><span>Sport, bike, year and month</span><span class="filter-caret" aria-hidden="true">⌄</span></summary>
           <div class="insights-filter-grid">
             <label>Sport<select id="statsSport"><option value="">All types</option></select></label>
-            <label>Bike<select id="statsBike"><option value="">All bikes</option></select></label>
+            <label class="cycling-only">Bike<select id="statsBike"><option value="">All bikes</option></select></label>
             <label>Year<select id="statsYear"><option value="">All years</option></select></label>
             <label>Month<select id="statsMonth"><option value="">All months</option></select></label>
           </div>
         </details>
-        <div aria-labelledby="tabOverview" class="stats-panel" data-stats-panel="overview" id="statsOverview" role="tabpanel">
+        <div aria-label="Personal overview dashboard" class="stats-panel" data-stats-panel="overview" id="statsOverview" role="tabpanel">
+          <div class="lh-dashboard-controls" id="lhDashToolbar" role="group" aria-label="Personalize overview dashboard">
+            <div class="lh-dashboard-controls-copy"><span class="lh-dashboard-kicker">YOUR SPACE · YOUR PRIORITIES</span><strong>Your personal dashboard</strong><span id="lhDashSummary">Individual metrics, chosen and arranged by you.</span></div>
+            <div class="lh-dashboard-controls-actions"><button id="lhDashFavoritesFirst" type="button" aria-pressed="true" title="Turn favorite prioritization on or off; saved stars are retained">★ Favorites: On</button><button id="lhDashCustomize" type="button" aria-expanded="false" aria-controls="lhDashEditor">Edit entire Overview</button></div>
+          </div>
+          <div id="lhDashEditor" class="lh-dashboard-editor" hidden aria-label="Edit all Overview sections and cards">
+            <div class="lh-dashboard-editor-head"><div><strong>Arrange your entire Overview</strong><p>Choose a section on the left. Add or remove its individual cards on the right, rearrange their order, or move whole sections up and down. Changes save automatically in this browser.</p></div><button type="button" id="lhDashReset">Restore all defaults</button></div>
+            <div class="lh-overview-studio">
+              <nav id="lhOverviewSectionsEditor" class="lh-overview-editor-sections" aria-label="Overview sections to edit"></nav>
+              <div id="lhOverviewCardsPanel" class="lh-overview-picker" aria-label="Individual cards for selected section">
+                <div class="lh-overview-picker-heading"><div><span>EDIT INDIVIDUAL CARDS</span><h5 id="lhOverviewPickerTitle">Your activity totals</h5><label class="lh-overview-picker-select-label">Choose section <select id="lhOverviewQuickSelect" aria-label="Choose Overview section to edit"></select></label><p id="lhOverviewPickerDesc">Choose the measurements to display, then change their order.</p></div><strong id="lhOverviewPickerCount"></strong></div>
+                <div id="lhOverviewCardsList" class="lh-overview-cards-list"></div>
+                <div id="lhDashGlancePicker" hidden>
+                  <label class="lh-dash-search-label" for="lhDashSearch">Find a metric <input id="lhDashSearch" type="search" placeholder="Speed, distance, temperature, gear…" autocomplete="off"></label>
+                  <label class="lh-dash-priority"><input id="lhDashPinPriority" type="checkbox" checked> Favorite cards first</label>
+                  <div id="lhDashRows" class="lh-dashboard-editor-rows"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <section id="lhOverviewGlanceSection" class="lh-overview-section"><div class="lh-dashboard-board-head"><div><span class="lh-dashboard-board-eyebrow">A VIEW BUILT AROUND YOU</span><h4>At a glance</h4><p>Every number comes from your recorded activities. Select a source-linked record to revisit its ride.</p></div><span id="lhDashBoardCount" aria-live="polite">Your selected cards</span></div><div id="lhDashCanvas" class="lh-dashboard-canvas" aria-label="Your chosen activity metric cards"></div><p id="lhDashEmpty" class="lh-dashboard-empty" hidden>No cards are visible yet. Choose “Customize cards” to add the measurements that matter to you.</p></section>
+
           <section class="stats-story-section stats-summary" aria-labelledby="overviewSummaryHeading">
             <div class="stats-story-heading"><div><span class="stats-story-kicker">THE BIG PICTURE</span><h4 id="overviewSummaryHeading">Your activity totals</h4><p>Related metrics together, so every number has context.</p></div></div>
             <div class="insights-hero-metrics" id="metricGrid"></div>
@@ -5528,9 +8694,9 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
             <div class="analytics-categories" role="group" aria-label="Explore chart categories"><button type="button" data-analytics-category="all" aria-pressed="true">All charts</button><button type="button" data-analytics-category="speed" aria-pressed="false">Speed</button><button type="button" data-analytics-category="distance" aria-pressed="false">Distance</button><button type="button" data-analytics-category="time" aria-pressed="false">Time &amp; frequency</button></div>
             <p class="analytics-guidance">Timelines summarize recorded activities by period. Comparison charts plot whole activities, not second-by-second GPS speed. Filters and the optional speed-anomaly setting also affect these charts.</p>
             <div class="analytics-grid" id="analyticsGrid">
-              <article class="insights-content-card analytics-card" data-analytics-id="speedHistoryChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Typical riding speed</h5><p>How the average speed of your rides changes with time</p></div></div><div class="analytics-plot" id="speedHistoryChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="speedHistoryChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Typical moving speed</h5><p>How recorded average speed changes with time across the selected activities</p></div></div><div class="analytics-plot" id="speedHistoryChart"></div></article>
               <article class="insights-content-card analytics-card" data-analytics-id="speedDistributionChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Speed distribution</h5><p>How often your rides fall in each speed range</p></div></div><div class="analytics-plot" id="speedDistributionChart"></div></article>
-              <article class="insights-content-card analytics-card" data-analytics-id="speedDurationChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Speed versus ride duration</h5><p>See whether longer rides tend to be slower or faster</p></div></div><div class="analytics-plot" id="speedDurationChart"></div></article>
+              <article class="insights-content-card analytics-card" data-analytics-id="speedDurationChart" data-analytics-family="speed"><div class="analytics-card-head"><div><h5>Speed versus activity duration</h5><p>See whether longer activities tend to be slower or faster</p></div></div><div class="analytics-plot" id="speedDurationChart"></div></article>
               <article class="insights-content-card analytics-card" data-analytics-id="distanceHistoryChart" data-analytics-family="distance"><div class="analytics-card-head"><div><h5>Distance by period</h5><p>Total distance recorded each week, month, or year</p></div></div><div class="analytics-plot" id="distanceHistoryChart"></div></article>
               <article class="insights-content-card analytics-card" data-analytics-id="distanceDistributionChart" data-analytics-family="distance"><div class="analytics-card-head"><div><h5>Ride distance distribution</h5><p>Short outings, long adventures, and everything between</p></div></div><div class="analytics-plot" id="distanceDistributionChart"></div></article>
               <article class="insights-content-card analytics-card" data-analytics-id="distanceDurationChart" data-analytics-family="distance"><div class="analytics-card-head"><div><h5>Distance versus moving time</h5><p>Explore how distance relates to time in motion</p></div></div><div class="analytics-plot" id="distanceDurationChart"></div></article>
@@ -5540,13 +8706,13 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
           </section>
         </div>
         <div aria-labelledby="tabAdvanced" class="stats-panel" data-stats-panel="advanced" hidden id="statsAdvanced" role="tabpanel">
-          <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">DEVICE &amp; WEATHER INSIGHTS</span><h4>Ride conditions &amp; effort</h4><p>Recorded Garmin FIT and Strava measurements only, including cycling cadence and sport-specific cycles / strokes when present. Device temperature differs from ambient weather; missing values remain unavailable.</p></div></div><div class="advanced-cards" id="advancedCards"></div><div class="advanced-graph-grid" id="advancedGraphs"></div><p class="muted settings-note">These charts compare activity summaries, not second-by-second sensor traces. Weather speed comes from the original FIT or Strava metadata; no live weather is requested.</p></section>
+          <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">DEVICE &amp; WEATHER INSIGHTS</span><h4>Activity conditions &amp; effort</h4><p>Recorded Garmin FIT and Strava measurements only, including cycling cadence and sport-specific cycles / strokes when present. Device temperature differs from ambient weather; missing values remain unavailable.</p></div></div><div class="advanced-cards" id="advancedCards"></div><div class="advanced-graph-grid" id="advancedGraphs"></div><p class="muted settings-note">These charts compare activity summaries, not second-by-second sensor traces. Weather speed comes from the original FIT or Strava metadata; no live weather is requested.</p></section>
         </div>
 
         <div aria-labelledby="tabCompare" class="stats-panel" data-stats-panel="compare" hidden id="statsCompare" role="tabpanel">
           <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">RIDE-TO-RIDE</span><h4>Compare two activities</h4><p>Select two recorded activities. The colored routes and measurements appear together; original tracks are never changed.</p></div></div>
           <div class="v120-compare-pickers"><label>Find rides<input id="compareSearch" type="search" placeholder="Search names or dates (e.g. 2019)"></label><label>Browse<select id="compareOrder"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label><label>First ride<select id="compareFirst"><option value="">Choose an activity</option></select></label><label>Second ride<select id="compareSecond"><option value="">Choose another activity</option></select></label><button id="compareLoad" class="primary" type="button">Compare routes</button></div><div class="v121-compare-browse"><span id="compareBrowseStatus" role="status" aria-live="polite">Browse recorded activities to compare.</span><button id="compareMore" type="button" hidden>Load more rides</button></div>
-          <div class="v120-compare-stage"><div id="compareTiles" aria-hidden="true"></div><canvas id="compareCanvas" role="img" aria-label="Two GPS routes shown in contrasting colors over a map when online tiles are enabled"></canvas><span id="compareMapBadge" class="compare-map-badge">GPS routes</span><a id="compareMapAttribution" class="compare-map-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><div id="compareMetrics" class="v121-compare-metrics"></div><div class="v121-compare-trends"><div class="v121-compare-trend-head"><div><strong>Performance through the ride</strong><p>Sensor measurements aligned by elapsed ride progress, not route position. Gaps mean unrecorded readings.</p></div><label>Measurement<select id="compareTrendMetric" aria-label="Compare recorded ride measurements"></select></label></div><canvas id="compareTrendCanvas" role="img" aria-label="Two recorded sensor trends aligned by elapsed ride progress"></canvas><div class="v121-compare-legend"><span><i class="v121-first"></i>First ride</span><span><i class="v121-second"></i>Second ride</span></div><div id="compareTrendStatus" class="muted" role="status" aria-live="polite"></div></div><div id="compareStatus" class="muted" role="status">Select two rides to begin.</div></section>
+          <div class="v120-compare-stage"><div id="compareTiles" aria-hidden="true"></div><canvas id="compareCanvas" role="img" aria-label="Two GPS routes shown in contrasting colors over a map when online tiles are enabled"></canvas><span id="compareMapBadge" class="compare-map-badge">GPS routes</span><a id="compareMapAttribution" class="compare-map-attribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><div id="compareMetrics" class="v121-compare-metrics"></div><div class="v121-compare-trends"><div class="v121-compare-trend-head"><div><strong>Performance through the activity</strong><p>Sensor measurements aligned by elapsed activity progress, not route position. Gaps mean unrecorded readings.</p></div><label>Measurement<select id="compareTrendMetric" aria-label="Compare recorded activity measurements"></select></label></div><canvas id="compareTrendCanvas" role="img" aria-label="Two recorded sensor trends aligned by elapsed activity progress"></canvas><div class="v121-compare-legend"><span><i class="v121-first"></i>First activity</span><span><i class="v121-second"></i>Second activity</span></div><div id="compareTrendStatus" class="muted" role="status" aria-live="polite"></div></div><div id="compareStatus" class="muted" role="status">Select two activities to begin.</div></section>
         </div>
         <div aria-labelledby="tabYearbook" class="stats-panel" data-stats-panel="yearbook" hidden id="statsYearbook" role="tabpanel">
           <section class="stats-story-section"><div class="stats-story-heading"><div><span class="stats-story-kicker">PERSONAL YEARBOOK</span><h4>A year of adventures</h4><p>Discover yearly distance, time, favorite rides, active days and gear. Preview this year's routes on your heatmap or export a private recap image.</p></div></div>
@@ -5593,8 +8759,45 @@ button.lh-help-trigger,#statsDialog button.lh-help-trigger,#settingsDialog butto
       </div>
     </div>
   </div>
-</dialog><dialog id="captureDialog" class="capture-dialog" aria-labelledby="captureTitle"><div class="dialog-head"><div class="capture-brand"><img src="/logo.png" alt="" aria-hidden="true" width="40" height="40"><div><h2 id="captureTitle">Export heatmap image</h2><p>Frame an exact area of your routes before saving.</p></div></div><button id="captureClose" type="button" aria-label="Close image editor">Close</button></div><div class="capture-settings"><label>Canvas shape<select id="captureShape"><option value="16:9">Wide · 16:9</option><option value="3:2">Landscape · 3:2</option><option value="1:1">Square · 1:1</option><option value="4:5">Portrait · 4:5</option></select></label><label>PNG width<select id="captureWidth"><option value="1600">1600 px</option><option value="2400" selected>2400 px</option><option value="3200">3200 px</option></select></label><label>PNG background<select id="captureBackground"><option value="dark">Dark · map preview</option><option value="light">Light · map preview</option><option value="transparent">Transparent · checkerboard</option></select></label></div><div class="capture-zoom-row"><label for="captureZoomSlider">Zoom</label><input type="range" id="captureZoomSlider" min="1" max="18" step="0.25" value="12" aria-label="Fine-adjust PNG framing zoom"><output id="captureZoomValue" for="captureZoomSlider">12.00</output><small>Use the slider for precise framing, scroll over an area to zoom toward it, or choose Fit to center your recorded routes.</small></div><div class="capture-stage" id="captureStage"><div class="capture-tiles dark" id="captureTiles" aria-hidden="true"></div><canvas id="captureCanvas" aria-label="Editable preview of the geographic area that will be exported"></canvas><div class="capture-controls" role="group" aria-label="Adjust captured area"><button type="button" id="capturePlus" aria-label="Zoom capture in">+</button><button type="button" id="captureMinus" aria-label="Zoom capture out">−</button><button type="button" id="captureFit" aria-label="Fit recorded routes in capture">Fit</button></div><div class="capture-overlay-status" id="captureProgress" role="status" aria-live="polite">Preparing capture…</div><span class="capture-map-credit" id="captureMapCredit" hidden>© OpenStreetMap contributors · preview only</span></div><div class="capture-editor-foot"><p>Drag to reposition, use fine zoom to frame the route, or choose Fit for balanced padding. Dark and light map tiles are preview guides only. PNGs save the route overlay on a solid dark, solid light, or transparent background without third-party map imagery.</p><div class="capture-editor-actions"><button type="button" id="captureReset">Use current map view</button><button type="button" id="captureSave" class="primary" disabled>Save PNG</button></div></div><div id="captureStatus" role="status" aria-live="polite" class="capture-status"></div></dialog><dialog id="ridePreviewDialog" class="ride-preview-dialog" aria-labelledby="ridePreviewTitle"><div class="dialog-head"><div><h2 id="ridePreviewTitle">Ride preview</h2><div class="muted" id="ridePreviewSubtitle">Recorded activity</div></div><button id="closeRidePreview" type="button">Close preview</button></div><div class="ride-explore"><div class="ride-preview-map"><div id="ridePreviewTiles" class="dark" aria-hidden="true"></div><canvas id="ridePreviewCanvas" role="img" aria-label="GPS activity route over a dark online map when online tiles are enabled"></canvas><canvas id="telemetryMarkerCanvas" aria-hidden="true"></canvas><span class="ride-preview-badge" id="ridePreviewBadge">Dark map · GPS route</span><a class="ride-preview-attribution" id="ridePreviewAttribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><section class="v120-telemetry" id="rideTelemetry" hidden><div class="v120-telemetry-heading"><div><strong>Ride telemetry</strong><p>Recorded sensor samples over this ride; move across the graph to locate a reading on the route.</p></div><label>Measurement<select id="telemetryMetric"></select></label></div><canvas id="telemetryCanvas" role="img" aria-label="Recorded ride measurements. Move pointer to inspect a sample."></canvas><label class="telemetry-scrub-label" for="telemetryScrub">Ride position <input id="telemetryScrub" type="range" min="0" max="0" value="0" step="1" aria-label="Select recorded ride position" hidden></label><div id="telemetryStatus" class="muted" role="status" aria-live="polite"></div></section></div><div id="ridePreviewDetails" class="ride-preview-details"></div><div class="ride-preview-source" id="ridePreviewSource"></div><div class="review-preview" id="rideReviewPanel" hidden><div><strong id="rideReviewHeading">Speed filter review</strong><p id="rideReviewText"></p></div><button type="button" id="rideReviewAction"></button></div><div class="ride-preview-actions"><button id="openActivityEdit" type="button" disabled>Edit details</button><button id="openRouteRepair" type="button" disabled>Review GPS spikes</button><button id="openFlyover" type="button" disabled>3D Flyover</button><button id="showRideMap" class="primary" type="button" disabled>Show only this activity on map</button><button id="backToStats" type="button">Back to statistics</button></div><div id="ridePreviewStatus" class="muted" role="status" aria-live="polite"></div></dialog><dialog id="activityEditDialog" class="v122-review-dialog" aria-labelledby="editActivityTitle"><div class="dialog-head"><div><h2 id="editActivityTitle">Edit activity details</h2><p class="muted">Local corrections to names, gear and summary measurements. Raw FIT, GPX and TCX files are not changed.</p></div><button type="button" id="closeActivityEdit">Close</button></div><form id="activityEditForm"><div class="v122-edit-fields"><label>Name<input id="editRideName" maxlength="300" required></label><label>Activity type<input id="editRideSport" maxlength="80" required></label><label>Date<input id="editRideDate" type="date"></label><label>Known bike / gear<select id="editRideBikeSelect"><option value="">Choose from your library or enter a name</option></select></label><label>Bike / gear name<input id="editRideBike" maxlength="160" placeholder="e.g. Road bike"></label><label>Gear ID (optional)<input id="editRideGearId" maxlength="120"></label><label>Summary distance (km)<input id="editRideDistance" type="number" min="0" max="20000" step="any" placeholder="Not recorded"></label><label>Moving time (minutes)<input id="editRideMoving" type="number" min="0" max="1666666" step="any" placeholder="Not recorded"></label><label>Elapsed time (minutes)<input id="editRideElapsed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average speed (km/h)<input id="editRideAvgSpeed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Maximum speed (km/h)<input id="editRideMaxSpeed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Climbing (m)<input id="editRideElevation" type="number" min="0" max="1000000" step="any" placeholder="Not recorded"></label><label>Average heart rate (bpm)<input id="editRideHeartRate" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average power (W)<input id="editRidePower" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average cadence (rpm)<input id="editRideCadence" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Calories (kcal)<input id="editRideCalories" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Device average temperature (°C)<input id="editRideTemp" type="number" step="any" placeholder="Not recorded"></label><label>Device maximum temperature (°C)<input id="editRideMaxTemp" type="number" step="any" placeholder="Not recorded"></label><label>Weather temperature (°C)<input id="editRideWeatherTemp" type="number" step="any" placeholder="Not recorded"></label><label>Wind speed (km/h)<input id="editRideWind" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Wind gust (km/h)<input id="editRideGust" type="number" min="0" step="any" placeholder="Not recorded"></label></div><section class="v122-speed-review"><div><strong>Review speed estimates</strong><p class="muted">Calculate an average from corrected distance and moving time; inspect GPS samples, elevation changes and similar routes before accepting a possible maximum speed. Recorded telemetry is never rewritten.</p></div><button type="button" id="reviewSpeedEstimate">Analyze speeds</button><div id="speedEstimateStatus" role="status" aria-live="polite"></div><button type="button" id="useSpeedEstimate" hidden>Fill suggested speed fields</button></section><p class="muted">Summary corrections affect library statistics. They do not rewrite the GPS positions, timestamps, device telemetry, or original source files. Original values are kept for restoring.</p><div class="v122-edit-actions"><button id="restoreActivityEdit" type="button" disabled>Restore original details</button><button id="saveActivityEdit" class="primary" type="submit">Save activity</button></div><div id="activityEditStatus" class="muted" role="status" aria-live="polite"></div></form></dialog><dialog id="routeRepairDialog" class="v122-review-dialog" aria-labelledby="routeRepairTitle"><div class="dialog-head"><div><h2 id="routeRepairTitle">Experimental GPS spike repair</h2><p class="muted">Review a proposed route change before applying. No automatic route edits.</p></div><button type="button" id="closeRouteRepair">Close</button></div><p id="routeRepairStatus" role="status" aria-live="polite">Checking GPS track and timestamped samples…</p><canvas id="routeRepairCanvas" width="900" height="270" role="img" aria-label="Comparison of original GPS route in pink and proposed GPS route in green"></canvas><div class="v122-repair-legend"><span>● Original track</span><span>● Proposed track</span></div><div id="routeRepairSummary" class="muted"></div><div id="routeRepairCandidates" class="v122-repair-candidates"></div><div class="v122-edit-actions"><button id="restoreRouteRepair" type="button" hidden>Restore original GPS route</button><button id="applyRouteRepair" type="button" class="primary" disabled>Apply selected repairs</button></div><p class="muted">This conservative detector requires timestamped GPS measurements and proposes only isolated, implausibly fast excursions. Genuine out-and-back routes and larger GPS errors may require manual source-data correction. The original coordinates and telemetry are retained in your local database for restoration; source FIT files are never changed.</p></dialog><dialog id="flyoverDialog" aria-labelledby="flyoverTitle"><div class="flyover-shell"><div class="flyover-top"><div class="flyover-heading"><h2 id="flyoverTitle">3D Flyover</h2><p id="flyoverSubline">Activity replay</p></div><div id="flyoverTerrainBadge" role="status" aria-live="polite">Loading 3D scene…</div><button type="button" id="flyoverClose" aria-label="Close 3D flyover">Back to preview</button></div><div id="flyoverViewport" aria-label="Interactive 3D terrain with a recorded GPS route"></div><div class="flyover-controls"><div class="flyover-actions"><button type="button" id="flyoverPlay" disabled>Play flyover</button><button type="button" id="flyoverFollow" aria-pressed="true">Following rider</button><label>Playback speed <select id="flyoverSpeedControl" aria-label="Flyover playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><label>Surface <select id="flyoverSurface" aria-label="Flyover terrain surface"><option value="relief" selected>3D scenery + satellite</option><option value="satellite">Flat satellite · reference</option></select></label><label>Terrain relief <select id="flyoverRelief" aria-label="Flyover terrain relief"><option value="1">Natural · 1×</option><option value="2.6" selected>Enhanced · 2.6×</option></select></label><label>Camera <select id="flyoverCameraMode" aria-label="Flyover camera view"><option value="scenic" selected>Cinematic · aerial</option><option value="closer">Closer · rider</option></select></label></div><input id="flyoverProgress" type="range" min="0" max="1000" step="1" value="0" disabled aria-label="Scrub 3D activity replay"><div class="flyover-times"><span>Start</span><span id="flyoverPercent">0%</span><span>Finish</span></div><div class="flyover-metrics"><div><span>Distance along route</span><strong id="flyoverDistance">—</strong></div><div><span id="flyoverClockLabel">Recording time</span><strong id="flyoverClock">—</strong></div><div><span>Speed</span><strong id="flyoverSpeed">—</strong></div><div><span>Elevation</span><strong id="flyoverElevation">—</strong></div><div><span>Heart rate</span><strong id="flyoverHeart">—</strong></div></div><p class="flyover-disclosure">Flyover loads MapLibre, satellite imagery, elevation tiles and optional OpenStreetMap-based 3D building tiles on demand. Providers can see your IP address and viewed map area; your activity library is not uploaded.</p><div id="flyoverStatus" role="status" aria-live="polite"></div></div></div></dialog><dialog id="welcomeDialog" aria-labelledby="welcomeTitle"><div class="welcome-icon" aria-hidden="true">✦</div><h2 id="welcomeTitle">Welcome to LibreHeatmaps</h2><p>Your own GPS heatmaps and activity history, on your computer. Get started by importing a complete Strava or Garmin account ZIP (no extraction needed) or individual FIT, GPX, or TCX tracks.</p><div class="welcome-steps"><strong>Have a Strava account?</strong><span>Strava → Settings → My Account → Download My Account → Get Started. Select the entire downloaded ZIP here when it arrives—do not extract it or select the activity files individually.</span><strong>Have a Garmin account?</strong><span>Select your complete Garmin account export ZIP as downloaded. LibreHeatmaps also reads FIT tracks stored inside its nested ZIP files.</span></div><p class="welcome-privacy">Your GPS data stays on this device. Online map backgrounds request map tiles from external providers.</p><div class="welcome-actions"><button id="welcomeLater" type="button">Explore first</button><button id="welcomeImport" type="button" class="primary">Import my GPS data</button></div></dialog><dialog id="settingsDialog"><div class="dialog-head"><div class="settings-dialog-brand"><img alt="" aria-hidden="true" height="44" src="/logo.png" width="44"/><div><h2>Settings</h2><div class="muted">Customize the map and manage locally stored activity data</div></div></div><button aria-label="Close settings" class="settings-close" id="closeSettings" title="Close settings" type="button">×</button></div><div class="settings-layout"><nav class="settings-nav" id="settingsCategories" role="tablist" aria-label="Settings sections" aria-orientation="vertical"><div class="settings-nav-caption">PREFERENCES</div><button class="settings-category" type="button" id="settingsTab-appearance" data-settings-category="appearance" role="tab" aria-controls="settingsPanel-appearance" aria-selected="true" tabindex="0"><strong>Appearance</strong><small>Map & display</small></button><button class="settings-category" type="button" id="settingsTab-imports" data-settings-category="imports" role="tab" aria-controls="settingsPanel-imports" aria-selected="false" tabindex="-1"><strong>Imports & connections</strong><small>Files, Garmin & Strava</small></button><button class="settings-category" type="button" id="settingsTab-insights" data-settings-category="insights" role="tab" aria-controls="settingsPanel-insights" aria-selected="false" tabindex="-1"><strong>Insights</strong><small>Statistics & insights</small></button><button class="settings-category" type="button" id="settingsTab-library" data-settings-category="library" role="tab" aria-controls="settingsPanel-library" aria-selected="false" tabindex="-1"><strong>Library & backups</strong><small>Local library & backups</small></button><button class="settings-category" type="button" id="settingsTab-updates" data-settings-category="updates" role="tab" aria-controls="settingsPanel-updates" aria-selected="false" tabindex="-1"><strong>Updates</strong><small>Software updates</small></button></nav><div class="settings-panels" id="settingsPanels"><div class="settings-panel" id="settingsPanel-appearance" role="tabpanel" aria-labelledby="settingsTab-appearance" data-settings-panel="appearance"><div class="settings-panel-head"><p class="settings-kicker">Map & display</p><h2>Appearance</h2><p>Choose units, map backgrounds and heatmap colors</p></div><section class="settings-section"><h2>Appearance</h2><div class="field"><label for="settingsUnits">Display units</label><select id="settingsUnits"><option value="mi">Miles, mph, feet and °F</option><option value="km">Kilometers, km/h, meters and °C</option></select></div><div class="field"><label for="palette">Heat color scale</label><select id="palette"><option value="classic">Purple → red → orange → white</option><option value="ember">Ember · red → orange → gold</option><option value="violet">Violet · purple → magenta → white</option><option value="ocean">Ocean · blue → cyan → white</option><option value="forest">Forest · teal → lime → yellow</option></select><div aria-label="Selected heat scale preview" class="palette-preview" id="palettePreview" role="img"></div><div class="palette-ends"><span>Less traveled</span><span>More traveled</span></div></div><div class="field"><label for="defaultMap">Default map background</label><select id="defaultMap"><option value="dark">Dark</option><option value="light">Light</option><option value="satellite">Satellite</option></select></div><p class="muted settings-note">Changes can be previewed immediately and saved to your local data folder. Close without saving to discard them. Online map tiles can be disabled in Map view at any time.</p><button id="resetAppearance">Restore appearance defaults</button></section></div><div class="settings-panel" id="settingsPanel-imports" role="tabpanel" aria-labelledby="settingsTab-imports" data-settings-panel="imports" hidden><div class="settings-panel-head"><p class="settings-kicker">Files & connected accounts</p><h2>Imports & connections</h2><p>Automatic file imports, Garmin and Strava GPX</p></div><section class="settings-section" id="fileImportSettings"><h2>File imports</h2><p class="muted settings-note">Use the top-left Import button or drag-and-drop for manual files. Automatic imports and account connections are optional.</p><div class="settings-watch"><h3>Your automatic import folder</h3><p class="muted settings-note">Choose any existing local or network folder. New FIT, GPX, TCX and recognized .gps files import on startup and about every 15 seconds while open. Nothing is moved or deleted; subfolders are not scanned. Leave blank to disable.</p><label for="watchFolder">Watched activity folder</label><input autocomplete="off" id="watchFolder" placeholder="Leave blank to turn automatic import off" spellcheck="false" type="text"/><div class="settings-actions"><div><small id="watchStatus" role="status">Automatic import is off.</small></div><button id="watchBrowse" type="button">Choose folder…</button><button id="watchRescan" type="button">Scan now</button></div></div><div class="settings-watch garmin-cloud-panel"><h3>Garmin wireless activity sync</h3><p class="muted settings-note">Wirelessly import original FIT recordings through Garmin Connect using your Personal API key. Checks run at startup, on your chosen timer, or with Sync now. If you select a watched folder, downloaded originals can also be saved there. Garmin Connect—not your PC—receives the Edge's Wi-Fi uploads.</p><p class="muted settings-note"><a href="https://connect.garmin.com/" rel="noopener noreferrer" target="_blank">Open Garmin Connect to create a Personal API key</a> · <a href="https://developer.garmin.com/gc-developer-program/personal/personal-faq/" rel="noopener noreferrer" target="_blank">Garmin's setup instructions</a></p><label for="garminPersonalKey">Personal API key (only needed when connecting or replacing it)</label><input autocomplete="new-password" id="garminPersonalKey" placeholder="Paste your personal Garmin API key" spellcheck="false" type="password"/><div class="settings-actions"><div><small aria-live="polite" id="garminPersonalStatus" role="status">Wireless sync is not connected.</small></div><button id="garminPersonalConnect" type="button">Connect Garmin</button><button id="garminPersonalSync" type="button">Sync now</button><button id="garminPersonalDisconnect" type="button">Disconnect</button></div><div class="settings-actions"><div><strong>Import complete Garmin history</strong><small>For older rides beyond the recent 500. Reviews 50 activities per batch, waits between batches, and resumes after restarting LibreHeatmaps. Original recordings and saved settings are preserved.</small><small id="garminHistoryStatus" role="status" aria-live="polite">Not started</small></div><button id="garminHistoryStart" type="button">Import full history</button><button id="garminHistoryPause" type="button" disabled>Pause</button></div><div class="field"><label for="garminSyncPreset">Automatic Garmin sync interval</label><select id="garminSyncPreset"><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option selected="" value="60">Every hour · default</option><option value="120">Every 2 hours</option><option value="240">Every 4 hours</option><option value="custom">Custom interval…</option></select><label for="garminSyncCustom" hidden="" id="garminSyncCustomLabel">Custom interval (minutes, 15–1440)</label><input hidden="" id="garminSyncCustom" max="1440" min="15" step="1" type="number" value="60"/><small>Checks on startup, at this interval, and on demand. Save settings to apply.</small></div><p class="muted settings-note">Requires Garmin Connect and internet access. Disconnect deletes the local key; revoke it in Garmin Connect to invalidate it remotely.</p></div><div class="garmin-usb-panel"><strong>Garmin via USB</strong><p class="muted">Connect your Edge using a USB data cable. Find saved FIT rides, copy them into your local archive, and import—without Garmin Connect or Strava.</p><button id="garminScan" type="button">Find connected Garmin</button><div hidden="" id="garminUsbFound"><label for="garminUsbDevice">Connected device</label><select id="garminUsbDevice"></select><button class="primary full" id="garminUsbImport" type="button">Copy &amp; import FIT rides</button></div><button id="garminOpenArchive" type="button">Open local FIT archive</button><div aria-live="polite" class="muted" id="garminUsbStatus" role="status">USB mass-storage Garmin devices only. Recordings on the device are never deleted.</div></div><div class="settings-watch strava-sync-panel" id="stravaSettings"><h3>Strava GPX sync · no developer API</h3><p class="muted settings-note">Import a Strava history ZIP once, then check up to ten recent activities for missing GPX routes. Automatic checks require a separate one-time browser sign-in. This is unofficial website automation, prohibited by Strava's terms and subject to interruption; use only if you accept that limitation.</p><label class="toggle" for="stravaTerms"><input id="stravaTerms" type="checkbox"/> I understand this uses an unofficial Strava website workflow and may be restricted by Strava's terms.</label><div class="settings-actions"><div><strong>Experimental automatic GPX sync · separate sign-in</strong><small>Sign in through the dedicated browser profile. Your existing browser cookies and passwords are not copied.</small><small>The session survives application updates while valid. Reconnect if Strava expires it.</small><small id="stravaBrowserStatus" role="status">Disconnected. Automated sync requires a separate one-time sign-in.</small></div><button id="stravaBrowserConnect" type="button">Sign in for auto-sync</button><button id="stravaBrowserSync" type="button">Sync now</button><button id="stravaBrowserDisconnect" type="button">Disconnect &amp; delete session</button></div><div class="field"><label for="stravaSyncPreset">Automatic Strava GPX sync interval</label><select id="stravaSyncPreset"><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option value="60" selected>Every hour · default</option><option value="120">Every 2 hours</option><option value="240">Every 4 hours</option><option value="custom">Custom interval…</option></select><label id="stravaSyncCustomLabel" for="stravaSyncCustom" hidden>Custom interval (minutes, 15–1440)</label><input id="stravaSyncCustom" type="number" min="15" max="1440" step="1" value="60" hidden/><small>Checks on startup, at this interval, and on demand. The newest 25 rides are checked by default; choose 1–50 below. Save settings to apply.</small></div><div class="field"><label for="stravaRecentCount">Recent Strava rides to check (1–50)</label><input id="stravaRecentCount" type="number" min="1" max="50" step="1" value="25" inputmode="numeric"/><small>Default 25. Only missing rides are downloaded; this does not change your saved history.</small></div><p class="muted settings-note">Disconnect deletes the local browser session, not your imported activities. Official Strava OAuth/API access is not part of this connection.</p></div></section></div><div class="settings-panel" id="settingsPanel-insights" role="tabpanel" aria-labelledby="settingsTab-insights" data-settings-panel="insights" hidden><div class="settings-panel-head"><p class="settings-kicker">Statistics & insights</p><h2>Insights</h2><p>Speed filtering and recorded activity measurements</p></div><section class="settings-section"><h2>Statistics &amp; data quality</h2><div class="settings-actions"><div><strong>Custom cycling speed filter</strong><small>Exclude unusually fast rides from speed charts using your chosen limit. Default: 50 mph (80.5 km/h). Routes and ride totals stay unchanged.</small></div><label class="anomaly-setting"><input id="filterSpeedAnomalies" type="checkbox"/><span>Enable filter</span></label></div><div class="field"><label for="speedThreshold">Maximum cycling speed</label><div class="speed-threshold-control"><input aria-describedby="speedThresholdUnit speedThresholdHint" id="speedThreshold" inputmode="decimal" max="200" min="5" step="0.1" type="number" value="50"/><span class="speed-threshold-suffix" id="speedThresholdUnit">mph</span></div><small id="speedThresholdHint">Only affects speed statistics when enabled; units follow your display preference.</small></div><div class="settings-actions smart-filter-row"><div><strong>Experimental · Detect unusual speeds</strong><small>Find exceptional speed outliers compared with similar rides. Works best with 12+ activities; review genuine fast rides before excluding them.</small></div><label class="anomaly-setting"><input id="filterSpeedSmart" type="checkbox"/><span>Enable anomaly filter</span></label></div><p class="muted settings-note" id="anomalyStatus">Both filters are optional and off by default. Your original rides, routes and non-speed totals are never changed.</p><div class="settings-actions"><div><strong>Review flagged rides</strong><small>Review flagged rides and approve genuine performances.</small><small aria-live="polite" class="anomaly-review-count" id="anomalyReviewCount" role="status">Checking saved filters…</small></div><button id="openSpeedReview" type="button">Review anomalies</button></div></section><section class="settings-section"><h2>Garmin &amp; advanced activity data</h2><div class="settings-actions"><div><strong>Show advanced activity insights</strong><small>Show available cadence, power, heart-rate, calories and weather measurements in Statistics and activity previews. Reimporting source FIT/ZIP files can enrich older rides.</small></div><label class="anomaly-setting"><input id="advancedData" type="checkbox"/><span>Enable advanced insights</span></label></div><p class="muted settings-note">Available values come from imported files. Missing values are not estimated.</p></section></div><div class="settings-panel" id="settingsPanel-library" role="tabpanel" aria-labelledby="settingsTab-library" data-settings-panel="library" hidden><div class="settings-panel-head"><p class="settings-kicker">Local library & backups</p><h2>Library & backups</h2><p>Storage, duplicates, backup and restore</p></div><section class="settings-section"><h2>Local data &amp; cache</h2><p class="muted settings-note">Your SQLite activity library stays local. Original source files are not modified by these tools.</p><div class="settings-actions"><div><strong>Refresh rendered map data</strong><small>Discard temporary map calculations and reload the current view. Imported activities remain untouched.</small></div><button id="clearViewCache">Refresh map cache</button></div><section class="v121-duplicates"><h3>Review possible duplicate recordings</h3><p class="muted settings-note">Run an optional, strict comparison of previously imported activities. Nothing is removed automatically. Inspect each match and choose which recording to keep; removed copies can be restored from the local archive.</p><div class="settings-actions"><div><strong>Find existing duplicates</strong><small>This scan runs only when requested and does not change map loading or your data.</small></div><button id="scanDuplicates" type="button">Scan library</button></div><div aria-live="polite" class="muted" id="duplicateStatus" role="status"></div><div class="v121-duplicate-list" id="duplicatePairs"></div><div class="v121-duplicate-list" id="duplicateArchive"></div></section><details class="settings-subdetails settings-danger"><summary>Delete activity data</summary><div class="settings-actions danger-block"><div><strong>Delete all imported activities</strong><small>Delete only LibreHeatmaps activity records, statistics and import history. Original FIT/GPX files, watched folders, saved account sessions and settings are retained. Connected accounts may reimport missing rides.</small></div><button class="danger" id="clearActivities">Delete local activity data</button></div></details><details class="settings-subdetails settings-storage"><summary>Local data location</summary><div class="local-storage"><strong>Local data location</strong><div class="path-label">Data folder</div><code id="dataFolder">Loading…</code><div class="path-label">SQLite database</div><code id="dataFile">Loading…</code><div class="settings-actions"><div><strong>Open local data folder</strong><small>View your database and diagnostic log in your file manager. Your original exports are never moved or deleted by this control.</small></div><button id="openDataFolder">Open folder</button></div></div></details></section><section class="settings-section"><h2>Portable library</h2><p class="muted settings-note">Library backups contain the original GPS locations and telemetry. Keep backups and exported routes private unless you intend to share those locations.</p><div class="settings-actions"><div><strong>Portable library backup</strong><small>Download a self-contained ZIP of the local SQLite library and settings. Original downloaded FIT/GPX/Strava ZIP files are not included.</small></div><button id="backupLibrary" type="button">Download backup ZIP</button></div><div class="settings-actions"><div><strong>Restore a library</strong><small>Replace the current local library with a verified LibreHeatmaps backup. Create a backup first; this operation requires confirmation.</small></div><button id="restoreLibrary" type="button">Restore from ZIP</button><input accept=".zip" hidden="" id="restoreLibraryFile" type="file"/></div><div class="muted" id="libraryStatus" role="status"></div></section></div><div class="settings-panel" id="settingsPanel-updates" role="tabpanel" aria-labelledby="settingsTab-updates" data-settings-panel="updates" hidden><div class="settings-panel-head"><p class="settings-kicker">Software updates</p><h2>Updates</h2><p>Check and install verified LibreHeatmaps releases</p></div><section class="settings-section"><h2>Software update</h2><p class="muted settings-note">Current version: <strong id="installedVersion">1.2.2</strong>. Settings checks GitHub for updates when opened, with manual refresh available. Only release metadata is requested; activity data stays local. Downloads are SHA-256 verified before installation.</p><div class="settings-actions"><div><strong>Available releases</strong><small>Check automatically when Settings opens, or refresh manually. Your GPS data is never sent to GitHub.</small></div><button id="checkUpdate">Check for updates</button></div><div class="settings-actions"><div><strong>Install a verified release</strong><small>Previous app files are saved together in a dated ZIP inside LibreHeatmaps-backups. Imported activities stay untouched. Restart after updating.</small></div><button disabled="" id="installUpdate">Install update</button></div><div aria-live="polite" class="settings-status" id="updateStatus" role="status"></div><a hidden="" href="https://github.com/Gubna-Tech" id="releaseLink" rel="noreferrer noopener" target="_blank">View release on GitHub</a></section></div></div></div><div id="settingsGlobalStatus" class="settings-global-status"><div id="settingsStatus" role="status" aria-live="polite" class="settings-status"></div></div><div class="settings-savebar"><div aria-live="polite" class="settings-save-state" id="settingsSaveState" role="status">Checking saved settings…</div><button class="primary" id="saveSettings">Save settings</button></div></dialog>
-<dialog id="timeMachineDialog" aria-label="Heatmap Time Machine"><div class="tm-dock"><strong class="tm-title">Time Machine</strong><label class="tm-mode">History<select id="timeMachineMode"><option value="through">Through selected year</option><option value="year">Selected year only</option></select></label><div class="tm-year"><strong id="timeMachineYearLabel">2026</strong><input id="timeMachineYear" aria-label="Select activity year" type="range" min="2020" max="2026" step="1" value="2026"></div><div class="tm-step"><button id="timeMachinePrev" type="button" aria-label="Previous year">‹</button><button id="timeMachinePlay" type="button">Play years</button><button id="timeMachineNext" type="button" aria-label="Next year">›</button></div><div class="tm-summary" id="timeMachineNumbers" aria-live="polite"></div><div class="tm-actions"><button id="timeMachineReset" type="button">All years</button><button id="timeMachineApply" class="primary" type="button">Apply</button><button id="timeMachineClose" type="button" aria-label="Close Time Machine">×</button></div></div><p class="tm-status" id="timeMachineStatus" role="status"></p></dialog>
+</dialog><dialog id="captureDialog" class="capture-dialog" aria-labelledby="captureTitle"><div class="dialog-head"><div class="capture-brand"><img src="/logo.png" alt="" aria-hidden="true" width="40" height="40"><div><h2 id="captureTitle">Export heatmap image</h2><p>Frame an exact area of your routes before saving.</p></div></div><button id="captureClose" type="button" aria-label="Close image editor">Close</button></div><div class="capture-settings"><label>Canvas shape<select id="captureShape"><option value="16:9">Wide · 16:9</option><option value="3:2">Landscape · 3:2</option><option value="1:1">Square · 1:1</option><option value="4:5">Portrait · 4:5</option></select></label><label>PNG width<select id="captureWidth"><option value="1600">1600 px</option><option value="2400" selected>2400 px</option><option value="3200">3200 px</option></select></label><label>PNG background<select id="captureBackground"><option value="dark">Dark · map preview</option><option value="light">Light · map preview</option><option value="transparent">Transparent · checkerboard</option></select></label></div><div class="capture-zoom-row"><label for="captureZoomSlider">Zoom</label><input type="range" id="captureZoomSlider" min="1" max="18" step="0.25" value="12" aria-label="Fine-adjust PNG framing zoom"><output id="captureZoomValue" for="captureZoomSlider">12.00</output><small>Use the slider for precise framing, scroll over an area to zoom toward it, or choose Fit to center your recorded routes.</small></div><div class="capture-stage" id="captureStage"><div class="capture-tiles dark" id="captureTiles" aria-hidden="true"></div><canvas id="captureCanvas" aria-label="Editable preview of the geographic area that will be exported"></canvas><div class="capture-controls" role="group" aria-label="Adjust captured area"><button type="button" id="capturePlus" aria-label="Zoom capture in">+</button><button type="button" id="captureMinus" aria-label="Zoom capture out">−</button><button type="button" id="captureFit" aria-label="Fit recorded routes in capture">Fit</button></div><div class="capture-overlay-status" id="captureProgress" role="status" aria-live="polite">Preparing capture…</div><span class="capture-map-credit" id="captureMapCredit" hidden>© OpenStreetMap contributors · preview only</span></div><div class="capture-editor-foot"><p>Drag to reposition, use fine zoom to frame the route, or choose Fit for balanced padding. Dark and light map tiles are preview guides only. PNGs save the route overlay on a solid dark, solid light, or transparent background without third-party map imagery.</p><div class="capture-editor-actions"><button type="button" id="captureReset">Use current map view</button><button type="button" id="captureSave" class="primary" disabled>Save PNG</button></div></div><div id="captureStatus" role="status" aria-live="polite" class="capture-status"></div></dialog><dialog id="ridePreviewDialog" class="ride-preview-dialog" aria-labelledby="ridePreviewTitle"><div class="dialog-head"><div><h2 id="ridePreviewTitle">Activity preview</h2><div class="muted" id="ridePreviewSubtitle">Recorded activity</div></div><div class="lh-preview-head-actions"><button id="openActivitySources" type="button" disabled>Data sources</button><button id="closeRidePreview" type="button">Close preview</button></div></div><div class="ride-explore"><div class="ride-preview-map" id="ridePreviewMap" tabindex="0" role="region" aria-label="Activity route map. Drag to pan, scroll or use zoom controls, press Home to fit route"><div id="ridePreviewTiles" class="dark" aria-hidden="true"></div><canvas id="ridePreviewCanvas" role="img" aria-label="GPS activity route over a dark online map when online tiles are enabled"></canvas><canvas id="telemetryMarkerCanvas" aria-hidden="true"></canvas><span class="ride-preview-badge" id="ridePreviewBadge">Dark map · GPS route</span><div class="lh-preview-controls" role="group" aria-label="Activity map controls"><button type="button" id="previewZoomIn" aria-label="Zoom in on activity route" title="Zoom in">+</button><button type="button" id="previewZoomOut" aria-label="Zoom out on activity route" title="Zoom out">−</button><button type="button" id="previewZoomFit" aria-label="Fit complete activity route" title="Fit complete route">Fit</button></div><div class="lh-preview-map-hint" aria-hidden="true">Drag to move · Scroll to zoom</div><a class="ride-preview-attribution" id="ridePreviewAttribution" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></div><section class="v120-telemetry" id="rideTelemetry" hidden><div class="v120-telemetry-heading"><div><strong>Ride telemetry</strong><p>Recorded sensor samples for this activity; move across the graph to locate a reading on the route.</p></div><label>Measurement<select id="telemetryMetric"></select></label></div><canvas id="telemetryCanvas" role="img" aria-label="Recorded activity measurements. Move pointer to inspect a sample."></canvas><label class="telemetry-scrub-label" for="telemetryScrub">Activity position <input id="telemetryScrub" type="range" min="0" max="0" value="0" step="1" aria-label="Select recorded ride position" hidden></label><div id="telemetryStatus" class="muted" role="status" aria-live="polite"></div><button type="button" id="telemetryExplorePlace" class="lh-telemetry-explore" hidden>Explore this point in Place Lens</button></section></div><div id="ridePreviewDetails" class="ride-preview-details"></div><div class="ride-preview-source" id="ridePreviewSource"></div><div class="review-preview" id="rideReviewPanel" hidden><div><strong id="rideReviewHeading">Speed filter review</strong><p id="rideReviewText"></p></div><button type="button" id="rideReviewAction"></button></div><div class="ride-preview-actions"><button id="openActivityEdit" type="button" disabled>Edit details</button><button id="openRouteRepair" type="button" disabled>Review GPS spikes</button><button id="openElevation" type="button" disabled>3D elevation</button><button id="openFlyover" type="button" disabled>3D Flyover</button><button id="showRideMap" class="primary" type="button" disabled>Show only this activity on map</button><button id="backToStats" type="button">Back to statistics</button></div><div id="ridePreviewStatus" class="muted" role="status" aria-live="polite"></div></dialog><dialog id="elevationDialog" aria-labelledby="elevationTitle">
+ <div class="elev-shell">
+  <header class="elev-head"><div><h2 id="elevationTitle">3D elevation profile</h2><p id="elevationSubtitle">A perspective view of the recorded route and its climbs</p></div><button type="button" id="elevationClose">Close</button></header>
+  <div class="elev-main">
+   <div class="elev-spatial">
+    <div class="elev-stage"><div class="elev-camera-presets" role="group" aria-label="3D camera viewpoint"><button type="button" data-elevation-preset="route" aria-pressed="true">3D</button><button type="button" data-elevation-preset="top" aria-pressed="false">Top</button><button type="button" data-elevation-preset="side" aria-pressed="false">Side</button></div><canvas id="elevationCanvas" tabindex="0" role="img" aria-label="Three-dimensional perspective of a route raised by recorded altitude. Drag to rotate or select Pan to move the view; scroll to zoom. Playback moves the selected point along the route."></canvas><div class="elev-watermark" id="elevationHint">Drag to rotate · Shift+drag to pan · Scroll to zoom</div></div>
+   <details class="elev-geography" id="elevationGeography" open><summary>Route location <small>GPS position linked to the 3D scene</small></summary><div class="elev-geo-toolbar" role="group" aria-label="Geographic route navigation"><button type="button" id="elevationGeoFollow" aria-pressed="true">Follow rider</button><button type="button" id="elevationGeoOverview" aria-pressed="false">Whole route</button><span class="elev-geo-zoom"><button type="button" id="elevationGeoMinus" aria-label="Zoom out geographic map">−</button><button type="button" id="elevationGeoPlus" aria-label="Zoom in geographic map">+</button></span></div><div id="elevationMapReference" class="lh-mini-map lh-elevation-map" tabindex="0" role="group" aria-label="Geographic route navigator. Click a point on the route to seek the 3D replay"><div class="lh-mini-tiles" aria-hidden="true"></div><canvas aria-hidden="true"></canvas><div class="elev-geo-hud"><strong id="elevationGeoPosition">Position 0%</strong><span id="elevationGeoCoords">Recorded GPS location</span></div><span class="lh-map-credit">© OpenStreetMap contributors</span></div><div class="elev-geo-help">Click the route to jump to that point in 3D · Follow rider keeps your position centered</div></details>
+   </div>
+   <div class="elev-playbar" role="group" aria-label="3D route playback and navigation">
+    <button type="button" id="elevationPlay" aria-label="Play 3D route" disabled>Play route</button>
+    <label for="elevationSpeed">Replay speed <select id="elevationSpeed" aria-label="3D route playback speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+    <output id="elevationPlaybackStatus" for="elevationProgress" aria-live="off">Ready · 0%</output>
+    <div class="elev-view-modes" role="group" aria-label="3D navigation mode"><button type="button" id="elevationRotate" aria-pressed="true">Rotate</button><button type="button" id="elevationPan" aria-pressed="false">Pan</button></div>
+   </div>
+   <div class="elev-controls">
+    <label>Vertical exaggeration <input id="elevationStretch" type="range" min="1" max="6" step="0.5" value="2" aria-label="Vertical elevation exaggeration"></label>
+    <label>View angle <input id="elevationPitch" type="range" min="15" max="75" step="1" value="42" aria-label="View tilt angle"></label>
+    <label>Zoom <input id="elevationZoom" type="range" min="0.7" max="3" step="0.1" value="1" aria-label="Zoom 3D elevation profile"></label>
+    <label>Color by <select id="elevationColor" aria-label="Color the 3D route by measured elevation or grade"><option value="elevation">Elevation</option><option value="grade">Route grade</option></select></label>
+    <button id="elevationReset" type="button">Reset view</button>
+   </div>
+   <div class="elev-position"><label>Position along route <input id="elevationProgress" type="range" min="0" max="0" step="1" value="0" aria-label="Select position on 3D route" disabled></label></div>
+   <div class="elev-details"><div><span>Along route</span><strong id="elevDistance">—</strong></div><div><span>Elevation</span><strong id="elevAltitude">—</strong></div><div><span>Local grade</span><strong id="elevGrade">—</strong></div><div><span>Elevation range</span><strong id="elevRange">—</strong></div></div>
+   <div class="lh-spatial-telemetry" id="elevationSensorHud" role="group" aria-label="Recorded sensor measurements at the selected route position"><div class="lh-sensor-title">LIVE FROM YOUR RECORDING <span id="elevationSensorTime">Position · —</span></div><div class="lh-sensor-row"><div><span>Speed</span><strong id="elevSpeedLive">—</strong></div><div><span>Cadence</span><strong id="elevCadenceLive">—</strong></div><div><span>Power</span><strong id="elevPowerLive">—</strong></div><div><span>Heart rate</span><strong id="elevHeartLive">—</strong></div><div><span>Temp</span><strong id="elevTempLive">—</strong></div></div></div>
+   <div class="elev-grade-legend" id="elevationLegend" aria-label="Elevation color legend"><span><i style="background:#3B99C2"></i>Lower elevation</span><span><i style="background:#68C1B5"></i>Mid elevation</span><span><i style="background:#F4D35E"></i>Higher elevation</span><span><i style="background:#E99543"></i>Highest elevation</span></div>
+   <div class="elev-foot"><p>Color shows measured elevation or grade (your choice), never heatmap frequency. A raised route profile, not a terrain surface. Retraced GPS positions share a display-only altitude derived from recorded samples; original altitude readings and files remain unchanged.</p><button type="button" id="elevationExport">Save PNG</button></div>
+   <div id="elevationStatus" role="status" aria-live="polite"></div>
+  </div>
+ </div>
+</dialog>
+<dialog id="sourceReviewDialog" class="lh-source-dialog" aria-labelledby="sourceReviewTitle"><div class="dialog-head"><div><h2 id="sourceReviewTitle">Data source priorities</h2><p class="muted">Choose your preferred source for each measurement. One setting applies across your library and future imports.</p></div><button id="closeSourceReview" type="button">Close</button></div><div id="sourceReviewList" class="lh-source-review-list"></div><div id="sourceReviewStatus" role="status" aria-live="polite" class="muted"></div></dialog><dialog id="activityEditDialog" class="v122-review-dialog" aria-labelledby="editActivityTitle"><div class="dialog-head"><div><h2 id="editActivityTitle">Edit activity details</h2><p class="muted">Local corrections to names, gear and summary measurements. Raw FIT, GPX and TCX files are not changed.</p></div><button type="button" id="closeActivityEdit">Close</button></div><form id="activityEditForm"><div class="v122-edit-fields"><label>Name<input id="editRideName" maxlength="300" required></label><label>Activity type<input id="editRideSport" maxlength="80" required></label><label>Date<input id="editRideDate" type="date"></label><label>Known bike / gear<select id="editRideBikeSelect"><option value="">Choose from your library or enter a name</option></select></label><label>Bike / gear name<input id="editRideBike" maxlength="160" placeholder="e.g. Road bike"></label><label>Gear ID (optional)<input id="editRideGearId" maxlength="120"></label><label>Summary distance (km)<input id="editRideDistance" type="number" min="0" max="20000" step="any" placeholder="Not recorded"></label><label>Moving time (minutes)<input id="editRideMoving" type="number" min="0" max="1666666" step="any" placeholder="Not recorded"></label><label>Elapsed time (minutes)<input id="editRideElapsed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average speed (km/h)<input id="editRideAvgSpeed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Maximum speed (km/h)<input id="editRideMaxSpeed" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Climbing (m)<input id="editRideElevation" type="number" min="0" max="1000000" step="any" placeholder="Not recorded"></label><label>Average heart rate (bpm)<input id="editRideHeartRate" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average power (W)<input id="editRidePower" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Average cadence (rpm)<input id="editRideCadence" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Calories (kcal)<input id="editRideCalories" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Device average temperature (°C)<input id="editRideTemp" type="number" step="any" placeholder="Not recorded"></label><label>Device maximum temperature (°C)<input id="editRideMaxTemp" type="number" step="any" placeholder="Not recorded"></label><label>Weather temperature (°C)<input id="editRideWeatherTemp" type="number" step="any" placeholder="Not recorded"></label><label>Wind speed (km/h)<input id="editRideWind" type="number" min="0" step="any" placeholder="Not recorded"></label><label>Wind gust (km/h)<input id="editRideGust" type="number" min="0" step="any" placeholder="Not recorded"></label></div><section class="v122-speed-review"><div><strong>Review speed estimates</strong><p class="muted">Calculate an average from corrected distance and moving time; inspect GPS samples, elevation changes and similar routes before accepting a possible maximum speed. Recorded telemetry is never rewritten.</p></div><button type="button" id="reviewSpeedEstimate">Analyze speeds</button><div id="speedEstimateStatus" role="status" aria-live="polite"></div><button type="button" id="useSpeedEstimate" hidden>Fill suggested speed fields</button></section><p class="muted">Summary corrections affect library statistics. They do not rewrite the GPS positions, timestamps, device telemetry, or original source files. Original values are kept for restoring.</p><div class="v122-edit-actions"><button id="restoreActivityEdit" type="button" disabled>Restore original details</button><button id="saveActivityEdit" class="primary" type="submit">Save activity</button></div><div id="activityEditStatus" class="muted" role="status" aria-live="polite"></div></form></dialog><dialog id="routeRepairDialog" class="v122-review-dialog" aria-labelledby="routeRepairTitle"><div class="dialog-head"><div><h2 id="routeRepairTitle">Experimental GPS spike repair</h2><p class="muted">Review a proposed route change before applying. No automatic route edits.</p></div><button type="button" id="closeRouteRepair">Close</button></div><p id="routeRepairStatus" role="status" aria-live="polite">Checking GPS track and timestamped samples…</p><canvas id="routeRepairCanvas" width="900" height="270" role="img" aria-label="Comparison of original GPS route in pink and proposed GPS route in green"></canvas><div class="v122-repair-legend"><span>● Original track</span><span>● Proposed track</span></div><div id="routeRepairSummary" class="muted"></div><div id="routeRepairCandidates" class="v122-repair-candidates"></div><div class="v122-edit-actions"><button id="restoreRouteRepair" type="button" hidden>Restore original GPS route</button><button id="applyRouteRepair" type="button" class="primary" disabled>Apply selected repairs</button></div><p class="muted">This conservative detector requires timestamped GPS measurements and proposes only isolated, implausibly fast excursions. Genuine out-and-back routes and larger GPS errors may require manual source-data correction. The original coordinates and telemetry are retained in your local database for restoration; source FIT files are never changed.</p></dialog><dialog id="flyoverDialog" aria-labelledby="flyoverTitle"><div class="flyover-shell"><div class="flyover-top"><div class="flyover-heading"><h2 id="flyoverTitle">3D Flyover</h2><p id="flyoverSubline">Activity replay</p></div><div id="flyoverTerrainBadge" role="status" aria-live="polite">Loading 3D scene…</div><button type="button" id="flyoverClose" aria-label="Close 3D flyover">Back to preview</button></div><div id="flyoverViewport" aria-label="Interactive 3D terrain with a recorded GPS route"></div><div class="flyover-controls"><div class="flyover-actions"><button type="button" id="flyoverPlay" disabled>Play flyover</button><button type="button" id="flyoverFollow" aria-pressed="true">Following rider</button><label>Playback speed <select id="flyoverSpeedControl" aria-label="Flyover playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><label>Surface <select id="flyoverSurface" aria-label="Flyover terrain surface"><option value="relief" selected>3D scenery + satellite</option><option value="satellite">Flat satellite · reference</option></select></label><label>Terrain relief <select id="flyoverRelief" aria-label="Flyover terrain relief"><option value="1">Natural · 1×</option><option value="2.6" selected>Enhanced · 2.6×</option></select></label><label>Camera <select id="flyoverCameraMode" aria-label="Flyover camera view"><option value="scenic" selected>Cinematic · aerial</option><option value="closer">Closer · rider</option></select></label></div><input id="flyoverProgress" type="range" min="0" max="1000" step="1" value="0" disabled aria-label="Scrub 3D activity replay"><div class="flyover-times"><span>Start</span><span id="flyoverPercent">0%</span><span>Finish</span></div><div class="flyover-metrics"><div><span>Distance along route</span><strong id="flyoverDistance">—</strong></div><div><span id="flyoverClockLabel">Recording time</span><strong id="flyoverClock">—</strong></div><div><span>Speed</span><strong id="flyoverSpeed">—</strong></div><div><span>Elevation</span><strong id="flyoverElevation">—</strong></div><div><span>Heart rate</span><strong id="flyoverHeart">—</strong></div><div><span>Cadence</span><strong id="flyoverCadence">—</strong></div><div><span>Power</span><strong id="flyoverPower">—</strong></div><div><span>Temperature</span><strong id="flyoverTemp">—</strong></div></div><p class="flyover-disclosure">Flyover loads MapLibre, satellite imagery, elevation tiles and optional OpenStreetMap-based 3D building tiles on demand. Providers can see your IP address and viewed map area; your activity library is not uploaded.</p><div id="flyoverStatus" role="status" aria-live="polite"></div></div></div></dialog><dialog id="welcomeDialog" aria-labelledby="welcomeTitle"><div class="welcome-icon" aria-hidden="true">✦</div><h2 id="welcomeTitle">Welcome to LibreHeatmaps</h2><p>Your own GPS heatmaps and activity history, on your computer. Get started by importing a complete Strava or Garmin account ZIP (no extraction needed) or individual FIT, GPX, or TCX tracks.</p><div class="welcome-steps"><strong>Have a Strava account?</strong><span>Strava → Settings → My Account → Download My Account → Get Started. Select the entire downloaded ZIP here when it arrives—do not extract it or select the activity files individually.</span><strong>Have a Garmin account?</strong><span>Select your complete Garmin account export ZIP as downloaded. LibreHeatmaps also reads FIT tracks stored inside its nested ZIP files.</span></div><p class="welcome-privacy">Your GPS data stays on this device. Online map backgrounds request map tiles from external providers.</p><div class="welcome-actions"><button id="welcomeLater" type="button">Explore first</button><button id="welcomeImport" type="button" class="primary">Import my GPS data</button></div></dialog><dialog id="settingsDialog"><div class="dialog-head"><div class="settings-dialog-brand"><img alt="" aria-hidden="true" height="44" src="/logo.png" width="44"/><div><h2>Settings</h2><div class="muted">Customize the map and manage locally stored activity data</div></div></div><button aria-label="Close settings" class="settings-close" id="closeSettings" title="Close settings" type="button">×</button></div><div class="settings-layout"><nav class="settings-nav" id="settingsCategories" role="tablist" aria-label="Settings sections" aria-orientation="vertical"><div class="settings-nav-caption">PREFERENCES</div><button class="settings-category" type="button" id="settingsTab-appearance" data-settings-category="appearance" role="tab" aria-controls="settingsPanel-appearance" aria-selected="true" tabindex="0"><strong>Appearance</strong><small>Map & display</small></button><button class="settings-category" type="button" id="settingsTab-imports" data-settings-category="imports" role="tab" aria-controls="settingsPanel-imports" aria-selected="false" tabindex="-1"><strong>Imports & connections</strong><small>Files, Garmin & Strava</small></button><button class="settings-category" type="button" id="settingsTab-insights" data-settings-category="insights" role="tab" aria-controls="settingsPanel-insights" aria-selected="false" tabindex="-1"><strong>Insights</strong><small>Statistics & insights</small></button><button class="settings-category" type="button" id="settingsTab-library" data-settings-category="library" role="tab" aria-controls="settingsPanel-library" aria-selected="false" tabindex="-1"><strong>Library & backups</strong><small>Local library & backups</small></button><button class="settings-category" type="button" id="settingsTab-updates" data-settings-category="updates" role="tab" aria-controls="settingsPanel-updates" aria-selected="false" tabindex="-1"><strong>Updates</strong><small>Software updates</small></button><div class="lh-about-rail-separator" aria-hidden="true"></div><button class="settings-category lh-about-tab" type="button" id="settingsTab-about" data-settings-category="about" role="tab" aria-controls="settingsPanel-about" aria-selected="false" tabindex="-1"><strong>About LibreHeatmaps</strong><small>Our story & values</small></button></nav><div class="settings-panels" id="settingsPanels"><div class="settings-panel" id="settingsPanel-appearance" role="tabpanel" aria-labelledby="settingsTab-appearance" data-settings-panel="appearance"><div class="settings-panel-head"><p class="settings-kicker">Map & display</p><h2>Appearance</h2><p>Choose units, map backgrounds and heatmap colors</p></div><section class="settings-section"><h2>Appearance</h2><div class="field"><label for="settingsActivityFocus">Activity focus</label><select id="settingsActivityFocus"><option value="cycling">Cycling · default</option><option value="foot">Running &amp; walking</option><option value="all">All GPS activities</option></select><small>Switch between cycling, running/walking and all activities. This changes visible data and terminology, never original files. Also available in the sidebar.</small></div><div class="field"><label for="settingsUnits">Display units</label><select id="settingsUnits"><option value="mi">Miles, mph, feet and °F</option><option value="km">Kilometers, km/h, meters and °C</option></select></div><div class="field"><label for="palette">Heat color scale</label><select id="palette"><option value="classic">Purple → red → orange → white</option><option value="ember">Ember · red → orange → gold</option><option value="violet">Violet · purple → magenta → white</option><option value="ocean">Ocean · blue → cyan → white</option><option value="forest">Forest · teal → lime → yellow</option></select><div aria-label="Selected heat scale preview" class="palette-preview" id="palettePreview" role="img"></div><div class="palette-ends"><span>Less traveled</span><span>More traveled</span></div></div><div class="field"><label for="defaultMap">Default map background</label><select id="defaultMap"><option value="dark">Dark</option><option value="light">Light</option><option value="satellite">Satellite</option></select></div><p class="muted settings-note">Changes can be previewed immediately and saved to your local data folder. Close without saving to discard them. Online map tiles can be disabled in Map view at any time.</p><button id="resetAppearance">Restore appearance defaults</button></section></div><div class="settings-panel" id="settingsPanel-imports" role="tabpanel" aria-labelledby="settingsTab-imports" data-settings-panel="imports" hidden><div class="settings-panel-head"><p class="settings-kicker">Files & connected accounts</p><h2>Imports & connections</h2><p>Automatic file imports, Garmin and Strava GPX</p></div><section class="settings-section" id="fileImportSettings"><h2>File imports</h2><p class="muted settings-note">Use the top-left Import button or drag-and-drop for manual files. Automatic imports and account connections are optional.</p><div class="settings-watch"><h3>Your automatic import folder</h3><p class="muted settings-note">Choose any existing local or network folder. New FIT, GPX, TCX, KML, KMZ, GeoJSON, coordinate CSV and recognized .gps files import on startup and about every 15 seconds while open. Nothing is moved or deleted; subfolders are not scanned. Leave blank to disable.</p><label for="watchFolder">Watched activity folder</label><input autocomplete="off" id="watchFolder" placeholder="Leave blank to turn automatic import off" spellcheck="false" type="text"/><div class="settings-actions"><div><small id="watchStatus" role="status">Automatic import is off.</small></div><button id="watchBrowse" type="button">Choose folder…</button><button id="watchRescan" type="button">Scan now</button></div></div><div class="settings-watch garmin-cloud-panel"><h3>Garmin wireless activity sync</h3><p class="muted settings-note">Wirelessly import original FIT recordings through Garmin Connect using your Personal API key. Checks run at startup, on your chosen timer, or with Sync now. If you select a watched folder, downloaded originals can also be saved there. Garmin Connect—not your PC—receives the Edge's Wi-Fi uploads.</p><p class="muted settings-note"><a href="https://connect.garmin.com/" rel="noopener noreferrer" target="_blank">Open Garmin Connect to create a Personal API key</a> · <a href="https://developer.garmin.com/gc-developer-program/personal/personal-faq/" rel="noopener noreferrer" target="_blank">Garmin's setup instructions</a></p><label for="garminPersonalKey">Personal API key (only needed when connecting or replacing it)</label><input autocomplete="new-password" id="garminPersonalKey" placeholder="Paste your personal Garmin API key" spellcheck="false" type="password"/><div class="settings-actions"><div><small aria-live="polite" id="garminPersonalStatus" role="status">Wireless sync is not connected.</small></div><button id="garminPersonalConnect" type="button">Connect Garmin</button><button id="garminPersonalSync" type="button">Sync now</button><button id="garminPersonalDisconnect" type="button">Disconnect</button></div><div class="settings-actions"><div><strong>Import complete Garmin history</strong><small>For older rides beyond your chosen recent-activity limit. Reviews 50 activities per batch, waits between batches, and resumes after restarting LibreHeatmaps. Original recordings and saved settings are preserved.</small><small id="garminHistoryStatus" role="status" aria-live="polite">Not started</small></div><button id="garminHistoryStart" type="button">Import full history</button><button id="garminHistoryPause" type="button" disabled>Pause</button></div><div class="field"><label for="garminSyncPreset">Automatic Garmin sync interval</label><select id="garminSyncPreset"><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option selected="" value="60">Every hour · default</option><option value="120">Every 2 hours</option><option value="240">Every 4 hours</option><option value="custom">Custom interval…</option></select><label for="garminSyncCustom" hidden="" id="garminSyncCustomLabel">Custom interval (minutes, 15–1440)</label><input hidden="" id="garminSyncCustom" max="1440" min="15" step="1" type="number" value="60"/><small>Checks on startup, at this interval, and on demand. Save settings to apply.</small></div><div class="field"><label for="garminRecentCount">Recent Garmin activities to check (1–100)</label><input id="garminRecentCount" type="number" min="1" max="100" step="1" value="25" inputmode="numeric"/><small>Default 25. Choose up to 100; only missing activities are downloaded. Full-history import stays separate.</small></div><p class="muted settings-note">Requires Garmin Connect and internet access. Disconnect deletes the local key; revoke it in Garmin Connect to invalidate it remotely.</p></div><div class="garmin-usb-panel"><strong>Garmin via USB</strong><p class="muted">Connect your Edge using a USB data cable. Find saved FIT rides, copy them into your local archive, and import—without Garmin Connect or Strava.</p><button id="garminScan" type="button">Find connected Garmin</button><div hidden="" id="garminUsbFound"><label for="garminUsbDevice">Connected device</label><select id="garminUsbDevice"></select><button class="primary full" id="garminUsbImport" type="button">Copy &amp; import FIT rides</button></div><button id="garminOpenArchive" type="button">Open local FIT archive</button><div aria-live="polite" class="muted" id="garminUsbStatus" role="status">USB mass-storage Garmin devices only. Recordings on the device are never deleted.</div></div><div class="settings-watch strava-sync-panel" id="stravaSettings"><h3>Strava GPX sync · no developer API</h3><p class="muted settings-note">Import a Strava history ZIP once, then check the latest 25 activities by default (configurable from 1 to 50) for missing GPX routes. Automatic checks require a separate one-time browser sign-in. This is unofficial website automation, prohibited by Strava's terms and subject to interruption; use only if you accept that limitation.</p><label class="toggle" for="stravaTerms"><input id="stravaTerms" type="checkbox"/> I understand this uses an unofficial Strava website workflow and may be restricted by Strava's terms.</label><div class="settings-actions"><div><strong>Experimental automatic GPX sync · separate sign-in</strong><small>Sign in through the dedicated browser profile. Your existing browser cookies and passwords are not copied.</small><small>The session survives application updates while valid. Reconnect if Strava expires it.</small><small id="stravaBrowserStatus" role="status">Disconnected. Automated sync requires a separate one-time sign-in.</small></div><button id="stravaBrowserConnect" type="button">Sign in for auto-sync</button><button id="stravaBrowserSync" type="button">Sync now</button><button id="stravaBrowserDisconnect" type="button">Disconnect &amp; delete session</button></div><div class="field"><label for="stravaSyncPreset">Automatic Strava GPX sync interval</label><select id="stravaSyncPreset"><option value="15">Every 15 minutes</option><option value="30">Every 30 minutes</option><option value="60" selected>Every hour · default</option><option value="120">Every 2 hours</option><option value="240">Every 4 hours</option><option value="custom">Custom interval…</option></select><label id="stravaSyncCustomLabel" for="stravaSyncCustom" hidden>Custom interval (minutes, 15–1440)</label><input id="stravaSyncCustom" type="number" min="15" max="1440" step="1" value="60" hidden/><small>Checks on startup, at this interval, and on demand. The newest 25 rides are checked by default; choose 1–50 below. Save settings to apply.</small></div><div class="field"><label for="stravaRecentCount">Recent Strava rides to check (1–50)</label><input id="stravaRecentCount" type="number" min="1" max="50" step="1" value="25" inputmode="numeric"/><small>Default 25. Only missing rides are downloaded; this does not change your saved history.</small></div><p class="muted settings-note">Disconnect deletes the local browser session, not your imported activities. Official Strava OAuth/API access is not part of this connection.</p></div></section></div><div class="settings-panel" id="settingsPanel-insights" role="tabpanel" aria-labelledby="settingsTab-insights" data-settings-panel="insights" hidden><div class="settings-panel-head"><p class="settings-kicker">Statistics & insights</p><h2>Insights</h2><p>Speed filtering and recorded activity measurements</p></div><section class="settings-section"><h2>Statistics &amp; data quality</h2><div class="settings-actions"><div><strong>Custom cycling speed filter</strong><small>Exclude unusually fast rides from speed charts using your chosen limit. Default: 50 mph (80.5 km/h). Routes and ride totals stay unchanged.</small></div><label class="anomaly-setting"><input id="filterSpeedAnomalies" type="checkbox"/><span>Enable filter</span></label></div><div class="field"><label for="speedThreshold">Maximum cycling speed</label><div class="speed-threshold-control"><input aria-describedby="speedThresholdUnit speedThresholdHint" id="speedThreshold" inputmode="decimal" max="200" min="5" step="0.1" type="number" value="50"/><span class="speed-threshold-suffix" id="speedThresholdUnit">mph</span></div><small id="speedThresholdHint">Only affects speed statistics when enabled; units follow your display preference.</small></div><div class="settings-actions smart-filter-row"><div><strong>Experimental · Detect unusual speeds</strong><small>Find exceptional speed outliers compared with similar rides. Works best with 12+ activities; review genuine fast rides before excluding them.</small></div><label class="anomaly-setting"><input id="filterSpeedSmart" type="checkbox"/><span>Enable anomaly filter</span></label></div><p class="muted settings-note" id="anomalyStatus">Both filters are optional and off by default. Your original activities, routes and non-speed totals are never changed.</p><div class="settings-actions"><div><strong>Review flagged rides</strong><small>Review flagged rides and approve genuine performances.</small><small aria-live="polite" class="anomaly-review-count" id="anomalyReviewCount" role="status">Checking saved filters…</small></div><button id="openSpeedReview" type="button">Review anomalies</button></div></section><section class="settings-section"><h2>Garmin &amp; advanced activity data</h2><div class="settings-actions"><div><strong>Show advanced activity insights</strong><small>Show available cadence, power, heart-rate, calories and weather measurements in Statistics and activity previews. Reimporting source FIT/ZIP files can enrich older rides.</small></div><label class="anomaly-setting"><input id="advancedData" type="checkbox"/><span>Enable advanced insights</span></label></div><p class="muted settings-note">Available values come from imported files. Missing values are not estimated.</p></section></div><div class="settings-panel" id="settingsPanel-library" role="tabpanel" aria-labelledby="settingsTab-library" data-settings-panel="library" hidden><div class="settings-panel-head"><p class="settings-kicker">Local library & backups</p><h2>Library & backups</h2><p>Storage, duplicates, backup and restore</p></div><section class="settings-section"><h2>Local data &amp; cache</h2><p class="muted settings-note">Your SQLite activity library stays local. Original source files are not modified by these tools.</p><div class="settings-actions"><div><strong>Refresh rendered map data</strong><small>Discard temporary map calculations and reload the current view. Imported activities remain untouched.</small></div><button id="clearViewCache">Refresh map cache</button></div><section class="v121-duplicates"><h3>Review possible duplicate recordings</h3><p class="muted settings-note">Run an optional, strict comparison of previously imported activities. Nothing is removed automatically. For combined Garmin/Strava recordings, your library-wide source rules decide which source supplies each available field. For separate strict duplicate pairs, you can still archive and restore either recording. Original FIT/GPX files are never deleted.</p><div class="settings-actions lh-source-settings-entry"><div><strong>Choose Garmin, Strava or file measurements</strong><small>Set library-wide preferences for distance, time, elevation, sensors and route data. Configure once; apply to every matching activity.</small></div><button type="button" id="openLibrarySources">Review data sources</button></div><div class="settings-actions"><div><strong>Find existing duplicates</strong><small>This scan runs only when requested and does not change map loading or your data.</small></div><button id="scanDuplicates" type="button">Scan library</button></div><div aria-live="polite" class="muted" id="duplicateStatus" role="status"></div><div class="v121-duplicate-list" id="duplicatePairs"></div><div class="v121-duplicate-list" id="duplicateArchive"></div></section><details class="settings-subdetails settings-danger"><summary>Delete activity data</summary><div class="settings-actions danger-block"><div><strong>Delete all imported activities</strong><small>Delete only LibreHeatmaps activity records, statistics and import history. Original FIT/GPX files, watched folders, saved account sessions and settings are retained. Connected accounts may reimport missing rides.</small></div><button class="danger" id="clearActivities">Delete local activity data</button></div></details><details class="settings-subdetails settings-storage"><summary>Local data location</summary><div class="local-storage"><strong>Local data location</strong><div class="path-label">Data folder</div><code id="dataFolder">Loading…</code><div class="path-label">SQLite database</div><code id="dataFile">Loading…</code><div class="settings-actions"><div><strong>Open local data folder</strong><small>View your database and diagnostic log in your file manager. Your original exports are never moved or deleted by this control.</small></div><button id="openDataFolder">Open folder</button></div></div></details></section><section class="settings-section"><h2>Portable library</h2><p class="muted settings-note">Library backups contain the original GPS locations and telemetry. Keep backups and exported routes private unless you intend to share those locations.</p><div class="settings-actions"><div><strong>Portable library backup</strong><small>Download a self-contained ZIP of the local SQLite library and settings. Original downloaded FIT/GPX/Strava ZIP files are not included.</small></div><button id="backupLibrary" type="button">Download backup ZIP</button></div><div class="settings-actions"><div><strong>Restore a library</strong><small>Replace the current local library with a verified LibreHeatmaps backup. Create a backup first; this operation requires confirmation.</small></div><button id="restoreLibrary" type="button">Restore from ZIP</button><input accept=".zip" hidden="" id="restoreLibraryFile" type="file"/></div><div class="muted" id="libraryStatus" role="status"></div></section></div><div class="settings-panel" id="settingsPanel-updates" role="tabpanel" aria-labelledby="settingsTab-updates" data-settings-panel="updates" hidden><div class="settings-panel-head"><p class="settings-kicker">Software updates</p><h2>Updates</h2><p>Check and install verified LibreHeatmaps releases</p></div><section class="settings-section"><h2>Software update</h2><p class="muted settings-note">Current version: <strong id="installedVersion">1.3.0</strong>. Settings checks GitHub for updates when opened, with manual refresh available. Only release metadata is requested; activity data stays local. Downloads are SHA-256 verified before installation.</p><div class="settings-actions"><div><strong>Available releases</strong><small>Check automatically when Settings opens, or refresh manually. Your GPS data is never sent to GitHub.</small></div><button id="checkUpdate">Check for updates</button></div><div class="settings-actions"><div><strong>Install a verified release</strong><small>Previous app files are saved together in a dated ZIP inside LibreHeatmaps-backups. Imported activities stay untouched. Restart after updating.</small></div><button disabled="" id="installUpdate">Install update</button></div><div aria-live="polite" class="settings-status" id="updateStatus" role="status"></div><a hidden="" href="https://github.com/Gubna-Tech" id="releaseLink" rel="noreferrer noopener" target="_blank">View release on GitHub</a></section></div><div class="settings-panel" id="settingsPanel-about" role="tabpanel" aria-labelledby="settingsTab-about" data-settings-panel="about" hidden>
+ <div class="settings-panel-head"><p class="settings-kicker">OUR STORY</p><h2>About LibreHeatmaps</h2><p>Built for cyclists. Open to every adventure.</p></div>
+ <div class="lh-about-hero"><span class="lh-about-edition">LIBREHEATMAPS · OPEN SOURCE</span><h3>Your routes. Your history. Your perspective.</h3><p>Free, open-source GPS heatmaps. Your data stays local. Your history stays yours.</p></div>
+ <section class="settings-section lh-about-story"><h3>Created by Gubna</h3><p>LibreHeatmaps was created by Gubna to make exploring a lifetime of GPS adventures accessible without giving up ownership of the data behind them. Cycling is our passion, but everyone who records a route should be able to explore it.</p><p>The app is developed in collaboration with <a href="https://trailsidecycles.com/" target="_blank" rel="noopener noreferrer">Trailside Cycles</a>. That partnership reflects our love of bikes, local cycling communities, and the stories behind every ride.</p></section>
+ <section class="settings-section lh-about-values"><h3>What we believe</h3><div class="lh-about-values-grid"><div><strong>Free & open source</strong><p>Tools to explore your activities without a paid subscription.</p></div><div><strong>Local-first ownership</strong><p>Your original GPS files remain yours; importing never rewrites them.</p></div><div><strong>Ride-first exploration</strong><p>Heatmaps, route memories, and genuine recorded metrics to help relive the ride.</p></div></div></section>
+ <section class="settings-section lh-about-links"><h3>Project & acknowledgements</h3><p>Licensed under MIT. LibreHeatmaps is independent of Garmin, Strava, and map providers. Online services are optional and identified in the app.</p><p><a href="https://github.com/Gubna-Tech/LibreHeatmaps" target="_blank" rel="noopener noreferrer">LibreHeatmaps on GitHub</a> · <a href="https://trailsidecycles.com/" target="_blank" rel="noopener noreferrer">Trailside Cycles</a></p></section>
+ </div></div></div><div id="settingsGlobalStatus" class="settings-global-status"><div id="settingsStatus" role="status" aria-live="polite" class="settings-status"></div></div><div class="settings-savebar"><div aria-live="polite" class="settings-save-state" id="settingsSaveState" role="status">Checking saved settings…</div><button class="primary" id="saveSettings">Save settings</button></div></dialog>
+<dialog id="lhCommandDialog" class="lh-command-dialog" aria-label="Quick navigation"><div class="lh-command-heading"><div><strong>Go anywhere</strong><span>Find a view or action. Ctrl+K opens this menu.</span></div><button type="button" id="lhCommandClose">Close</button></div><label for="lhCommandSearch">Search actions</label><input id="lhCommandSearch" type="search" autocomplete="off" placeholder="Search map, activities, sources…"><div id="lhCommandResults" role="listbox" aria-label="Matching actions"></div></dialog>
+
 <script>
 const TOKEN = '__APP_TOKEN__';
 const PALETTES={
@@ -5607,9 +8810,23 @@ forest:{colors:['#206f7f','#30ab82','#76d373','#d4e86b','#fff7c6'],name:'Teal �
 const $ = id => document.getElementById(id);
 const map = $('map'), tiles = $('tiles'), bikeTiles=$('bikeTiles'), canvas = $('overlay'), ctx = canvas.getContext('2d');
 const bikeTileNodes=new Map();
+let activityFocus='cycling';
+const activityFocusDescriptions={cycling:'Cycling-first: rides, bike rides and unclassified GPS tracks. Other sports remain safely stored.',foot:'Running, walking, hiking and trekking activities. Cycling features are hidden, but the shared map and tools stay available.',all:'Explore all your GPS activities together. Nothing is deleted or reclassified.'};
+const matchesActivityFocus=sport=>{const name=String(sport||'Unknown').toLowerCase();if(activityFocus==='all')return true;if(activityFocus==='foot')return /run|jog|walk|hik|trek/.test(name);return /rid|bik|cycl|velo/.test(name)||name==='unknown'||name==='route'};
+function applyActivityFocus(mode,refresh=true){
+ if(!['cycling','foot','all'].includes(mode))mode='cycling';
+ activityFocus=mode;document.body.dataset.activityFocus=mode;
+ $('activityFocus').value=mode;$('settingsActivityFocus').value=mode;
+ $('activityFocusNote').textContent=activityFocusDescriptions[mode];
+ if(refresh){$('sport').value='';$('statsSport').value='';$('statsBike').value=''}
+ if(mode==='foot'&&$('statsDialog').open&&$('tabReview').getAttribute('aria-selected')==='true')selectStatsTab('overview');
+ tileMap();updatePrivacy();
+ if(refresh){state.activeRideId=null;$('clearRide').hidden=true;loadedKey='';scheduleData();if($('statsDialog').open){refreshStatsFilters().then(refreshInsights).catch(()=>{})}}
+}
+
 
 const heatVisitTooltip=$('heatVisitTooltip');let heatVisitGrid=new Map();
-const state = {lat:36.1627,lon:-86.7816,z:12,activeRideId:null,activeRideBounds:null,online:true,mode:'dark',bikeRoutes:false,bikeTintColor:'#54dc96',bounds:null,data:{step:2,cells:[],activities:0,peak:0},tileNodes:new Map(),generation:0,known:0};
+const state = {lat:36.1627,lon:-86.7816,z:12,activeRideId:null,activeRideBounds:null,online:true,mode:'dark',bikeRoutes:true,bikeTintColor:'#54dc96',bounds:null,data:{step:2,cells:[],activities:0,peak:0},tileNodes:new Map(),generation:0,known:0};
 const earth = z => 256*Math.pow(2,z);
 const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
 const px = (lat,lon,z=state.z) => {const e=earth(z),r=clamp(lat,-85.0511,85.0511)*Math.PI/180;return [(lon+180)/360*e,(1-Math.asinh(Math.tan(r))/Math.PI)/2*e]};
@@ -5632,14 +8849,14 @@ function updateBikeControls(){
 function clearBikeTiles(){for(const item of bikeTileNodes.values())item.remove();bikeTileNodes.clear()}
 function bikeTileMap(){
  updateBikeControls();
- if(!state.bikeRoutes){clearBikeTiles();bikeLayerStatus('Optional cycling overlay · no cycling tile requests while off.');return}
+ if(!state.bikeRoutes||activityFocus==='foot'){clearBikeTiles();bikeLayerStatus('Optional cycling overlay · no cycling tile requests while off.');return}
  if(!state.online){clearBikeTiles();bikeLayerStatus('Enable Online map tiles to view cycling paths and lanes.');return}
  drawBikeOverview();
 }
 function bikeSourceZoom(v){
- // CyclOSM generalizes away small paths on distant raster tiles. Display one
- // source level more detailed when its tile request count is bounded; preserve
- // the single CyclOSM overlay and avoid high-volume regional prefetching.
+ 
+ 
+ 
  if(state.z>=14)return state.z;
  const source=state.z+1,scale=2;
  const columns=Math.floor((v.left+v.w)*scale/256)-Math.floor(v.left*scale/256)+1;
@@ -5687,9 +8904,9 @@ item.style.transform=`translate3d(${x*t-v.left}px,${y*t-v.top}px,0)`
 }}
 for(const [key,item] of state.tileNodes){if(!used.has(key)){item.remove();state.tileNodes.delete(key)}}
 bikeTileMap();
-$('attribution').innerHTML=(state.mode==='satellite'?'Imagery © <a href="https://www.esri.com/" target="_blank" rel="noopener noreferrer">Esri</a> and imagery providers':'<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>')+(state.bikeRoutes?' · <a href="https://www.cyclosm.org/" target="_blank" rel="noopener noreferrer">CyclOSM</a>':'');
+$('attribution').innerHTML=(state.mode==='satellite'?'Imagery © <a href="https://www.esri.com/" target="_blank" rel="noopener noreferrer">Esri</a> and imagery providers':'<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a>')+(state.bikeRoutes&&activityFocus!=='foot'?' · <a href="https://www.cyclosm.org/" target="_blank" rel="noopener noreferrer">CyclOSM</a>':'');
 }
-let tileFrame=0;function queueTiles(){if(tileFrame)return;tileFrame=requestAnimationFrame(()=>{tileFrame=0;tileMap()})}
+let tileFrame=0;function queueTiles(){lhPlaceMarker();if(tileFrame)return;tileFrame=requestAnimationFrame(()=>{tileFrame=0;tileMap()})}
 const renderSurface=document.createElement('canvas'),renderContext=renderSurface.getContext('2d',{alpha:true});
 let renderFrame=0,previousGeometry=null,zoomWaiting=false,paintCache=null;
 function queueRender(){if(renderFrame)return;renderFrame=requestAnimationFrame(()=>{renderFrame=0;render()})}
@@ -5791,7 +9008,13 @@ function updateMap(deferRender=false){if(deferRender)prepareZoom();else zoomWait
 const viewSession=Math.random().toString(36).slice(2)+Date.now().toString(36);
 let viewSequence=0;
 let timer=null,controller=null,loadedKey='';function scheduleData(delay=100){heatVisitTooltip.hidden=true;cancelHeatPrefetch();clearTimeout(timer);if(controller)controller.abort();++state.generation;timer=setTimeout(loadView,delay)}
-function filterParams(){const p=new URLSearchParams();if(state.activeRideId){p.set('activity_id',String(state.activeRideId));return p}for(const [key,id] of [['sport','sport'],['from','dateFrom'],['to','dateTo'],['q','search']]){const val=$(id).value.trim();if(val)p.set(key,val)}if(timeMachineActive){p.delete('from');p.set('to',timeMachineYear+'-12-31');if(timeMachineMode==='year')p.set('from',timeMachineYear+'-01-01')}return p}
+function filterParams(){const p=new URLSearchParams();if(state.activeRideId){p.set('activity_id',String(state.activeRideId));return p}p.set('focus',activityFocus);for(const [key,id] of [['sport','sport'],['from','dateFrom'],['to','dateTo'],['q','search']]){const val=$(id).value.trim();if(val)p.set(key,val)}if(timeMachineActive){
+ const yyyy=String(timeMachineYear),mm=String(timeMachineMonth).padStart(2,'0');
+ const lensTo=timeMachineMonth?new Date(Date.UTC(timeMachineYear,timeMachineMonth,0)).toISOString().slice(0,10):yyyy+'-12-31';
+ const lensFrom=timeMachineMode==='year'?(timeMachineMonth?yyyy+'-'+mm+'-01':yyyy+'-01-01'):'';
+ if(lensFrom)p.set('from',p.has('from')&&p.get('from')>lensFrom?p.get('from'):lensFrom);
+ p.set('to',p.has('to')&&p.get('to')<lensTo?p.get('to'):lensTo);
+ }return p}
 async function getJson(url){const res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error((await res.text()).slice(0,300));return await res.json()}
 function heatViewRequest(z){
  const [w,h]=dimensions(),center=px(state.lat,state.lon,z),t=256;
@@ -5823,20 +9046,27 @@ if(state.known===0){zoomWaiting=false;canvas.style.opacity='1';$('busy').classLi
 const key=heatViewRequest(state.z);if(key===loadedKey){zoomWaiting=false;canvas.style.transform='';canvas.style.opacity='1';$('busy').classList.add('hidden');queueRender();return;}
 const id=state.generation;if(controller)controller.abort();controller=new AbortController();$('busy').textContent='Refining heatmap…';$('busy').classList.remove('hidden');
 try{const res=await fetch('/api/view?'+key,{signal:controller.signal,headers:{'X-LibreHeatmaps-View-Session':viewSession,'X-LibreHeatmaps-View-Serial':String(++viewSequence)}});if(!res.ok)throw Error('Map request failed: '+res.status);
-const data=await res.json();if(id!==state.generation)return;state.data=data;heatVisitGrid=new Map();
+const data=await res.json();if(id!==state.generation)return;state.data=data;if(window.lhJourneySpaceRefresh)window.lhJourneySpaceRefresh();heatVisitGrid=new Map();
 for(const cell of data.visits||[]){if(Array.isArray(cell)&&cell.length===3)heatVisitGrid.set(cell[0]+','+cell[1],cell[2]);}
 heatVisitTooltip.hidden=true;previousGeometry=null;loadedKey=key;zoomWaiting=false;
 if(!garminHomeActive||state.activeRideId)$('mapDetail').textContent=state.activeRideId?'Selected route · '+data.activities.toLocaleString()+' matching activity':data.activities.toLocaleString()+' matching activities in map area';queueRender();scheduleHeatPrefetch()}
 catch(e){if(e.name!=='AbortError'){zoomWaiting=false;canvas.style.transform='';canvas.style.opacity='1';$('busy').classList.add('hidden');loadedKey='';queueRender();$('mapDetail').textContent='Map update failed: '+e.message}}
 finally{if(id===state.generation)$('busy').classList.add('hidden')}
 }
-async function refreshStats(zoom=false){loadedKey='';const s=await getJson('/api/stats');if(s.count===0&&s.first_launch&&!$('welcomeDialog').open&&!welcomeHandled){welcomeHandled=true;requestAnimationFrame(()=>{$('welcomeDialog').showModal()})}const previous=state.known;state.known=s.count;state.bounds=s.bounds;state.focusBounds=s.focus_bounds||s.bounds;$('activityCount').textContent=s.count.toLocaleString();$('pointCount').textContent=s.points.toLocaleString();$('empty').classList.toggle('hidden',s.count>0);const current=$('sport').value;$('sport').innerHTML='<option value="">All activity types</option>';for(const [name,n] of s.types){const opt=document.createElement('option');opt.value=name;opt.textContent=name+' ('+n+')';$('sport').appendChild(opt)}$('sport').value=current;$('dateRange').textContent=s.first?'Available: '+s.first+' to '+s.last:'';if(s.count&&(zoom||!previous))fitBounds(state.focusBounds);else scheduleData()}
+let statsRefreshRevision=0;
+async function refreshStats(zoom=false){const requestRevision=++statsRefreshRevision;loadedKey='';const s=await getJson('/api/stats');if(requestRevision!==statsRefreshRevision)return;if(s.count===0&&s.first_launch&&!$('welcomeDialog').open&&!welcomeHandled){welcomeHandled=true;requestAnimationFrame(()=>{$('welcomeDialog').showModal()})}const previous=state.known;state.known=s.count;state.bounds=s.bounds;state.focusBounds=s.focus_bounds||s.bounds;$('activityCount').textContent=s.count.toLocaleString();$('pointCount').textContent=s.points.toLocaleString();$('empty').classList.toggle('hidden',s.count>0);const current=$('sport').value;$('sport').innerHTML='<option value="">All activity types</option>';for(const [name,n] of s.types){if(!matchesActivityFocus(name))continue;const opt=document.createElement('option');opt.value=name;opt.textContent=name+' ('+n+')';$('sport').appendChild(opt)}$('sport').value=current;$('dateRange').textContent=s.first?'Available: '+s.first+' to '+s.last:'';if(s.count&&(zoom||!previous))fitBounds(state.focusBounds);else scheduleData();lhLoadTimeLens().catch(()=>{})}
 function chooseMap(mode){state.mode=mode;$('defaultMap').value=mode;document.querySelectorAll('[data-map]').forEach(b=>b.classList.toggle('primary',b.dataset.map===mode));tileMap();queueRender();savePreferences()}
 document.querySelectorAll('[data-map]').forEach(b=>b.onclick=()=>chooseMap(b.dataset.map));
 function updatePrivacy(){
 
-$('tileNotice').textContent=state.online?'Online map tiles contact external providers'+(state.bikeRoutes?' including CyclOSM':'')+' and may reveal your IP and viewed map area. Track files and statistics remain local.':'Offline mode: no third-party map requests. Your route overlay remains available.';
+$('tileNotice').textContent=state.online?'Online map tiles contact external providers'+((state.bikeRoutes&&activityFocus!=='foot')?' including CyclOSM':'')+' and may reveal your IP and viewed map area. Track files and statistics remain local.':'Offline mode: no third-party map requests. Your route overlay remains available.';
 }
+$('activityFocus').addEventListener('change',async()=>{
+ const previous=activityFocus,next=$('activityFocus').value;
+ applyActivityFocus(next);
+ try{const response=await fetch('/api/activity-focus',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({activity_focus:next})});const saved=await response.json();if(!response.ok||saved.activity_focus!==next)throw Error(saved.error||'Could not save activity focus');if(savedSettings)savedSettings.activity_focus=next}
+ catch(e){applyActivityFocus(previous);$('activityFocusNote').textContent='Could not save focus: '+e.message}
+});
 $('bikeRoutes').addEventListener('change',()=>{state.bikeRoutes=$('bikeRoutes').checked;tileMap();updatePrivacy();savePreferences()});
 
 
@@ -5850,8 +9080,8 @@ function selectStatsTab(target){
 if(!['overview','analytics','advanced','activities','data','review','compare','yearbook'].includes(target))target='overview';
 for(const tab of document.querySelectorAll('[data-stats-tab]')){const active=tab.dataset.statsTab===target;tab.setAttribute('aria-selected',String(active));tab.tabIndex=active?0:-1}
 for(const panel of document.querySelectorAll('[data-stats-panel]'))panel.hidden=panel.dataset.statsPanel!==target;
-const labels={overview:['OVERVIEW','Your activity, at a glance','Totals, personal records and trends—together in one view.'],analytics:['ANALYTICS','Your riding patterns','Explore activity-level speed, time and distance across your history.'],activities:['ACTIVITIES','Your recorded routes','Browse your recent and longest GPS activities.'],data:['DATA EXPLORER','Every ride, in detail','Sort, filter, and choose which recorded measurements you want to see.'],advanced:['ADVANCED DATA','Garmin & weather insights','Explore available calories, temperature, wind, cadence and power measurements.'],review:['DATA QUALITY','Review your speed outliers','Inspect flagged rides and approve genuine high-speed performances.'],compare:['RIDE COMPARISON','Compare two routes','Look at your recorded rides together.'],yearbook:['YEAR IN REVIEW','Your personal yearbook','Annual adventures in one place.']};
-const item=labels[target];$('insightsEyebrow').textContent=item[0];$('insightsViewTitle').textContent=item[1];$('insightsViewDesc').textContent=item[2];$('insightsMain').scrollTop=0;if(target==='analytics'&&currentInsights)requestAnimationFrame(()=>renderAnalytics(currentInsights.analytics));if(target==='advanced'&&currentInsights)requestAnimationFrame(()=>renderAdvanced(currentInsights.advanced));if(target==='data')loadDataTable();if(target==='review')loadSpeedReview();if(target==='compare')loadCompareOptions();if(target==='yearbook')loadYearbook();
+const labels={overview:['OVERVIEW','Your activity, at a glance','Totals, records, trends, habits and gear in their original sections—plus your chosen personal cards.'],analytics:['ANALYTICS','Your movement patterns','Explore activity-level speed, time and distance across your history.'],activities:['ACTIVITIES','Your recorded routes','Browse your recent and longest GPS activities.'],data:['DATA EXPLORER','Every activity, in detail','Sort, filter, and choose which recorded measurements you want to see.'],advanced:['ADVANCED DATA','Garmin & weather insights','Explore available calories, temperature, wind, cadence and power measurements.'],review:['DATA QUALITY','Review your speed outliers','Inspect flagged rides and approve genuine high-speed performances.'],compare:['RIDE COMPARISON','Compare two routes','Look at your recorded rides together.'],yearbook:['YEAR IN REVIEW','Your personal yearbook','Annual adventures in one place.']};
+$('insightsTitle').textContent=target==='overview'?'Your overview':'Activity insights';const item=labels[target];if(activityFocus==='foot'){if(target==='analytics'){item[1]='Your activity patterns';item[2]='Explore pace, movement, distance and elevation across your history.'}if(target==='data')item[1]='Your activities, in detail';if(target==='compare')item[1]='Compare two activities'}$('insightsEyebrow').textContent=item[0];$('insightsViewTitle').textContent=item[1];$('insightsViewDesc').textContent=item[2];$('insightsMain').scrollTop=0;lhContextBuild(target);if($('statsDialog').open)lhRailSelect(target);if(target==='analytics'&&currentInsights)requestAnimationFrame(()=>renderAnalytics(currentInsights.analytics));if(target==='advanced'&&currentInsights)requestAnimationFrame(()=>renderAdvanced(currentInsights.advanced));if(target==='data')loadDataTable();if(target==='review')loadSpeedReview();if(target==='compare')loadCompareOptions();if(target==='yearbook')loadYearbook();
 }
 for(const tab of document.querySelectorAll('[data-stats-tab]')){tab.onclick=()=>selectStatsTab(tab.dataset.statsTab);tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(e.key))return;e.preventDefault();const tabs=Array.from(document.querySelectorAll('[data-stats-tab]:not([hidden])'));let i=tabs.indexOf(tab);i=e.key==='Home'?0:e.key==='End'?tabs.length-1:(i+(['ArrowRight','ArrowDown'].includes(e.key)?1:-1)+tabs.length)%tabs.length;selectStatsTab(tabs[i].dataset.statsTab);tabs[i].focus()}}
 async function dismissWelcome(){if(!$('welcomeDialog').open)return;$('welcomeDialog').close();try{await protectedAction('/api/welcome/dismiss')}catch(e){console.warn('Could not save welcome choice:',e.message)}}
@@ -5860,8 +9090,9 @@ $('welcomeImport').onclick=()=>{dismissWelcome();$('file').click()};
 $('welcomeDialog').addEventListener('cancel',e=>{e.preventDefault();dismissWelcome()});
 function nice(n,dec=0){return Number(n||0).toLocaleString(undefined,{maximumFractionDigits:dec,minimumFractionDigits:dec})}
 function distanceLabel(m){const miles=$('units').value==='mi';return nice(m/(miles?1609.344:1000),1)+(miles?' mi':' km')}
+function paceLabel(speedMps){if(!Number.isFinite(speedMps)||speedMps<=0)return 'Not recorded';const minutes=($('units').value==='mi'?1609.344:1000)/speedMps/60;if(!Number.isFinite(minutes)||minutes>120)return 'Not recorded';const seconds=Math.round(minutes*60),unit=$('units').value==='mi'?'mi':'km';return Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')+' /'+unit}
 function timeLabel(s){if(s===null||s===undefined||!Number.isFinite(s))return 'Not recorded';return s<3600?Math.round(Math.max(0,s)/60).toLocaleString()+' min':nice(s/3600,1)+' h'}
-function statsParams(){const p=new URLSearchParams();for(const [k,id] of [['sport','statsSport'],['bike','statsBike'],['year','statsYear'],['month','statsMonth']]){const v=$(id).value;if(v)p.set(k,v)}return p}
+function statsParams(){const p=new URLSearchParams();p.set('focus',activityFocus);for(const [k,id] of [['sport','statsSport'],['bike','statsBike'],['year','statsYear'],['month','statsMonth']]){const v=$(id).value;if(v)p.set(k,v)}return p}
 function bars(root,rows,key,asDistance=true){const el=$(root);el.replaceChildren();if(!rows.length){el.textContent='No dated activities in this selection.';return}const top=Math.max(...rows.map(r=>r[key]),1);for(const row of rows){const line=document.createElement('div');line.className='chart-row';const label=document.createElement('span'),track=document.createElement('div'),bar=document.createElement('div'),value=document.createElement('strong');label.textContent=row.year||(row.month?new Date(row.month+'-01T12:00:00').toLocaleDateString(undefined,{month:'short',year:'2-digit'}):'');track.className='chart-track';bar.className='chart-bar';bar.style.width=Math.max(1.5,100*row[key]/top)+'%';track.append(bar);value.textContent=asDistance?distanceLabel(row[key]):nice(row[key]);line.append(label,track,value);el.append(line)}}
 const ANALYTICS_SPECS={
  speedHistoryChart:{family:'speed',kind:'timeline',source:'speed_history',value:'speed_kmh',summary:'typical',unit:'speed',defaultStyle:'line',styles:['line','area','bar'],help:'Compares the typical average moving speed of recorded rides in each time period. Average gives equal weight to each eligible ride; Median reduces the influence of exceptionally fast or slow rides. Missing moving times are excluded.'},
@@ -5911,42 +9142,176 @@ function analyticsMakePlot(container,series,spec,style){container.replaceChildre
  const showTip=(event,row,label)=>{const rect=container.getBoundingClientRect(),sx=event?.clientX??rect.left+X(row.x),sy=event?.clientY??rect.top+Y(row.y);tip.textContent=label||((row.label||fmtX(row.x))+' · '+analyticsValue(row.y,series.yUnit)+' · '+row.n+' '+(row.n===1?'ride':'rides'));tip.hidden=false;const px=Math.max(5,Math.min((sx-rect.left)+13,W-215));tip.style.left=px+'px';tip.style.top=Math.max(4,Math.min(sy-rect.top-47,H-54))+'px'};
  function interactive(node,row,label){node.classList.add('plot-hit');const title=analyticsSVG('title',{},node);title.textContent=label||((row.label||fmtX(row.x))+': '+analyticsValue(row.y,series.yUnit));node.addEventListener('pointerenter',e=>showTip(e,row,label));node.addEventListener('pointermove',e=>showTip(e,row,label));node.addEventListener('pointerleave',()=>tip.hidden=true);if(rows.length<=65){node.setAttribute('tabindex','0');node.addEventListener('focus',()=>showTip(null,row,label));node.addEventListener('blur',()=>tip.hidden=true)}if(row.id){node.addEventListener('click',()=>openRidePreview(row.id));node.style.cursor='pointer'}}
  if(spec.kind==='relationship'&&style==='density'){
-  const nx=Math.min(28,Math.max(10,Math.round(PW/20))),ny=14,cells=new Map();for(const r of rows){const ix=Math.max(0,Math.min(nx-1,Math.floor((r.x-xmin)/(xmax-xmin)*nx))),iy=Math.max(0,Math.min(ny-1,Math.floor((r.y-ymin)/(ymax-ymin)*ny))),k=ix+','+iy;cells.set(k,(cells.get(k)||0)+1)}const highest=Math.max(...cells.values());for(const [key,n] of cells){const [ix,iy]=key.split(',').map(Number),width=PW/nx,height=PH/ny,rect=analyticsSVG('rect',{x:L+ix*width+.5,y:T+PH-(iy+1)*height+.5,width:Math.max(2,width-1),height:Math.max(2,height-1),rx:Math.min(width/3,3),fill:'#ed96c7',opacity:(.22+.76*Math.sqrt(n/highest)).toFixed(3)},svg);const center={x:xmin+(ix+.5)/nx*(xmax-xmin),y:ymin+(iy+.5)/ny*(ymax-ymin),n};interactive(rect,center,n+' '+(n===1?'ride':'rides')+' in this chart region')}
+  const nx=Math.min(28,Math.max(10,Math.round(PW/20))),ny=14,cells=new Map();for(const r of rows){const ix=Math.max(0,Math.min(nx-1,Math.floor((r.x-xmin)/(xmax-xmin)*nx))),iy=Math.max(0,Math.min(ny-1,Math.floor((r.y-ymin)/(ymax-ymin)*ny))),k=ix+','+iy;cells.set(k,(cells.get(k)||0)+1)}const highest=Math.max(...cells.values());for(const [key,n] of cells){const [ix,iy]=key.split(',').map(Number),width=PW/nx,height=PH/ny,rect=analyticsSVG('rect',{x:L+ix*width+.5,y:T+PH-(iy+1)*height+.5,width:Math.max(2,width-1),height:Math.max(2,height-1),rx:Math.min(width/3,3),fill:(()=>{const q=Math.sqrt(n/highest);return q>.80?'#0D3B66':q>.57?'#245F88':q>.35?'#4887A9':q>.17?'#74A8BE':'#A3C4D1'})(),opacity:1,stroke:'#F8F5EC','stroke-width':.7},svg);const center={x:xmin+(ix+.5)/nx*(xmax-xmin),y:ymin+(iy+.5)/ny*(ymax-ymin),n};interactive(rect,center,n+' '+(n===1?'ride':'rides')+' in this chart region')}
  }else if(style==='scatter'&&spec.kind==='relationship'){
-  const drawRows=rows.length>1600?rows.filter((r,i)=>i%Math.ceil(rows.length/1600)===0):rows;for(const r of drawRows){const dot=analyticsSVG('circle',{cx:X(r.x),cy:Y(r.y),r:3,fill:'#eaa0ca',opacity:.63,stroke:'#201a2d','stroke-width':.5},svg);interactive(dot,r)}
+  const drawRows=rows.length>1600?rows.filter((r,i)=>i%Math.ceil(rows.length/1600)===0):rows;for(const r of drawRows){const dot=analyticsSVG('circle',{cx:X(r.x),cy:Y(r.y),r:3,fill:'#F4D35E',opacity:.63,stroke:'#0D3B66','stroke-width':.5},svg);interactive(dot,r)}
  }else{
   const lineStyle=style==='line'||style==='area'||style==='trend';const baseY=Y(ymin);if(lineStyle&&rows.length>1){const shape=rows.map((r,i)=>(i?'L':'M')+X(r.x).toFixed(2)+','+Y(r.y).toFixed(2)).join(' ');if(style==='area'){analyticsSVG('path',{d:shape+` L${X(rows[rows.length-1].x)},${baseY} L${X(rows[0].x)},${baseY} Z`,class:'plot-area-new'},svg)}analyticsSVG('path',{d:shape,class:'plot-line-new'},svg)}
-  if(style==='bar'){let width;if(rows.length>1)width=Math.min(42,Math.max(3,PW/(rows.length+(spec.kind==='histogram'?0:1))*.76));else width=Math.min(90,PW/3);for(const r of rows){const x=X(r.x),y=Y(r.y);const bar=analyticsSVG('rect',{x:x-width/2,y,width,height:Math.max(1,baseY-y),rx:3,fill:'#bc83e3',opacity:.88},svg);interactive(bar,r)}}
+  if(style==='bar'){let width;if(rows.length>1)width=Math.min(42,Math.max(3,PW/(rows.length+(spec.kind==='histogram'?0:1))*.76));else width=Math.min(90,PW/3);for(const r of rows){const x=X(r.x),y=Y(r.y);const bar=analyticsSVG('rect',{x:x-width/2,y,width,height:Math.max(1,baseY-y),rx:3,fill:'#F4D35E',opacity:.88},svg);interactive(bar,r)}}
   else{const stride=rows.length>380?Math.ceil(rows.length/380):1;for(let i=0;i<rows.length;i+=stride){const r=rows[i];const dot=analyticsSVG('circle',{cx:X(r.x),cy:Y(r.y),r:rows.length>80?2.3:3.7,class:'plot-dot-new',opacity:rows.length>140?.72:1},svg);interactive(dot,r)}}
  }
  container.append(svg,tip);
 }
-function analyticsDownloadCsv(key){const series=analyticsSeries[key],spec=ANALYTICS_SPECS[key];if(!series||!spec)return;const esc=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const lines=[[spec.kind==='histogram'?'Value range':series.xUnit==='date'?'Recorded period':series.xUnit==='minutes'?'Moving time (minutes)':'X',series.yUnit==='speed'?'Speed ('+analyticsUnits().speed+')':series.yUnit==='distance'?'Distance ('+analyticsUnits().distance+')':series.yUnit==='hours'?'Moving time (hours)':series.yUnit==='percent'?'Cumulative (%)':'Number of activities','Activities represented'].map(esc).join(',')];for(const row of series.rows){const x=series.xUnit==='date'?analyticsDateString(row.x,analyticsPrefs.grain):series.xUnit==='minutes'?row.x:series.raw.length&&spec.kind==='histogram'?row.label:row.x;lines.push([x,row.y,row.n].map(esc).join(','))}const blob=new Blob(['\uFEFF'+lines.join('\\r\\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='LibreHeatmaps-'+key.replace('Chart','')+'.csv';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1500)}
+function analyticsDownloadCsv(key){const series=analyticsSeries[key],spec=ANALYTICS_SPECS[key];if(!series||!spec)return;const esc=v=>'"'+String(v??'').replace(/"/g,'""')+'"';const lines=[[spec.kind==='histogram'?'Value range':series.xUnit==='date'?'Recorded period':series.xUnit==='minutes'?'Moving time (minutes)':'X',series.yUnit==='speed'?'Speed ('+analyticsUnits().speed+')':series.yUnit==='distance'?'Distance ('+analyticsUnits().distance+')':series.yUnit==='hours'?'Moving time (hours)':series.yUnit==='percent'?'Cumulative (%)':'Number of activities','Activities represented'].map(esc).join(',')];for(const row of series.rows){const x=series.xUnit==='date'?analyticsDateString(row.x,analyticsPrefs.grain):series.xUnit==='minutes'?row.x:series.raw.length&&spec.kind==='histogram'?row.label:row.x;lines.push([x,row.y,row.n].map(esc).join(','))}const blob=new Blob(['\uFEFF'+lines.join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='LibreHeatmaps-'+key.replace('Chart','')+'.csv';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1500)}
 function analyticsBuildTable(card,series){const specForTable=ANALYTICS_SPECS[card.dataset.analyticsId];const details=card.querySelector('.analytics-table');if(!details)return;const body=details.querySelector('tbody');body.replaceChildren();for(const r of series.rows.slice(-80)){const tr=document.createElement('tr');for(const value of [specForTable.kind==='histogram'?r.label:series.xUnit==='date'?analyticsDateString(r.x,analyticsPrefs.grain):series.xUnit==='minutes'?analyticsValue(r.x/60,'hours'):analyticsValue(r.x,series.xUnit),analyticsValue(r.y,series.yUnit),String(r.n)]){const td=document.createElement('td');td.textContent=value;tr.append(td)}body.append(tr)}details.querySelector('.analytics-table-note').textContent=series.rows.length>80?'Showing the last 80 of '+series.rows.length.toLocaleString()+' plotted values. Export CSV for the full chart.':'The table reflects the current chart settings and filters.';details.querySelectorAll('th')[0].textContent=specForTable.kind==='histogram'?'Value range':series.xUnit==='date'?'Date':series.xUnit==='minutes'?'Moving time':'Range';details.querySelectorAll('th')[1].textContent='Value'}
 function analyticsSetupCard(card,spec){if(card.dataset.analyticsControlsReady)return;card.dataset.analyticsControlsReady='1';const key=card.dataset.analyticsId,head=card.querySelector('.analytics-card-head'),tools=document.createElement('div');tools.className='analytics-card-tools';const label=document.createElement('label');label.textContent='Chart style';const select=document.createElement('select');select.className='analytics-style';select.setAttribute('aria-label','Chart style for '+card.querySelector('h5').textContent);for(const m of spec.styles){const option=document.createElement('option');option.value=m;option.textContent={line:'Line',area:'Filled area',bar:'Bars',scatter:'Individual dots',density:'Density map',trend:'Binned trend',cumulative:'Cumulative %'}[m];select.append(option)}label.append(select);const buttons=document.createElement('div');buttons.className='analytics-card-buttons';const expand=document.createElement('button');expand.type='button';expand.className='analytics-expand';expand.textContent='Expand';expand.setAttribute('aria-pressed','false');expand.onclick=()=>{card.classList.toggle('expanded');const active=card.classList.contains('expanded');expand.setAttribute('aria-pressed',String(active));expand.textContent=active?'Reduce':'Expand';requestAnimationFrame(()=>renderAnalytics(currentInsights?.analytics))};const csv=document.createElement('button');csv.type='button';csv.textContent='Export CSV';csv.onclick=()=>analyticsDownloadCsv(key);buttons.append(expand,csv);if(key==='distanceDistributionChart'){const rangeLabel=document.createElement('label');rangeLabel.textContent='Distance range';const rangeSelect=document.createElement('select');rangeSelect.className='analytics-distance-range';rangeSelect.setAttribute('aria-label','Distance distribution range');for(const [value,caption] of [['typical','Typical rides'],['full','Full range']]){const option=document.createElement('option');option.value=value;option.textContent=caption;rangeSelect.append(option)}rangeSelect.value=analyticsPrefs.distanceRange;rangeSelect.onchange=()=>{analyticsPrefs.distanceRange=rangeSelect.value;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)};rangeLabel.append(rangeSelect);tools.append(label,rangeLabel,buttons)}else tools.append(label,buttons);head.after(tools);const summary=document.createElement('div');summary.className='analytics-card-summary';card.querySelector('.analytics-plot').after(summary);const details=document.createElement('details');details.className='analytics-table';details.innerHTML='<summary>View chart data</summary><table><thead><tr><th scope="col">Date</th><th scope="col">Value</th><th scope="col">Activities</th></tr></thead><tbody></tbody></table><p class="analytics-table-note"></p>';summary.after(details);select.onchange=()=>{analyticsPrefs.styles[key]=select.value;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)}}
 function renderAnalytics(a){if(!a)return;for(const id of ['Period','Grain','Typical','Scale','Layout']){$('analytics'+id).value=analyticsPrefs[id.toLowerCase()]}$('analyticsGrid').classList.toggle('layout-double',analyticsPrefs.layout==='double');for(const b of document.querySelectorAll('[data-analytics-category]'))b.setAttribute('aria-pressed',String(b.dataset.analyticsCategory===analyticsPrefs.category));const count=(a.activity_distances||[]).length;$('analyticsCount').textContent=count.toLocaleString()+' dated activities available'+(currentInsights?.analytics_limited?' · most recent 20,000 shown':'');
- for(const [key,spec] of Object.entries(ANALYTICS_SPECS)){const card=document.querySelector('[data-analytics-id="'+key+'"]');if(!card)continue;analyticsSetupCard(card,spec);card.hidden=analyticsPrefs.category!=='all'&&analyticsPrefs.category!==spec.family;if(card.hidden)continue;const select=card.querySelector('.analytics-style');const style=spec.styles.includes(analyticsPrefs.styles[key])?analyticsPrefs.styles[key]:spec.defaultStyle;select.value=style;if(key==='distanceDistributionChart')card.querySelector('.analytics-distance-range').value=analyticsPrefs.distanceRange;const series=analyticsChartRows(a,spec,style);analyticsSeries[key]=series;const plot=$(key);analyticsMakePlot(plot,series,spec,style);const summary=card.querySelector('.analytics-card-summary');summary.replaceChildren();const left=document.createElement('span');left.textContent=series.raw.length.toLocaleString()+' activities · '+series.rows.length.toLocaleString()+' '+(spec.kind==='timeline'?'periods':spec.kind==='histogram'?'ranges':style==='density'?'positions':style==='trend'?'groups':'points');const right=document.createElement('strong');right.textContent=spec.kind==='timeline'?((spec.summary==='typical'?'Typical speed':'Total across selected periods')+' · '+(analyticsPrefs.grain==='month'?'monthly':analyticsPrefs.grain==='week'?'weekly':'yearly')):spec.kind==='histogram'?'Ride counts by value range':style==='density'?'Brighter = more rides':style==='scatter'?(series.rows.length>1600?'Dots sampled for clarity · full data in CSV':'Each dot = one ride'):'Average by duration group';if(analyticsPrefs.scale==='focus'&&style!=='bar'&&style!=='density'&&spec.kind!=='histogram')right.textContent+=' · Focused axis';summary.append(left,right);analyticsBuildTable(card,series)}
+ for(const [key,spec] of Object.entries(ANALYTICS_SPECS)){const card=document.querySelector('[data-analytics-id="'+key+'"]');if(!card)continue;analyticsSetupCard(card,spec);card.hidden=analyticsPrefs.category!=='all'&&analyticsPrefs.category!==spec.family;if(card.hidden)continue;const select=card.querySelector('.analytics-style');const style=spec.styles.includes(analyticsPrefs.styles[key])?analyticsPrefs.styles[key]:spec.defaultStyle;select.value=style;if(key==='distanceDistributionChart')card.querySelector('.analytics-distance-range').value=analyticsPrefs.distanceRange;const series=analyticsChartRows(a,spec,style);analyticsSeries[key]=series;const plot=$(key);analyticsMakePlot(plot,series,spec,style);const summary=card.querySelector('.analytics-card-summary');summary.replaceChildren();const left=document.createElement('span');left.textContent=series.raw.length.toLocaleString()+' activities · '+series.rows.length.toLocaleString()+' '+(spec.kind==='timeline'?'periods':spec.kind==='histogram'?'ranges':style==='density'?'positions':style==='trend'?'groups':'points');const right=document.createElement('strong');right.textContent=spec.kind==='timeline'?((spec.summary==='typical'?'Typical speed':'Total across selected periods')+' · '+(analyticsPrefs.grain==='month'?'monthly':analyticsPrefs.grain==='week'?'weekly':'yearly')):spec.kind==='histogram'?'Ride counts by value range':style==='density'?'Darker = more rides':style==='scatter'?(series.rows.length>1600?'Dots sampled for clarity · full data in CSV':'Each dot = one ride'):'Average by duration group';if(analyticsPrefs.scale==='focus'&&style!=='bar'&&style!=='density'&&spec.kind!=='histogram')right.textContent+=' · Focused axis';summary.append(left,right);analyticsBuildTable(card,series)}
 }
 for(const id of ['Period','Grain','Typical','Scale','Layout'])$('analytics'+id).addEventListener('change',()=>{analyticsPrefs[id.toLowerCase()]=$('analytics'+id).value;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)});
 for(const b of document.querySelectorAll('[data-analytics-category]'))b.addEventListener('click',()=>{analyticsPrefs.category=b.dataset.analyticsCategory;analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)});
 $('analyticsReset').onclick=()=>{analyticsPrefs={...ANALYTICS_DEFAULTS,styles:{}};analyticsSavePrefs();renderAnalytics(currentInsights?.analytics)};
 let analyticsResizeTimer=null;window.addEventListener('resize',()=>{if(currentInsights&&$('statsDialog').open&&!$('statsAnalytics').hidden){clearTimeout(analyticsResizeTimer);analyticsResizeTimer=setTimeout(()=>renderAnalytics(currentInsights.analytics),160)}});
 
+ 
+const lhRecordPreview=document.createElement('aside');lhRecordPreview.className='lh-record-hover';lhRecordPreview.id='lhRecordPreview';lhRecordPreview.hidden=true;lhRecordPreview.setAttribute('role','tooltip');
+const lhRecordPreviewTitle=document.createElement('strong'),lhRecordPreviewMeta=document.createElement('small'),lhRecordPreviewCanvas=document.createElement('canvas'),lhRecordPreviewNote=document.createElement('div');lhRecordPreviewNote.className='lh-record-hover-status';
+const lhRecordPreviewMap=document.createElement('div');lhRecordPreviewMap.className='lh-mini-map lh-record-hover-map';
+const lhRecord3D=document.createElement('div');lhRecord3D.className='lh-hover-elevation';lhRecord3D.hidden=true;const lhRecord3DLabel=document.createElement('div');lhRecord3DLabel.className='lh-hover-elevation-label';lhRecord3DLabel.textContent='3D ELEVATION · RECORDED GPS';const lhRecord3DCanvas=document.createElement('canvas');lhRecord3DCanvas.setAttribute('role','img');lhRecord3DCanvas.setAttribute('aria-label','Miniature raised elevation profile from the recorded GPS altitude');lhRecord3D.append(lhRecord3DLabel,lhRecord3DCanvas);
+const lhRecordTiles=document.createElement('div');lhRecordTiles.className='lh-mini-tiles';lhRecordTiles.setAttribute('aria-hidden','true');
+const lhRecordTileCredit=document.createElement('span');lhRecordTileCredit.className='lh-map-credit';lhRecordTileCredit.textContent='© OpenStreetMap contributors';
+lhRecordPreviewMap.append(lhRecordTiles,lhRecordPreviewCanvas,lhRecordTileCredit);
+lhRecordPreview.append(lhRecordPreviewTitle,lhRecordPreviewMeta,lhRecordPreviewMap,lhRecord3D,lhRecordPreviewNote);$('statsDialog').append(lhRecordPreview);
+let lhRecordPreviewTimer=0,lhRecordPreviewSerial=0,lhRecordPreviewTarget=null;const lhRecordPreviewCache=new Map();
+function lhRecordPreviewHide(){clearTimeout(lhRecordPreviewTimer);++lhRecordPreviewSerial;lhRecordPreview.hidden=true;lhRecordPreviewTarget=null;lhRecord3D.hidden=true}
+ 
+ 
+function lhDrawLocalRouteMap(container,rawPoints,selectedPoint=null,options={}){
+ const canvas=container.querySelector('canvas'),ctx=canvas?.getContext('2d'),tileLayer=container.querySelector('.lh-mini-tiles');
+ if(!canvas||!ctx||!tileLayer)return;
+ const w=Math.max(180,Math.round(container.clientWidth||270)),h=Math.max(95,Math.round(container.clientHeight||126));
+ const dpr=Math.min(2,window.devicePixelRatio||1);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ const points=Array.isArray(rawPoints)?rawPoints:[];
+ const step=Math.max(1,Math.ceil(points.length/2200)),route=[];
+ for(let i=0;i<points.length;i+=step){const p=points[i];
+  if(!p){route.push(null);continue}
+  const lat=Array.isArray(p)?Number(p[0]):Number(p.lat),lon=Array.isArray(p)?Number(p[1]):Number(p.lon);
+  route.push(Number.isFinite(lat)&&Number.isFinite(lon)&&Math.abs(lat)<=85&&Math.abs(lon)<=180?{lat,lon}:null)
+ }
+ const good=route.filter(Boolean);const online=!!state.online&&good.length>=2;
+ container.classList.toggle('lh-mini-map-online',online);
+ container.querySelector('.lh-map-credit')?.classList.toggle('hidden',!online);
+ if(good.length<2){tileLayer.replaceChildren();tileLayer.dataset.view='';ctx.fillStyle='#35556B';ctx.font='12px system-ui';ctx.textAlign='center';ctx.fillText('No GPS geometry for this record',w/2,h/2);return}
+ 
+ const centerLon=good[0].lon;
+ for(const p of good)p.lon=centerLon+((p.lon-centerLon+540)%360-180);
+ const merc=(lat,lon,z)=>{const t=Math.max(-85.0511,Math.min(85.0511,lat))*Math.PI/180,scale=256*(2**z);return [(lon+180)/360*scale,(1-Math.log(Math.tan(t)+1/Math.cos(t))/Math.PI)/2*scale]};
+ let zoom=2,range=null;
+ for(let z=19;z>=2;z--){const coords=good.map(p=>merc(p.lat,p.lon,z));const xx=coords.map(p=>p[0]),yy=coords.map(p=>p[1]);const dx=Math.max(...xx)-Math.min(...xx),dy=Math.max(...yy)-Math.min(...yy);
+  if((dx<=w-18&&dy<=h-18)||z===2){zoom=z;range={minX:Math.min(...xx),maxX:Math.max(...xx),minY:Math.min(...yy),maxY:Math.max(...yy)};break}
+ }
+ if(options.overviewZoomOffset&&!options.follow){
+  zoom=Math.max(2,Math.min(19,zoom+Math.round(Number(options.overviewZoomOffset)||0)));
+  const coords=good.map(p=>merc(p.lat,p.lon,zoom));
+  const xx=coords.map(p=>p[0]),yy=coords.map(p=>p[1]);
+  range={minX:Math.min(...xx),maxX:Math.max(...xx),minY:Math.min(...yy),maxY:Math.max(...yy)};
+ }
+ let left=(range.minX+range.maxX-w)/2,top=(range.minY+range.maxY-h)/2;
+ const follow=!!(options.follow&&selectedPoint&&Number.isFinite(Number(selectedPoint.lat))&&Number.isFinite(Number(selectedPoint.lon)));
+ if(follow){
+  zoom=Math.max(12,Math.min(17,zoom+3+(Number(options.zoomOffset)||0)));
+  const lon=centerLon+((Number(selectedPoint.lon)-centerLon+540)%360-180),[cx,cy]=merc(Number(selectedPoint.lat),lon,zoom);
+ 
+  left=Math.round((cx-w/2)/16)*16;top=Math.round((cy-h/2)/16)*16;
+ }
+ const miniStyle=state.mode==='satellite'?'satellite':state.mode==='light'?'light':'dark';
+ container.dataset.mapStyle=miniStyle;
+ const miniCredit=container.querySelector('.lh-map-credit');
+ if(miniCredit)miniCredit.textContent=miniStyle==='satellite'?'Imagery © Esri and imagery providers':'© OpenStreetMap contributors';
+ const signature=[zoom,Math.round(left),Math.round(top),w,h,online,miniStyle].join(':');
+ if(tileLayer.dataset.view!==signature){tileLayer.replaceChildren();tileLayer.dataset.view=signature;
+  if(online){const count=2**zoom;for(let y=Math.floor(top/256);y<=Math.floor((top+h)/256);y++){if(y<0||y>=count)continue;
+   for(let x=Math.floor(left/256);x<=Math.floor((left+w)/256);x++){
+    const tile=document.createElement('img');tile.alt='';tile.decoding='async';tile.loading='eager';tile.referrerPolicy='strict-origin-when-cross-origin';
+    tile.onerror=()=>{tile.style.visibility='hidden'};
+    tile.style.transform=`translate3d(${x*256-left}px,${y*256-top}px,0)`;
+    tile.src=tileUrl(zoom,((x%count)+count)%count,y);tileLayer.append(tile)
+   }
+  }}
+ }
+ if(!online){ctx.strokeStyle='#D6E3D8';ctx.lineWidth=.8;for(let x=15;x<w;x+=30){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}for(let y=15;y<h;y+=30){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}}
+ const xy=(p)=>{const [x,y]=merc(p.lat,p.lon,zoom);return [x-left,y-top]};ctx.beginPath();let last=false;
+ for(const p of route){if(!p){last=false;continue}const [x,y]=xy(p);if(last)ctx.lineTo(x,y);else ctx.moveTo(x,y);last=true}
+ ctx.lineCap='round';ctx.lineJoin='round';ctx.strokeStyle='#092B49';ctx.lineWidth=5.4;ctx.stroke();ctx.strokeStyle='#F4D35E';ctx.lineWidth=2.8;ctx.stroke();
+ if(options.progress!==undefined){
+ 
+  const fraction=Math.max(0,Math.min(1,Number(options.progress)||0));
+  const cutoff=fraction*(route.length-1);ctx.beginPath();let drawing=false;
+  for(let i=0;i<route.length&&i<=Math.ceil(cutoff);i++){
+   const p=route[i];if(!p){drawing=false;continue}const [x,y]=xy(p);
+   if(!drawing)ctx.moveTo(x,y);else ctx.lineTo(x,y);drawing=true;
+   if(i>=cutoff&&i>0)break;
+  }
+  ctx.strokeStyle='#FFFDF7';ctx.lineWidth=5.2;ctx.stroke();ctx.strokeStyle='#F4D35E';ctx.lineWidth=3.5;ctx.stroke();
+ }
+ container._lhRouteProjection={route,zoom,left,top,merc,centerLon,selectedPoint};
+ const markers=[[good[0],'#0D3B66'],[good.at(-1),'#F4D35E']];
+ if(selectedPoint){const lat=Number(selectedPoint.lat),lon=Number(selectedPoint.lon);if(Number.isFinite(lat)&&Number.isFinite(lon))markers.push([{lat,lon:centerLon+((lon-centerLon+540)%360-180)},'#FFFDF7'])}
+ for(const [p,color] of markers){const [x,y]=xy(p);if(color==='#FFFDF7'){
+    ctx.beginPath();ctx.arc(x,y,13,0,Math.PI*2);ctx.fillStyle='rgba(244,211,94,.24)';ctx.fill();
+    ctx.beginPath();ctx.arc(x,y,8.5,0,Math.PI*2);ctx.strokeStyle='#082A48';ctx.lineWidth=3;ctx.stroke();
+   }
+   ctx.beginPath();ctx.arc(x,y,color==='#FFFDF7'?5.7:4.2,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();ctx.strokeStyle='#0D3B66';ctx.lineWidth=2;ctx.stroke()
+ }
+}
+function lhDrawRecord3DMini(samples,serial){
+ if(serial!==lhRecordPreviewSerial||lhRecordPreview.hidden)return;
+ const good=Array.isArray(samples)?samples.filter(s=>Array.isArray(s)&&Number.isFinite(s[1])&&Number.isFinite(s[2])&&Number.isFinite(s[8])&&Math.abs(s[1])<=90&&Math.abs(s[2])<=180):[];
+ if(good.length<8){lhRecord3D.hidden=true;return}
+ lhRecord3D.hidden=false;
+ const canvas=lhRecord3DCanvas,w=Math.max(220,Math.round(lhRecord3D.clientWidth||268)),h=82,dpr=Math.min(window.devicePixelRatio||1,2);
+ canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);
+ const step=Math.max(1,Math.ceil(good.length/155)),pts=good.filter((_,i)=>i%step===0||i===good.length-1);
+ let min=Math.min(...pts.map(s=>s[8])),max=Math.max(...pts.map(s=>s[8]));if(max-min<4){const mid=(min+max)/2;min=mid-2;max=mid+2}
+ const x=i=>9+(w-30)*i/Math.max(1,pts.length-1),y=a=>57-33*(a-min)/(max-min),depth=12,base=69;
+ for(let i=1;i<pts.length;i++){
+  const x1=x(i-1),x2=x(i),y1=y(pts[i-1][8]),y2=y(pts[i][8]),t=(pts[i][8]-min)/(max-min);
+  c.fillStyle=t>.72?'rgba(244,211,94,.25)':t>.35?'rgba(104,193,181,.30)':'rgba(59,153,194,.28)';c.beginPath();c.moveTo(x1,y1);c.lineTo(x2,y2);c.lineTo(x2+depth,y2+6);c.lineTo(x1+depth,y1+6);c.closePath();c.fill();
+  if(i%9===0){c.strokeStyle='rgba(133,179,187,.16)';c.beginPath();c.moveTo(x2,y2);c.lineTo(x2,base);c.stroke()}
+ }
+ c.beginPath();pts.forEach((s,i)=>i?c.lineTo(x(i),y(s[8])):c.moveTo(x(i),y(s[8])));c.strokeStyle='#0D3B66';c.lineWidth=4;c.lineJoin='round';c.stroke();c.strokeStyle='#F4D35E';c.lineWidth=2.4;c.stroke();
+ c.fillStyle='#31556E';c.font='10px system-ui';c.fillText('Measured elevation: '+Math.round(min)+'–'+Math.round(max)+' m',9,79);
+}
+const lhRecordElevationCache=new Map();
+function lhRecordPreviewElevation(id,serial){
+ lhRecord3D.hidden=true;
+ if(lhRecordElevationCache.has(id)){lhDrawRecord3DMini(lhRecordElevationCache.get(id),serial);return}
+ getJson('/api/telemetry?id='+encodeURIComponent(id)).then(data=>{const samples=data?.samples||[];lhRecordElevationCache.set(id,samples);if(lhRecordElevationCache.size>8)lhRecordElevationCache.delete(lhRecordElevationCache.keys().next().value);lhDrawRecord3DMini(samples,serial)}).catch(()=>{if(serial===lhRecordPreviewSerial)lhRecord3D.hidden=true});
+}
+
+function lhRecordPreviewDraw(points){lhDrawLocalRouteMap(lhRecordPreviewMap,points)}
+function lhRecordPreviewShow(target){const id=target.dataset.lhPreviewId;if(!id)return;const serial=++lhRecordPreviewSerial;lhRecordPreviewTarget=target;const rect=target.getBoundingClientRect(),outer=$('statsDialog').getBoundingClientRect();
+ const left=Math.max(outer.left+9,Math.min(outer.right-303,rect.left+rect.width/2-146)),top=Math.max(outer.top+80,Math.min(outer.bottom-234,rect.top-25));
+ lhRecordPreview.style.left=Math.max(8,left)+'px';lhRecordPreview.style.top=Math.max(8,top)+'px';lhRecordPreviewTitle.textContent=target.dataset.lhPreviewTitle||'Recorded activity';lhRecordPreviewMeta.textContent='Local route preview';lhRecordPreviewNote.textContent='Loading GPS geometry…';lhRecordPreview.hidden=false;lhRecord3D.hidden=true;lhRecordPreviewElevation(String(id),serial);
+ const cached=lhRecordPreviewCache.get(String(id));if(cached){lhRecordPreviewMeta.textContent=[cached.day,cached.sport,distanceLabel(cached.distance_m)].filter(Boolean).join(' · ');lhRecordPreviewNote.textContent='Select this record to open the detailed activity map.';lhRecordPreviewDraw(cached.points);return}
+ getJson('/api/activity?id='+encodeURIComponent(id)).then(data=>{if(serial!==lhRecordPreviewSerial||!$('statsDialog').open)return;
+  lhRecordPreviewCache.set(String(id),data);if(lhRecordPreviewCache.size>8)lhRecordPreviewCache.delete(lhRecordPreviewCache.keys().next().value);
+  lhRecordPreviewMeta.textContent=[data.day,data.sport,distanceLabel(data.distance_m)].filter(Boolean).join(' · ');lhRecordPreviewNote.textContent='Select this record to open the detailed activity map.';lhRecordPreviewDraw(data.points);
+ }).catch(()=>{if(serial===lhRecordPreviewSerial)lhRecordPreviewNote.textContent='Route preview unavailable. Select to open the activity.'})
+}
+function lhRegisterRecordHover(el,id,label){if(!id)return;el.dataset.lhPreviewId=String(id);el.dataset.lhPreviewTitle=label||'Recorded activity';el.setAttribute('aria-describedby','lhRecordPreview');
+ el.addEventListener('pointerenter',()=>{clearTimeout(lhRecordPreviewTimer);lhRecordPreviewTimer=setTimeout(()=>lhRecordPreviewShow(el),320)});
+ el.addEventListener('pointerleave',lhRecordPreviewHide);
+ el.addEventListener('focus',()=>{clearTimeout(lhRecordPreviewTimer);lhRecordPreviewTimer=setTimeout(()=>lhRecordPreviewShow(el),130)});
+ el.addEventListener('blur',lhRecordPreviewHide)
+}
+$('statsDialog').addEventListener('close',lhRecordPreviewHide);$('statsDialog').addEventListener('keydown',e=>{if(e.key==='Escape')lhRecordPreviewHide()},true);
 function fillStats(s){
-currentInsights=s;advancedDataEnabled=!!s.advanced_enabled;$('tabAdvanced').hidden=!advancedDataEnabled;if(!advancedDataEnabled&&$('tabAdvanced').getAttribute('aria-selected')==='true')selectStatsTab('overview');dataMakeColumns();if(advancedDataEnabled&&!$('statsAdvanced').hidden)renderAdvanced(s.advanced);renderAnalytics(s.analytics);const grid=$('metricGrid');grid.replaceChildren();
+currentInsights=s;advancedDataEnabled=!!s.advanced_enabled;$('tabAdvanced').hidden=false;dataMakeColumns();if(advancedDataEnabled&&!$('statsAdvanced').hidden)renderAdvanced(s.advanced);renderAnalytics(s.analytics);const grid=$('metricGrid');grid.replaceChildren();
 const speedUnit=$('units').value==='mi'?' mph':' km/h';
 const peakSpeed=s.peak_speed_mps===null?'Not recorded':nice(s.peak_speed_mps*($('units').value==='mi'?2.236936:3.6),1)+speedUnit;
 const metricGroups=[
  {key:'distance',title:'Routes & distance',items:[['Total distance',distanceLabel(s.distance_m)],['Average route',distanceLabel(s.avg_distance_m)],['Activities',nice(s.count)],['GPS tracks',nice(s.mapped_gps_count)]]},
  {key:'time',title:'Time on the move',items:[['Moving time',s.moving_count?timeLabel(s.moving_seconds):'Not recorded'],['Elapsed time',s.elapsed_count?timeLabel(s.elapsed_seconds):'Not recorded'],['Average moving time',s.moving_count?timeLabel(s.moving_seconds/s.moving_count):'Not recorded']]},
- {key:'speed',title:'Speed',items:[['Average moving speed',s.overall_avg_speed_kmh!==null?nice(s.overall_avg_speed_kmh*($('units').value==='mi'?.621371:1),1)+speedUnit:'Not recorded'],['Peak recorded speed',peakSpeed,s.peak_speed?.id]]},
+ {key:'speed',title:activityFocus==='foot'?'Pace':'Speed',items:activityFocus==='foot'?[['Overall moving pace',s.overall_avg_speed_kmh!==null?paceLabel(s.overall_avg_speed_kmh/3.6):'Not recorded'],['Activities with moving-time data',nice(s.moving_count)]]:[['Average moving speed',s.overall_avg_speed_kmh!==null?nice(s.overall_avg_speed_kmh*($('units').value==='mi'?.621371:1),1)+speedUnit:'Not recorded'],['Peak recorded speed',peakSpeed,s.peak_speed?.id]]},
  {key:'rhythm',title:'Elevation & consistency',items:[['Elevation gained',s.elevation_count?nice(s.elevation_m*($('units').value==='mi'?3.28084:1),0)+($('units').value==='mi'?' ft':' m'):'Not recorded'],['Active days',nice(s.active_days)],['Longest streak',nice(s.longest_streak)+' days']]}
 ];
 for(const group of metricGroups){
  const section=document.createElement('section');section.className='stats-metric-group stats-group--'+group.key;
  const heading=document.createElement('h5');heading.className='stats-metric-group-label';heading.textContent=group.title;
  const cards=document.createElement('div');cards.className='stats-metric-cards';
- for(const [label,value,rideId] of group.items){const el=document.createElement(rideId?'button':'div');el.className='metric';if(rideId){el.type='button';el.title='Preview the fastest recorded activity';el.onclick=()=>openRidePreview(rideId)}const strong=document.createElement('strong'),small=document.createElement('span');strong.textContent=value;small.textContent=label;el.append(strong,small);cards.append(el)}
+ for(const [label,value,rideId] of group.items){const el=document.createElement(rideId?'button':'div');el.className='metric';if(rideId){el.type='button';el.title='Preview the fastest recorded activity';el.onclick=()=>{lhRecordPreviewHide();openRidePreview(rideId)};lhRegisterRecordHover(el,rideId,label)}const strong=document.createElement('strong'),small=document.createElement('span');strong.textContent=value;small.textContent=label;el.append(strong,small);cards.append(el)}
  section.append(heading,cards);grid.append(section);
 }
 const facts=$('facts'),milestones=$('milestones');facts.replaceChildren();milestones.replaceChildren();
@@ -5955,14 +9320,14 @@ const unitsImperial=$('units').value==='mi';
 const tempValue=v=>nice(unitsImperial?v*9/5+32:v,1)+(unitsImperial?' °F':' °C');
 const windValue=v=>nice(v*(unitsImperial?2.236936:3.6),1)+(unitsImperial?' mph':' km/h');
 const detail=r=>[r.name,r.day].filter(Boolean).join(' · ');
-if(s.longest_ride)endurance.push(['Longest ride',distanceLabel(s.longest_ride.distance_m),detail(s.longest_ride),s.longest_ride.id]);
-if(s.longest&&!s.longest_ride)endurance.push(['Longest activity',distanceLabel(s.longest.distance_m),detail(s.longest),s.longest.id]);
+if(activityFocus!=='foot'&&s.longest_ride)endurance.push(['Longest ride',distanceLabel(s.longest_ride.distance_m),detail(s.longest_ride),s.longest_ride.id]);
+if(s.longest&&(activityFocus==='foot'||!s.longest_ride))endurance.push(['Longest activity',distanceLabel(s.longest.distance_m),detail(s.longest),s.longest.id]);
 if(s.longest_moving)endurance.push(['Longest moving time',timeLabel(s.longest_moving.moving_seconds),detail(s.longest_moving),s.longest_moving.id]);
-const ascentRecord=s.max_ascent_ride||s.max_ascent;
-if(ascentRecord)endurance.push([s.max_ascent_ride?'Most climbing in a ride':'Most elevation in an activity',nice(ascentRecord.elevation_m*(unitsImperial?3.28084:1),0)+(unitsImperial?' ft':' m'),detail(ascentRecord),ascentRecord.id]);
+const ascentRecord=activityFocus==='foot'?s.max_ascent:(s.max_ascent_ride||s.max_ascent);
+if(ascentRecord)endurance.push([activityFocus!=='foot'&&s.max_ascent_ride?'Most climbing in a ride':'Most elevation in an activity',nice(ascentRecord.elevation_m*(unitsImperial?3.28084:1),0)+(unitsImperial?' ft':' m'),detail(ascentRecord),ascentRecord.id]);
 if(s.biggest_distance_month)endurance.push(['Biggest distance month',distanceLabel(s.biggest_distance_month.distance_m),s.biggest_distance_month.month]);
-if(s.peak_speed)performance.push(['Peak recorded speed',nice(s.peak_speed.speed_mps*(unitsImperial?2.236936:3.6),1)+speedUnit,detail(s.peak_speed),s.peak_speed.id]);
-if(s.fastest)performance.push(['Fastest average speed',nice(s.fastest.speed_kmh*(unitsImperial?.621371:1),1)+speedUnit,detail(s.fastest),s.fastest.id]);
+if(activityFocus!=='foot'&&s.peak_speed)performance.push(['Peak recorded speed',nice(s.peak_speed.speed_mps*(unitsImperial?2.236936:3.6),1)+speedUnit,detail(s.peak_speed),s.peak_speed.id]);
+if(activityFocus!=='foot'&&s.fastest)performance.push(['Fastest average speed',nice(s.fastest.speed_kmh*(unitsImperial?.621371:1),1)+speedUnit,detail(s.fastest),s.fastest.id]);
 const ar=s.advanced_records||{};
 function addAdvanced(target,key,label,convert){const r=ar[key];if(r)target.push([label,convert(r.value),detail(r)+' · '+nice(r.coverage)+' recorded',r.id])}
 if(s.advanced_enabled){
@@ -5972,12 +9337,12 @@ if(s.advanced_enabled){
  addAdvanced(conditions,'strongest_gust','Strongest wind gust',windValue);
  addAdvanced(sensors,'warmest_device','Highest device temperature',tempValue);
  addAdvanced(sensors,'coldest_device','Lowest device temperature',tempValue);
- addAdvanced(sensors,'highest_avg_cadence','Highest cycling cadence average',v=>nice(v,0)+' rpm');
+ if(activityFocus!=='foot')addAdvanced(sensors,'highest_avg_cadence','Highest cycling cadence average',v=>nice(v,0)+' rpm');
  addAdvanced(sensors,'highest_max_cadence','Highest recorded cadence peak',v=>nice(v,0)+' rpm');
  addAdvanced(sensors,'most_cycles','Most recorded cycles / strokes',v=>nice(v,0)+' cycles');
  addAdvanced(sensors,'highest_normalized_power','Highest normalized power',v=>nice(v,0)+' W');
  addAdvanced(sensors,'highest_training_stress','Highest training stress',v=>nice(v,1)+' TSS');
- if(ar.mean_ride_cadence)sensors.push(['Average of recorded ride cadences',nice(ar.mean_ride_cadence.value,0)+' rpm',nice(ar.mean_ride_cadence.coverage)+' activities with cadence data']);
+ if(activityFocus!=='foot'&&ar.mean_ride_cadence)sensors.push(['Average of recorded ride cadences',nice(ar.mean_ride_cadence.value,0)+' rpm',nice(ar.mean_ride_cadence.coverage)+' activities with cadence data']);
  addAdvanced(sensors,'highest_avg_power','Highest average power',v=>nice(v,0)+' W');
  addAdvanced(sensors,'highest_max_power','Highest recorded power',v=>nice(v,0)+' W');
  addAdvanced(sensors,'highest_avg_heart_rate','Highest average heart rate',v=>nice(v,0)+' bpm');
@@ -5991,7 +9356,7 @@ if(s.average_weekly_distance_m)history.push(['Distance per active week',distance
 if(s.first&&s.last)history.push(['History range',s.first,s.last]);
 function renderRecordCards(root,items){for(const [label,value,footnote,id] of items){
  const el=document.createElement(id?'button':'div');el.className='record-metric metric'+(id?' record-metric-link':'');
- if(id){el.type='button';el.title='Preview source activity for '+label.toLowerCase();el.onclick=()=>openRidePreview(id)}
+ if(id){el.type='button';el.title='Preview source activity for '+label.toLowerCase();el.onclick=()=>{lhRecordPreviewHide();openRidePreview(id)};lhRegisterRecordHover(el,id,label)}
  const stat=document.createElement('strong'),caption=document.createElement('span'),foot=document.createElement('small');
  stat.textContent=value;caption.textContent=label;foot.textContent=footnote||'';
  el.append(stat,caption,foot);root.append(el)
@@ -6020,6 +9385,7 @@ const weekdays=$('weekdayChart');weekdays.replaceChildren();
 const highest=Math.max(1,...s.weekdays.map(v=>v.count));
 for(const day of s.weekdays){const row=document.createElement('div');row.className='weekday-row';const lbl=document.createElement('span');lbl.textContent=day.name;const track=document.createElement('div');track.className='chart-track';const fill=document.createElement('div');fill.className='chart-bar';fill.style.width=(day.count/highest*100)+'%';track.append(fill);const number=document.createElement('strong');number.textContent=nice(day.count);row.append(lbl,track,number);weekdays.append(row)}
 updateSpeedReviewTab(s);$('statAccuracy').textContent=`${(s.filter_speed_anomalies||s.filter_speed_smart)?'Speed values excluded from calculations by enabled data-quality filters: '+s.excluded_speed_activities+'. Review flagged rides under Review anomalies, or inspect their original values in Data explorer. ':''}GPS coverage: ${s.mapped_gps_count}/${s.count} mapped routes. Source-reported distance: ${s.strava_distance_count}/${s.count}. Moving time: ${s.moving_count}/${s.count} (${s.moving_estimated_count} GPS estimates). Elevation: ${s.elevation_count}/${s.count} (${s.elevation_estimated_count} GPS estimates). Peak speed: ${s.peak_speed_count}/${s.count} with recorded Max Speed; this is a single reported maximum, so GPS spikes may affect it. Other distances are derived from sampled GPS tracks. Import a complete Strava or Garmin account ZIP to add available recorded totals and activity details; Strava activities.csv and bike files can also provide gear assignments.`;
+if(typeof lhDashboardSync==='function')lhDashboardSync();if(typeof lhOverviewSync==='function')lhOverviewSync();
 }
 function renderAdvanced(data){
  const root=$('advancedCards'),charts=$('advancedGraphs');root.replaceChildren();charts.replaceChildren();
@@ -6040,17 +9406,17 @@ function renderAdvanced(data){
   const range=hi-lo;hi+=range*.07;if(lo<0)lo-=range*.07;
   const pointY=v=>top+(hi-v)/(hi-lo)*plotH,baseY=pointY(0),svg=analyticsSVG('svg',{viewBox:`0 0 ${viewW} ${viewH}`,width:'100%',height:'auto',role:'img','aria-label':title+', '+recent.length+' months of recorded data'});
   for(let i=0;i<=4;i++){
-   const val=lo+(hi-lo)*i,y=pointY(val);analyticsSVG('line',{x1:left,y1:y,x2:viewW-right,y2:y,stroke:'#6a5575','stroke-opacity':'.48','stroke-dasharray':'3 5'},svg);
-   const text=analyticsSVG('text',{x:left-9,y:y+4,'text-anchor':'end','font-size':11,fill:'#cdbcd8'},svg);text.textContent=Number(val.toFixed(Math.abs(val)<10?1:0)).toLocaleString();
+   const val=lo+(hi-lo)*i,y=pointY(val);analyticsSVG('line',{x1:left,y1:y,x2:viewW-right,y2:y,stroke:'#9AB2C3','stroke-opacity':'.48','stroke-dasharray':'3 5'},svg);
+   const text=analyticsSVG('text',{x:left-9,y:y+4,'text-anchor':'end','font-size':11,fill:'#D7E3E6'},svg);text.textContent=Number(val.toFixed(Math.abs(val)<10?1:0)).toLocaleString();
   }
-  analyticsSVG('line',{x1:left,y1:baseY,x2:viewW-right,y2:baseY,stroke:'#b397c6','stroke-opacity':'.9'},svg);
+  analyticsSVG('line',{x1:left,y1:baseY,x2:viewW-right,y2:baseY,stroke:'#AFC3CF','stroke-opacity':'.9'},svg);
   const step=plotW/recent.length,barWidth=Math.max(3,Math.min(23,step*.66));
   for(let i=0;i<recent.length;i++){
-   const [month,value,count]=recent[i],x=left+(i+.5)*step,y=pointY(value),height=Math.max(1.5,Math.abs(y-baseY)),rect=analyticsSVG('rect',{x:x-barWidth/2,y:Math.min(y,baseY),width:barWidth,height,rx:Math.min(3,barWidth/3),fill:value<0?'#e48fba':'#b688d2'},svg),tip=analyticsSVG('title',{},rect);
+   const [month,value,count]=recent[i],x=left+(i+.5)*step,y=pointY(value),height=Math.max(1.5,Math.abs(y-baseY)),rect=analyticsSVG('rect',{x:x-barWidth/2,y:Math.min(y,baseY),width:barWidth,height,rx:Math.min(3,barWidth/3),fill:value<0?'#B66A32':'#F4D35E'},svg),tip=analyticsSVG('title',{},rect);
    tip.textContent=month+' · '+value.toLocaleString(undefined,{maximumFractionDigits:1})+' '+unit+' · '+count+' activities';
   }
   const count=Math.min(5,recent.length);for(let k=0;k<count;k++){
-   const i=count===1?0:Math.round(k*(recent.length-1)/(count-1)),month=recent[i][0],tick=analyticsSVG('text',{x:left+(i+.5)*step,y:viewH-14,'font-size':11,'text-anchor':'middle',fill:'#cdbcd8'},svg);tick.textContent=month.slice(2,4)+'/'+month.slice(5,7);
+   const i=count===1?0:Math.round(k*(recent.length-1)/(count-1)),month=recent[i][0],tick=analyticsSVG('text',{x:left+(i+.5)*step,y:viewH-14,'font-size':11,'text-anchor':'middle',fill:'#D7E3E6'},svg);tick.textContent=month.slice(2,4)+'/'+month.slice(5,7);
   }
   const chart=document.createElement('div');chart.className='advanced-chart';chart.append(svg);
   const info=document.createElement('p');info.className='muted';info.textContent=recent[0][0]+' – '+recent.at(-1)[0]+' · '+recent.length+' recorded months · '+unit;
@@ -6062,9 +9428,11 @@ function renderAdvanced(data){
 }
 function renderRideList(target,rides){
 const root=$(target);root.replaceChildren();if(!rides||!rides.length){root.textContent='No activities in this selection.';return}
-for(const ride of rides){const button=document.createElement('button');button.type='button';button.className='ride-list-item';button.title='Open route preview';const name=document.createElement('strong');name.textContent=ride.name||'Untitled activity';const meta=document.createElement('span');meta.textContent=[ride.day,ride.sport,distanceLabel(ride.distance_m)].filter(Boolean).join(' · ');button.append(name,meta);button.onclick=()=>openRidePreview(ride.id);root.append(button)}
+for(const ride of rides){const wrapper=document.createElement('div');wrapper.className='lh-activity-action';const button=document.createElement('button');button.type='button';button.className='ride-list-item';button.title='Open route preview';const name=document.createElement('strong');name.textContent=ride.name||'Untitled activity';const meta=document.createElement('span');meta.textContent=[ride.day,ride.sport,distanceLabel(ride.distance_m)].filter(Boolean).join(' · ');button.append(name,meta);button.onclick=()=>{lhRecordPreviewHide();openRidePreview(ride.id)};lhRegisterRecordHover(button,ride.id,ride.name||'Recorded activity');const to3d=document.createElement('button');to3d.type='button';to3d.className='lh-activity-3d';to3d.textContent='Elevation';to3d.title='Explore recorded elevation in 3D';to3d.setAttribute('aria-label','Open 3D elevation for '+(ride.name||'this activity'));to3d.onclick=()=>lhOpen3DFromList(ride.id);const toFlyover=document.createElement('button');toFlyover.type='button';toFlyover.className='lh-activity-flyover';toFlyover.textContent='Flyover';toFlyover.title='Open the existing online 3D terrain flyover';toFlyover.setAttribute('aria-label','Open 3D flyover for '+(ride.name||'this activity'));toFlyover.onclick=()=>lhOpenFlyoverFromList(ride.id);wrapper.append(button,to3d,toFlyover);root.append(wrapper)}
 }
-let previewRide=null;let rideProjection=null;
+async function lhOpen3DFromList(id){lhRecordPreviewHide();await openRidePreview(id);if($('ridePreviewDialog').open&&previewRide&&String(previewRide.id)===String(id))await elevationOpen()}
+async function lhOpenFlyoverFromList(id){lhRecordPreviewHide();await openRidePreview(id);if($('ridePreviewDialog').open&&previewRide&&String(previewRide.id)===String(id))await openFlyover()}
+let previewRide=null;let rideProjection=null;let ridePreviewView=null;let ridePreviewFrame=0;
 const TELEMETRY_METRICS=[
  {key:'speed_mps',idx:3,label:'Speed',format:v=>((v*($('units').value==='mi'?2.236936:3.6)).toFixed(1)+($('units').value==='mi'?' mph':' km/h'))},
  {key:'heart_rate_bpm',idx:4,label:'Heart rate',format:v=>Math.round(v)+' bpm'},
@@ -6073,7 +9441,22 @@ const TELEMETRY_METRICS=[
  {key:'altitude_m',idx:8,label:'Elevation',format:v=>(v*($('units').value==='mi'?3.28084:1)).toFixed(0)+($('units').value==='mi'?' ft':' m')},
  {key:'temp_c',idx:7,label:'Temperature',format:v=>($('units').value==='mi'?(v*9/5+32):v).toFixed(1)+($('units').value==='mi'?' °F':' °C')}
 ];
-let telemetrySamples=[],telemetrySelection=-1,telemetryRequest=0;
+let telemetrySamples=[],telemetrySelection=-1,telemetryRequest=0, v123PendingPeak=null;
+function v123JumpToPeak(metric){
+ if(!previewRide)return;
+ const peak=previewRide.peak_samples?.[metric];if(!peak)return;
+ if(!telemetrySamples.length){v123PendingPeak=metric;$('ridePreviewStatus').textContent='Loading the recorded GPS sample for this peak…';return}
+ let index=telemetrySamples.findIndex(s=>s[0]===peak.timestamp&&Math.abs(s[1]-peak.position[0])<.000001&&Math.abs(s[2]-peak.position[1])<.000001);
+ if(index<0){$('ridePreviewStatus').textContent='The peak sample is not available in this ride trace.';return}
+ const key=metric==='speed'?'speed_mps':'cadence_rpm';
+ if([...$('telemetryMetric').options].some(o=>o.value===key))$('telemetryMetric').value=key;
+ const focus=telemetryCoords(telemetrySamples[index]);if(focus&&ridePreviewView){const world=px(focus[0],focus[1],0);ridePreviewView.centerX=world[0];ridePreviewView.centerY=world[1];drawRidePreview(previewRide)}
+ selectTelemetrySample(index);
+ const moment=new Date(peak.timestamp*1000).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit',second:'2-digit'});
+ $('ridePreviewStatus').textContent='Peak '+(metric==='speed'?'sampled speed':'sampled cadence')+' located at '+moment+'. The pin marks its recorded GPS position; ride-wide reported maxima may differ.';
+ $('ridePreviewCanvas').scrollIntoView({behavior:'smooth',block:'center'});
+}
+
 function activeTelemetryMetric(){return TELEMETRY_METRICS.find(x=>x.key===$('telemetryMetric').value)||null}
 function telemetryCoords(sample){return sample&&sample.length>=3&&Number.isFinite(sample[1])&&Number.isFinite(sample[2])?[sample[1],sample[2]]:null}
 function drawTelemetryMarker(){
@@ -6083,7 +9466,7 @@ function drawTelemetryMarker(){
  const coords=telemetryCoords(telemetrySamples[telemetrySelection]);if(!coords)return;
  const world=px(coords[0],coords[1],0),x=world[0]*rideProjection.scale-rideProjection.left,y=world[1]*rideProjection.scale-rideProjection.top;
  if(!Number.isFinite(x)||!Number.isFinite(y)||x<0||y<0||x>rideProjection.w||y>rideProjection.h)return;
- ctx.setTransform(rideProjection.dpr,0,0,rideProjection.dpr,0,0);ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);ctx.fillStyle='#1a1129';ctx.fill();ctx.lineWidth=2.5;ctx.strokeStyle='#fff0dc';ctx.stroke();ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fillStyle='#ffa54c';ctx.fill();ctx.setTransform(1,0,0,1,0,0);
+ ctx.setTransform(rideProjection.dpr,0,0,rideProjection.dpr,0,0);ctx.beginPath();ctx.arc(x,y,10,0,Math.PI*2);ctx.fillStyle='#0D3B66';ctx.fill();ctx.lineWidth=2.5;ctx.strokeStyle='#fff0dc';ctx.stroke();ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fillStyle='#ffa54c';ctx.fill();ctx.setTransform(1,0,0,1,0,0);
 }
 function telemetryChartLayout(){const canvas=$('telemetryCanvas'),w=Math.max(240,canvas.clientWidth||canvas.parentElement.clientWidth||500),h=Math.max(160,canvas.clientHeight||220);return {canvas,w,h,left:54,right:16,top:24,bottom:30}}
 function drawTelemetryChart(){
@@ -6102,12 +9485,12 @@ function drawTelemetryChart(){
  const getX=i=>left+Math.max(0,Math.min(1,(telemetrySamples[i][0]-minT)/span))*plotW;
  const getY=v=>top+(hi-Math.max(lo,Math.min(hi,v)))/(hi-lo)*plotH;
  ctx.font='11px system-ui';ctx.textAlign='right';ctx.lineWidth=1;
- for(let k=0;k<=4;k++){const v=lo+(hi-lo)*k/4,y=getY(v);ctx.strokeStyle='#57476288';ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();ctx.fillStyle='#b5a4c4';ctx.fillText(Number(v.toFixed(1)).toLocaleString(),left-9,y+4)}
- ctx.textAlign='left';ctx.fillStyle='#b5a4c4';ctx.fillText('Start',left,h-7);ctx.textAlign='right';ctx.fillText('Finish',w-right,h-7);
- const gradient=ctx.createLinearGradient(left,0,w-right,0);gradient.addColorStop(0,'#ad8bf2');gradient.addColorStop(.55,'#f76eab');gradient.addColorStop(1,'#ffb365');
+ for(let k=0;k<=4;k++){const v=lo+(hi-lo)*k/4,y=getY(v);ctx.strokeStyle='#57476288';ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(w-right,y);ctx.stroke();ctx.fillStyle='#B8D0D7';ctx.fillText(Number(v.toFixed(1)).toLocaleString(),left-9,y+4)}
+ ctx.textAlign='left';ctx.fillStyle='#B8D0D7';ctx.fillText('Start',left,h-7);ctx.textAlign='right';ctx.fillText('Finish',w-right,h-7);
+ const gradient=ctx.createLinearGradient(left,0,w-right,0);gradient.addColorStop(0,'#0D3B66');gradient.addColorStop(.55,'#F4D35E');gradient.addColorStop(1,'#FFCE7C');
  ctx.strokeStyle=gradient;ctx.lineWidth=2.4;ctx.lineJoin='round';ctx.lineCap='round';ctx.beginPath();let drawing=false;
  for(let i=0;i<displayed.length;i++){if(displayed[i]===null){drawing=false;continue}const x=getX(i),y=getY(displayed[i]);if(!drawing)ctx.moveTo(x,y);else ctx.lineTo(x,y);drawing=true}ctx.stroke();
- if(cadence){ctx.fillStyle='#c49cde70';for(let i=0;i<values.length;i++){if(values[i]!==0)continue;const x=getX(i);ctx.fillRect(x,h-bottom-4,1.25,4)}}
+ if(cadence){ctx.fillStyle='#F4D35E70';for(let i=0;i<values.length;i++){if(values[i]!==0)continue;const x=getX(i);ctx.fillRect(x,h-bottom-4,1.25,4)}}
  if(telemetrySelection>=0&&telemetrySamples[telemetrySelection]){
   const index=telemetrySelection,x=getX(index);ctx.strokeStyle='#ffdcba';ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,h-bottom);ctx.stroke();ctx.setLineDash([]);
   if(values[index]!==null){ctx.beginPath();ctx.arc(x,getY(values[index]),5,0,2*Math.PI);ctx.fillStyle='#ffad66';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='#211b2c';ctx.stroke()}
@@ -6116,13 +9499,14 @@ function drawTelemetryChart(){
 function selectTelemetrySample(index){
  if(!telemetrySamples.length)return;telemetrySelection=Math.max(0,Math.min(telemetrySamples.length-1,Math.round(index)));
  $('telemetryScrub').value=String(telemetrySelection);
+ $('telemetryExplorePlace').hidden=!telemetryCoords(telemetrySamples[telemetrySelection]);
  const m=activeTelemetryMetric(),s=telemetrySamples[telemetrySelection],v=s[m?.idx];
  const when=Number.isFinite(s[0])?new Date(s[0]*1000).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit',second:'2-digit'}):'Time unavailable';
  $('telemetryStatus').textContent=(m?.key==='cadence_rpm'?'Cadence trend smoothed; coasting (0 rpm) shown as bottom ticks. Raw reading: ':'')+(telemetrySelection+1).toLocaleString()+' / '+telemetrySamples.length.toLocaleString()+' · '+when+' · '+(m?.label||'Measurement')+': '+(typeof v==='number'&&Number.isFinite(v)?m.format(v):'Not recorded')+' · Move the slider to follow the GPS position.';
  drawTelemetryChart();drawTelemetryMarker();
 }
 async function loadRideTelemetry(id){
- const request=++telemetryRequest;telemetrySamples=[];telemetrySelection=-1;$('rideTelemetry').hidden=false;$('telemetryCanvas').hidden=true;$('telemetryScrub').hidden=true;
+ const request=++telemetryRequest;telemetrySamples=[];telemetrySelection=-1;$('telemetryExplorePlace').hidden=true;$('rideTelemetry').hidden=false;$('telemetryCanvas').hidden=true;$('telemetryScrub').hidden=true;
  $('telemetryStatus').textContent='Loading recorded sensor measurements…';
  try{
   const result=await getJson('/api/telemetry?id='+encodeURIComponent(id));
@@ -6133,18 +9517,25 @@ async function loadRideTelemetry(id){
   telemetrySamples=samples;$('telemetryMetric').replaceChildren();for(const m of available){const option=document.createElement('option');option.value=m.key;option.textContent=m.label;$('telemetryMetric').append(option)}
   $('telemetryMetric').value=available.find(m=>m.key==='speed_mps')?.key||available[0].key;
   $('telemetryCanvas').hidden=false;$('telemetryScrub').hidden=false;$('telemetryScrub').min='0';$('telemetryScrub').max=String(samples.length-1);$('telemetryScrub').step='1';
-  requestAnimationFrame(()=>selectTelemetrySample(0));
+  requestAnimationFrame(()=>{selectTelemetrySample(0);if(v123PendingPeak){const metric=v123PendingPeak;v123PendingPeak=null;v123JumpToPeak(metric)}});
  }catch(e){if(request===telemetryRequest&&$('ridePreviewDialog').open)$('telemetryStatus').textContent='Telemetry unavailable: '+e.message}
 }
 $('telemetryMetric').onchange=()=>{if(telemetrySamples.length)selectTelemetrySample(Math.max(0,telemetrySelection))};
 $('telemetryScrub').oninput=e=>selectTelemetrySample(Number(e.target.value));
+$('telemetryExplorePlace').addEventListener('click',()=>{
+ const coords=telemetryCoords(telemetrySamples[telemetrySelection]);if(!coords)return;
+ $('ridePreviewDialog').close();if($('statsDialog').open)$('statsDialog').close();
+ $('lhNavMap').click();state.activeRideId=null;$('clearRide').hidden=true;
+ state.lat=coords[0];state.lon=coords[1];state.z=Math.max(state.z,13);
+ updateMap(true);lhExplorePlace(coords[0],coords[1]);
+});
 function telemetryPointer(e){if(!telemetrySamples.length)return;const r=$('telemetryCanvas').getBoundingClientRect();const left=54,right=16,at=Math.max(0,Math.min(1,(e.clientX-r.left-left)/Math.max(1,r.width-left-right)));const t0=telemetrySamples[0][0],target=t0+at*(telemetrySamples.at(-1)[0]-t0);let low=0,high=telemetrySamples.length-1;while(low<high){const mid=(low+high)>>1;if(telemetrySamples[mid][0]<target)low=mid+1;else high=mid}if(low>0&&Math.abs(telemetrySamples[low-1][0]-target)<Math.abs(telemetrySamples[low][0]-target))low--;if(low!==telemetrySelection)selectTelemetrySample(low)}
 $('telemetryCanvas').addEventListener('pointermove',telemetryPointer);$('telemetryCanvas').addEventListener('click',telemetryPointer);
 
 function updateSpeedReviewTab(info){
- const active=!!(info.filter_speed_anomalies||info.filter_speed_smart),tab=$('tabReview');tab.hidden=!active;
+ const active=!!(info.filter_speed_anomalies||info.filter_speed_smart),tab=$('tabReview');tab.hidden=false;
  $('reviewNavCount').textContent=info.excluded_speed_activities+' excluded in selection';
- if(!active&&tab.getAttribute('aria-selected')==='true')selectStatsTab('overview');
+ 
 }
 async function loadSpeedReview(){
  if(!$('statsDialog').open||$('statsReview').hidden)return;
@@ -6261,7 +9652,10 @@ function flyoverUpdateHud(point){
  const elev=s&&Number.isFinite(s[8])?s[8]*($('units').value==='mi'?3.28084:1):null;
  $('flyoverSpeed').textContent=speed===null?'—':speed.toFixed(1)+($('units').value==='mi'?' mph':' km/h');
  $('flyoverElevation').textContent=elev===null?'—':Math.round(elev)+($('units').value==='mi'?' ft':' m');
- $('flyoverHeart').textContent=s&&Number.isFinite(s[4])?Math.round(s[4])+' bpm':'—';
+ $('flyoverHeart').textContent=lhSampleReading(s,4,'heart');
+ $('flyoverCadence').textContent=lhSampleReading(s,6,'cadence');
+ $('flyoverPower').textContent=lhSampleReading(s,5,'power');
+ $('flyoverTemp').textContent=lhSampleReading(s,7,'temp');
 }
 function flyoverHeadingAt(distance){
  const behind=flyoverAtDistance(distance-90),ahead=flyoverAtDistance(distance+270);
@@ -6327,7 +9721,7 @@ function flyoverInstallShade(map,source){
   if(map.getLayer('flyoverShadingLayer'))map.removeLayer('flyoverShadingLayer');
   if(map.getSource('flyoverShading'))map.removeSource('flyoverShading');
   map.addSource('flyoverShading',source);
-  map.addLayer({id:'flyoverShadingLayer',type:'hillshade',source:'flyoverShading',layout:{visibility:'visible'},paint:{'hillshade-method':'combined','hillshade-illumination-anchor':'map','hillshade-exaggeration':$('flyoverRelief').value==='1'?.72:1,'hillshade-shadow-color':'#1d1525','hillshade-highlight-color':'#fff5e6','hillshade-accent-color':'#34263a','hillshade-illumination-direction':315}});
+  map.addLayer({id:'flyoverShadingLayer',type:'hillshade',source:'flyoverShading',layout:{visibility:'visible'},paint:{'hillshade-method':'combined','hillshade-illumination-anchor':'map','hillshade-exaggeration':$('flyoverRelief').value==='1'?.72:1,'hillshade-shadow-color':'#0D3B66','hillshade-highlight-color':'#fff5e6','hillshade-accent-color':'#174C75','hillshade-illumination-direction':315}});
   flyoverShadingWarning=false;
  }catch(e){flyoverShadingWarning=true;flyoverStatus('Terrain shading could not be initialized: '+e.message,true)}
 }
@@ -6441,7 +9835,7 @@ async function openFlyover(){
   flyoverPath=data.path;flyoverSegments=data.segments;flyoverLength=data.length;
   flyoverCruise=flyoverClamp(20+Math.sqrt(flyoverLength/1000)*12,48,124);flyoverDuration=flyoverLength/flyoverCruise;flyoverSpeedMeters=0;
   const first=flyoverPoint(0),look=flyoverPoint(.01);
-  const map=new library.Map({container:'flyoverViewport',style:{version:8,sources:{imagery:{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:19,attribution:'Imagery © Esri and contributors'}},layers:[{id:'imagery',type:'raster',source:'imagery',paint:{'raster-contrast':.10,'raster-saturation':.08}}],sky:{'sky-color':'#867c93','sky-horizon-blend':.65,'horizon-color':'#d2c6c9','horizon-fog-blend':.25,'fog-color':'#c5bec5','fog-ground-blend':.20}},center:first.coord,zoom:15.18,pitch:60.5,bearing:flyoverBearing(first.coord,look.coord),maxPitch:80,antialias:false,interactive:true,attributionControl:true,fadeDuration:0,renderWorldCopies:false});
+  const map=new library.Map({container:'flyoverViewport',style:{version:8,sources:{imagery:{type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,maxzoom:19,attribution:'Imagery © Esri and contributors'}},layers:[{id:'imagery',type:'raster',source:'imagery',paint:{'raster-contrast':.10,'raster-saturation':.08}}],sky:{'sky-color':'#174C75','sky-horizon-blend':.65,'horizon-color':'#D6E3E9','horizon-fog-blend':.25,'fog-color':'#C5D6DC','fog-ground-blend':.20}},center:first.coord,zoom:15.18,pitch:60.5,bearing:flyoverBearing(first.coord,look.coord),maxPitch:80,antialias:false,interactive:true,attributionControl:true,fadeDuration:0,renderWorldCopies:false});
   flyoverMap=map;map.addControl(new library.NavigationControl({visualizePitch:true}),'top-right');
   for(const name of ['dragstart','rotatestart','pitchstart'])map.on(name,()=>{if(id===flyoverSession&&!flyoverDrivingCamera)flyoverFollowSet(false)});
   map.on('error',event=>{if(id!==flyoverSession)return;const message=String(event?.error?.message||'');if(/openfreemap|flyoverBuildings/i.test(message)){if(!flyoverBuildingsWarning){flyoverBuildingsWarning=true;flyoverStatus('Some 3D building tiles could not be loaded; terrain and 2D playback are unaffected.',true)}return}if(!flyoverTerrainReady&&/terrain|terrarium|elevation-tiles|mapterhorn|s3.amazonaws|dem/i.test(message)&&!flyoverTerrainWarning){flyoverTerrainWarning=true;flyoverStatus('Some elevation tiles failed to load; the 3D terrain may be incomplete.',true)}});
@@ -6453,8 +9847,8 @@ async function openFlyover(){
    flyoverInstallBuildings(map);
    flyoverApplySurface();
    map.addSource('flyoverRoute',{type:'geojson',data:flyoverFeature('MultiLineString',flyoverSegments)});
-   map.addLayer({id:'flyoverRouteShadow',type:'line',source:'flyoverRoute',paint:{'line-color':'#23102f','line-width':8,'line-opacity':.90},layout:{'line-join':'round','line-cap':'round'}});
-   map.addLayer({id:'flyoverRouteLine',type:'line',source:'flyoverRoute',paint:{'line-color':'#efa0eb','line-width':3.5,'line-opacity':.95},layout:{'line-join':'round','line-cap':'round'}});
+   map.addLayer({id:'flyoverRouteShadow',type:'line',source:'flyoverRoute',paint:{'line-color':'#0D3B66','line-width':8,'line-opacity':.90},layout:{'line-join':'round','line-cap':'round'}});
+   map.addLayer({id:'flyoverRouteLine',type:'line',source:'flyoverRoute',paint:{'line-color':'#F4D35E','line-width':3.5,'line-opacity':.95},layout:{'line-join':'round','line-cap':'round'}});
    map.addSource('flyoverTraveled',{type:'geojson',data:flyoverFeature('MultiLineString',[[first.coord,first.coord]])});
    map.addLayer({id:'flyoverTraveledLine',type:'line',source:'flyoverTraveled',paint:{'line-color':'#ffba69','line-width':5,'line-opacity':1},layout:{'line-join':'round','line-cap':'round'}});
    const dot=document.createElement('div'),center=document.createElement('span');dot.className='flyover-rider-marker';dot.setAttribute('aria-hidden','true');dot.append(center);
@@ -6516,7 +9910,7 @@ const btn=$('saveActivityEdit');btn.disabled=true;status.textContent='Saving loc
 $('restoreActivityEdit').onclick=async()=>{if(!activityEditId||!confirm('Restore the original imported values for this activity?'))return;try{await v122Post('/api/activity-edit',{activity_id:activityEditId,action:'restore'});$('activityEditDialog').close();await openRidePreview(activityEditId);await refreshStats(true)}catch(e){$('activityEditStatus').textContent=e.message}};
 function drawRouteRepairComparison(review){const canvas=$('routeRepairCanvas'),ctx=canvas.getContext('2d');if(!ctx)return;const w=canvas.width,h=canvas.height;ctx.clearRect(0,0,w,h);const before=review.original_points||[],after=review.proposed_points||[];const valid=before.filter(Boolean);if(!valid.length)return;let north=-90,south=90,west=180,east=-180;for(const point of valid){north=Math.max(north,point[0]);south=Math.min(south,point[0]);west=Math.min(west,point[1]);east=Math.max(east,point[1])}const mid=(north+south)/2,lonFactor=Math.max(.1,Math.cos(mid*Math.PI/180));const spanX=Math.max(.000015,(east-west)*lonFactor),spanY=Math.max(.000015,north-south),scale=Math.min((w-48)/spanX,(h-36)/spanY);const centerX=(east+west)/2,centerY=(north+south)/2;
 const xy=p=>[w/2+(p[1]-centerX)*lonFactor*scale,h/2-(p[0]-centerY)*scale];const draw=(points,color,width,dash)=>{ctx.beginPath();let begun=false;for(const p of points){if(!p){begun=false;continue}const [x,y]=xy(p);if(begun)ctx.lineTo(x,y);else ctx.moveTo(x,y);begun=true}ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineCap='round';ctx.lineJoin='round';ctx.setLineDash(dash);ctx.stroke();ctx.setLineDash([])};
-draw(before,'#db70ad',3,[7,4]);draw(after,'#7aefba',2.5,[]);for(const p of review.proposals||[]){const [x,y]=xy(p.outlier);ctx.beginPath();ctx.arc(x,y,4,0,2*Math.PI);ctx.fillStyle='#ffc76e';ctx.fill()}}
+draw(before,'#FFCE7C',3,[7,4]);draw(after,'#FAF0CA',2.5,[]);for(const p of review.proposals||[]){const [x,y]=xy(p.outlier);ctx.beginPath();ctx.arc(x,y,4,0,2*Math.PI);ctx.fillStyle='#ffc76e';ctx.fill()}}
 async function openRouteRepair(){if(!previewRide)return;routeRepairId=previewRide.id;routeRepairSnapshot=null;$('routeRepairDialog').showModal();$('routeRepairStatus').textContent='Reviewing local GPS positions…';$('routeRepairCandidates').replaceChildren();$('applyRouteRepair').disabled=true;$('restoreRouteRepair').hidden=true;const ctx=$('routeRepairCanvas').getContext('2d');ctx?.clearRect(0,0,900,270);
 try{const review=await getJson('/api/route-repair?id='+routeRepairId);routeRepairSnapshot=review;
 if(review.applied){$('routeRepairStatus').textContent='A reviewed repair has been applied to this route.';$('routeRepairSummary').textContent=(review.changes?.length||0)+' GPS anomaly correction(s); original GPS coordinates and recorded telemetry are preserved for restoration.';$('restoreRouteRepair').hidden=false;return}
@@ -6525,53 +9919,85 @@ $('routeRepairSummary').textContent='Original stored GPS distance: '+(review.ori
 for(const proposal of review.proposals){const label=document.createElement('label'),input=document.createElement('input'),copy=document.createElement('span');input.type='checkbox';input.value=proposal.sample_index;input.checked=true;input.onchange=()=>{$('applyRouteRepair').disabled=!$('routeRepairCandidates').querySelector('input:checked')};copy.textContent='Suspicious GPS point: '+proposal.jump_speed_kmh+' km/h apparent jump over '+proposal.time_seconds+' seconds · detour ~'+proposal.detour_m+' m · original position '+proposal.outlier.join(', ')+' → interpolated between '+proposal.before.join(', ')+' and '+proposal.after.join(', ');label.append(input,copy);$('routeRepairCandidates').append(label)}$('applyRouteRepair').disabled=!review.proposals.length;
 }catch(e){$('routeRepairStatus').textContent='Review unavailable: '+e.message}}
 $('openRouteRepair').onclick=openRouteRepair;$('closeRouteRepair').onclick=()=>$('routeRepairDialog').close();
-$('applyRouteRepair').onclick=async()=>{if(!routeRepairId||!routeRepairSnapshot)return;const selection=[...$('routeRepairCandidates').querySelectorAll('input:checked')].map(el=>Number(el.value));if(!selection.length)return;if(!confirm('Apply '+selection.length+' reviewed GPS spike correction(s)?\\n\\nOriginal route and telemetry will be preserved in your local library for restoration.'))return;const btn=$('applyRouteRepair');btn.disabled=true;try{await v122Post('/api/route-repair',{activity_id:routeRepairId,action:'apply',selection});$('routeRepairDialog').close();await openRidePreview(routeRepairId);await refreshStats(true)}catch(e){$('routeRepairStatus').textContent=e.message;btn.disabled=false}};
+$('applyRouteRepair').onclick=async()=>{if(!routeRepairId||!routeRepairSnapshot)return;const selection=[...$('routeRepairCandidates').querySelectorAll('input:checked')].map(el=>Number(el.value));if(!selection.length)return;if(!confirm('Apply '+selection.length+' reviewed GPS spike correction(s)?\n\nOriginal route and telemetry will be preserved in your local library for restoration.'))return;const btn=$('applyRouteRepair');btn.disabled=true;try{await v122Post('/api/route-repair',{activity_id:routeRepairId,action:'apply',selection});$('routeRepairDialog').close();await openRidePreview(routeRepairId);await refreshStats(true)}catch(e){$('routeRepairStatus').textContent=e.message;btn.disabled=false}};
 $('restoreRouteRepair').onclick=async()=>{if(!routeRepairId||!confirm('Restore the original GPS track and sensor locations for this ride?'))return;try{await v122Post('/api/route-repair',{activity_id:routeRepairId,action:'restore'});$('routeRepairDialog').close();await openRidePreview(routeRepairId);await refreshStats(true)}catch(e){$('routeRepairStatus').textContent=e.message}};
 
 async function openRidePreview(id){
-const dialog=$('ridePreviewDialog');previewRide=null;$('showRideMap').disabled=true;$('openFlyover').disabled=true;$('openActivityEdit').disabled=true;$('openRouteRepair').disabled=true;$('ridePreviewTitle').textContent='Loading activity…';$('ridePreviewSubtitle').textContent='Private, local GPS preview';$('ridePreviewDetails').replaceChildren();$('ridePreviewStatus').textContent='Reading the route from your local database…';if(!dialog.open)dialog.showModal();$('rideReviewPanel').hidden=true;$('rideTelemetry').hidden=true;
-try{const data=await getJson('/api/activity?id='+encodeURIComponent(id));if(!dialog.open)return;previewRide=data;$('ridePreviewTitle').textContent=data.name||'Untitled activity';$('ridePreviewSubtitle').textContent=[data.day,data.sport].filter(Boolean).join(' · ');$('ridePreviewStatus').textContent=state.online?'Route remains local. Dark map tiles come from OpenStreetMap and reveal the displayed map area and your IP to the provider.':'Online map tiles are disabled. Enable them in Map view to see the dark basemap behind this route.';$('showRideMap').disabled=false;$('openActivityEdit').disabled=false;$('openRouteRepair').disabled=false;$('openFlyover').disabled=!(Array.isArray(data.points)&&data.points.filter(Boolean).length>=2);
+const dialog=$('ridePreviewDialog');v123PendingPeak=null;previewRide=null;ridePreviewView=null;$('showRideMap').disabled=true;$('openActivitySources').disabled=true;$('openFlyover').disabled=true;$('openElevation').disabled=true;$('openActivityEdit').disabled=true;$('openRouteRepair').disabled=true;$('ridePreviewTitle').textContent='Loading activity…';$('ridePreviewSubtitle').textContent='Private, local GPS preview';$('ridePreviewDetails').replaceChildren();$('ridePreviewStatus').textContent='Reading the route from your local database…';if(!dialog.open)dialog.showModal();$('rideReviewPanel').hidden=true;$('rideTelemetry').hidden=true;
+try{const data=await getJson('/api/activity?id='+encodeURIComponent(id));if(!dialog.open)return;previewRide=data;$('ridePreviewTitle').textContent=data.name||'Untitled activity';$('ridePreviewDialog').querySelector('.v120-telemetry-heading strong').textContent=activityFocus==='foot'?'Activity telemetry':'Ride telemetry';$('telemetryScrub').setAttribute('aria-label',activityFocus==='foot'?'Select recorded activity position':'Select recorded ride position');$('ridePreviewSubtitle').textContent=[data.day,data.sport].filter(Boolean).join(' · ');$('ridePreviewStatus').textContent=state.online?'Your GPS route stays local. Optional '+(state.mode==='satellite'?'Esri satellite imagery':'OpenStreetMap background')+' tiles contact the selected map provider.':'Online map tiles are disabled. The recorded GPS route remains visible without a background map.';$('showRideMap').disabled=false;$('openActivitySources').disabled=false;$('openActivityEdit').disabled=false;$('openRouteRepair').disabled=false;$('openFlyover').disabled=!(Array.isArray(data.points)&&data.points.filter(Boolean).length>=2);$('openElevation').disabled=$('openFlyover').disabled;
 const speedUnit=$('units').value==='mi'?' mph':' km/h',speedFactor=$('units').value==='mi'?2.236936:3.6;
 const recorded=n=>n===null||n===undefined||!Number.isFinite(Number(n))?null:Number(n);
-const facts=[['Distance',distanceLabel(data.distance_m)],['Moving time',timeLabel(data.moving_seconds)],['Elapsed time',timeLabel(data.elapsed_seconds)],['Elevation gain',recorded(data.elevation_m)===null?'Not recorded':nice(data.elevation_m*($('units').value==='mi'?3.28084:1),0)+($('units').value==='mi'?' ft':' m')],['Average speed',recorded(data.avg_speed)===null?'Not recorded':nice(data.avg_speed*speedFactor,1)+speedUnit],['Maximum speed',recorded(data.max_speed)===null?'Not recorded':nice(data.max_speed*speedFactor,1)+speedUnit],['Average power',recorded(data.avg_power)===null?'Not recorded':nice(data.avg_power,0)+' W'],['Average heart rate',recorded(data.avg_heart_rate)===null?'Not recorded':nice(data.avg_heart_rate,0)+' bpm'],['Gear',data.bike||'Not recorded'],['GPS samples',nice(data.point_count,0)],['GPS track distance',recorded(data.gps_distance_m)===null?'Not recorded':distanceLabel(data.gps_distance_m)],['Source distance',recorded(data.reported_distance_m)===null?'Not recorded':distanceLabel(data.reported_distance_m)]];
+const facts=[['Distance',distanceLabel(data.distance_m)],['Moving time',timeLabel(data.moving_seconds)],['Elapsed time',timeLabel(data.elapsed_seconds)],['Elevation gain',recorded(data.elevation_m)===null?'Not recorded':nice(data.elevation_m*($('units').value==='mi'?3.28084:1),0)+($('units').value==='mi'?' ft':' m')],[activityFocus==='foot'?'Average pace':'Average speed',recorded(data.avg_speed)===null?'Not recorded':activityFocus==='foot'?paceLabel(data.avg_speed):nice(data.avg_speed*speedFactor,1)+speedUnit],[activityFocus==='foot'?'Peak speed':'Maximum speed',recorded(data.max_speed)===null?'Not recorded':nice(data.max_speed*speedFactor,1)+speedUnit],...((activityFocus==='foot')?[]:[['Average power',recorded(data.avg_power)===null?'Not recorded':nice(data.avg_power,0)+' W']]),['Average heart rate',recorded(data.avg_heart_rate)===null?'Not recorded':nice(data.avg_heart_rate,0)+' bpm'],...((activityFocus==='foot')?[]:[['Gear',data.bike||'Not recorded']]),['GPS samples',nice(data.point_count,0)],['GPS track distance',recorded(data.gps_distance_m)===null?'Not recorded':distanceLabel(data.gps_distance_m)],['Source distance',recorded(data.reported_distance_m)===null?'Not recorded':distanceLabel(data.reported_distance_m)]];
 if(advancedDataEnabled){
  const more=[['Calories','calories_kcal',v=>nice(v,0)+' kcal'],['Device temperature','avg_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Weather temperature','weather_temp_c',v=>nice($('units').value==='mi'?v*9/5+32:v,1)+($('units').value==='mi'?' °F':' °C')],['Wind speed','wind_speed_mps',v=>nice(v*($('units').value==='mi'?2.236936:3.6),1)+($('units').value==='mi'?' mph':' km/h')],['Average cadence','avg_cadence',v=>nice(v,0)+' rpm'],['Max cadence','max_cadence',v=>nice(v,0)+' rpm'],[(/ride|cycl|bik/i.test(data.sport||'')?'Pedal cycles (FIT)':/swim/i.test(data.sport||'')?'Swim strokes (FIT)':'Cycles / strokes (FIT)'),'total_cycles',v=>nice(v,0)],['Normalized power','normalized_power',v=>nice(v,0)+' W'],['Training stress','training_stress_score',v=>nice(v,1)+' TSS'],['Intensity factor','intensity_factor',v=>nice(v,2)],['Peak heart rate','max_heart_rate',v=>nice(v,0)+' bpm'],['Max power','max_power',v=>nice(v,0)+' W'],['Weather condition','weather_condition',v=>String(v)]];
- for(const [label,key,format] of more){const v=data[key];if(v!==null&&v!==undefined&&v!=='')facts.push([label,format(v)])}
+ for(const [label,key,format] of more){if(activityFocus==='foot'&&(/power|cadence|cycles|training stress|intensity factor/i.test(label)))continue;const v=data[key];if(v!==null&&v!==undefined&&v!=='')facts.push([label,format(v)])}
 }
-for(const [label,value] of facts){const box=document.createElement('div');box.className='ride-preview-detail';const k=document.createElement('span');k.textContent=label;const v=document.createElement('strong');v.textContent=value;box.append(k,v);$('ridePreviewDetails').append(box)}
+const metricBuckets={route:{title:'Route & time',caption:'Distance, duration and recorded track',symbol:'⌖',items:[]},performance:{title:'Performance',caption:'Speed, effort and physiological data',symbol:'↗',items:[]},conditions:{title:'Conditions & equipment',caption:'Available environment and gear fields',symbol:'◈',items:[]}};
+const bucketFor=label=>/temperature|weather|wind|humidity|gear/i.test(label)?'conditions':/speed|pace|power|heart|cadence|cycles|training|intensity|calories/i.test(label)?'performance':'route';
+for(const [label,value] of facts){const box=document.createElement('div');box.className='ride-preview-detail';const k=document.createElement('span');k.textContent=label;const v=document.createElement('strong');v.textContent=value;box.append(k,v);
+const peak=(label==='Maximum speed'||label==='Peak speed')?data.peak_samples?.speed:label==='Max cadence'?data.peak_samples?.cadence:null;
+if(peak){const action=document.createElement('button');action.className='v123-peak-jump';action.type='button';const val=(label==='Maximum speed'||label==='Peak speed')?nice(peak.value*speedFactor,1)+speedUnit:nice(peak.value,0)+' rpm';action.textContent='Show where: '+val+' sampled';action.title='Locate the fastest timestamped sensor sample on this GPS route. A ride-wide summary maximum may differ.';action.onclick=()=>v123JumpToPeak((label==='Maximum speed'||label==='Peak speed')?'speed':'cadence');box.append(action)}
+metricBuckets[bucketFor(label)].items.push(box)}
+for(const bucket of Object.values(metricBuckets)){if(!bucket.items.length)continue;const section=document.createElement('section');section.className='lh-metric-bucket';const heading=document.createElement('div');heading.className='lh-metric-header';const glyph=document.createElement('span');glyph.className='lh-metric-icon';glyph.textContent=bucket.symbol;glyph.setAttribute('aria-hidden','true');const text=document.createElement('div');const title=document.createElement('h3');title.textContent=bucket.title;const caption=document.createElement('p');caption.textContent=bucket.caption;text.append(title,caption);heading.append(glyph,text);const grid=document.createElement('div');grid.className='lh-metric-grid';grid.append(...bucket.items);section.append(heading,grid);$('ridePreviewDetails').append(section)}
 loadRideTelemetry(data.id);const sources=[];if(data.filename)sources.push('File: '+data.filename);if(data.moving_source)sources.push('Moving time: '+(data.moving_source==='gps'?'GPS estimate':data.moving_source));if(data.elevation_source)sources.push('Elevation: '+(data.elevation_source==='gps'?'GPS estimate':data.elevation_source));$('ridePreviewSource').textContent=sources.join(' · ');showRideSpeedReview(data);requestAnimationFrame(()=>drawRidePreview(data));
 }catch(e){$('ridePreviewTitle').textContent='Could not load this activity';$('ridePreviewStatus').textContent=e.message}
 }
-function drawRidePreview(data){
-const el=$('ridePreviewCanvas'),context=el.getContext('2d'),layer=$('ridePreviewTiles');if(!el||!context)return;
-const w=Math.max(240,el.clientWidth),h=Math.max(180,el.clientHeight),dpr=Math.min(2,window.devicePixelRatio||1);
-el.width=Math.round(w*dpr);el.height=Math.round(h*dpr);context.setTransform(dpr,0,0,dpr,0,0);context.clearRect(0,0,w,h);
-const all=data.points.filter(Boolean);const projected=all.map(p=>px(p[0],p[1],0));
-if(projected.length<2){layer.replaceChildren();context.fillStyle='#ece2f8';context.font='15px system-ui';context.textAlign='center';context.fillText('No GPS track available to preview',w/2,h/2);return}
-let minx=Infinity,maxx=-Infinity,miny=Infinity,maxy=-Infinity;
-for(const point of projected){if(point[0]<minx)minx=point[0];if(point[0]>maxx)maxx=point[0];if(point[1]<miny)miny=point[1];if(point[1]>maxy)maxy=point[1]}
-const padding=40,worldSpan=Math.max((maxx-minx)/Math.max(1,w-padding*2),(maxy-miny)/Math.max(1,h-padding*2),1e-7);
-const zoom=clamp(Math.floor(Math.log2(1/worldSpan)),1,17),worldScale=Math.pow(2,zoom);
-const center=[(minx+maxx)/2*worldScale,(miny+maxy)/2*worldScale],left=center[0]-w/2,top=center[1]-h/2;
-rideProjection={scale:worldScale,left,top,w,h,dpr};const marker=$('telemetryMarkerCanvas');marker.width=el.width;marker.height=el.height;
-layer.replaceChildren();const enabled=state.online;$('ridePreviewAttribution').hidden=!enabled;$('ridePreviewBadge').textContent=enabled?'Dark map · GPS route':'Offline · GPS route';
-if(enabled){const maxTile=Math.pow(2,zoom);for(let y=Math.floor(top/256);y<=Math.floor((top+h)/256);y++){if(y<0||y>=maxTile)continue;for(let x=Math.floor(left/256);x<=Math.floor((left+w)/256);x++){const wrapped=((x%maxTile)+maxTile)%maxTile;const tile=document.createElement('img');tile.alt='';tile.loading='lazy';tile.decoding='async';tile.onerror=()=>{tile.style.visibility='hidden';$('ridePreviewBadge').textContent='Map tiles unavailable · GPS route';$('ridePreviewStatus').textContent='The map provider could not load its background tiles. Your route is still available locally.'};tile.onload=()=>{tile.style.visibility='visible'};tile.referrerPolicy='strict-origin-when-cross-origin';tile.style.transform=`translate3d(${x*256-left}px,${y*256-top}px,0)`;tile.src=`https://tile.openstreetmap.org/${zoom}/${wrapped}/${y}.png`;layer.append(tile)}}}
-const coord=p=>{const world=px(p[0],p[1],0);return [world[0]*worldScale-left,world[1]*worldScale-top]};
-context.beginPath();let first=null,last=null;for(const p of data.points){if(p===null){last=null;continue}const xy=coord(p);if(!first)first=xy;if(last)context.lineTo(xy[0],xy[1]);else context.moveTo(xy[0],xy[1]);last=xy}
-const grad=context.createLinearGradient(0,0,w,h);grad.addColorStop(0,'#ae82f2');grad.addColorStop(.55,'#f66e9b');grad.addColorStop(1,'#ffb35b');context.lineCap='round';context.lineJoin='round';context.strokeStyle='#090718';context.lineWidth=7;context.stroke();context.strokeStyle=grad;context.lineWidth=3.6;context.shadowColor='#cb83f1';context.shadowBlur=12;context.stroke();context.shadowBlur=0;
-if(first){context.beginPath();context.arc(first[0],first[1],5,0,Math.PI*2);context.fillStyle='#d6fbe6';context.fill()}
-const endpoint=all.at(-1);if(endpoint){const end=coord(endpoint);context.beginPath();context.arc(end[0],end[1],5,0,Math.PI*2);context.fillStyle='#ffc58b';context.fill()}
-drawTelemetryMarker();
+function ridePreviewFit(){ridePreviewView=null;if(previewRide)drawRidePreview(previewRide)}
+function ridePreviewRedraw(){if(ridePreviewFrame)return;ridePreviewFrame=requestAnimationFrame(()=>{ridePreviewFrame=0;if(previewRide)drawRidePreview(previewRide)})}
+function ridePreviewZoom(step,x,y){
+ if(!previewRide||!rideProjection||!ridePreviewView)return;
+ const {w,h,scale,left,top}=rideProjection,next=clamp(ridePreviewView.z+step,1,18);
+ if(next===ridePreviewView.z)return;
+ const ax=Number.isFinite(x)?x:w/2,ay=Number.isFinite(y)?y:h/2,anchorX=(left+ax)/scale,anchorY=(top+ay)/scale,nextScale=2**next;
+ ridePreviewView.z=next;ridePreviewView.centerX=anchorX-(ax-w/2)/nextScale;ridePreviewView.centerY=clamp(anchorY-(ay-h/2)/nextScale,0,256);
+ ridePreviewRedraw();
 }
-$('closeRidePreview').onclick=()=>$('ridePreviewDialog').close();$('backToStats').onclick=()=>$('ridePreviewDialog').close();$('ridePreviewDialog').addEventListener('close',()=>{if($('activityEditDialog').open)$('activityEditDialog').close();if($('routeRepairDialog').open)$('routeRepairDialog').close();if($('flyoverDialog').open)$('flyoverDialog').close();++telemetryRequest;telemetrySamples=[];telemetrySelection=-1;previewRide=null;rideProjection=null;$('ridePreviewTiles').replaceChildren();$('rideTelemetry').hidden=true});
+function ridePreviewPan(dx,dy){if(!previewRide||!rideProjection||!ridePreviewView)return;ridePreviewView.centerX-=dx/rideProjection.scale;ridePreviewView.centerY=clamp(ridePreviewView.centerY-dy/rideProjection.scale,0,256);ridePreviewRedraw()}
+function drawRidePreview(data){
+ const el=$('ridePreviewCanvas'),context=el.getContext('2d'),layer=$('ridePreviewTiles');if(!el||!context)return;
+ const w=Math.max(240,el.clientWidth),h=Math.max(180,el.clientHeight),dpr=Math.min(2,window.devicePixelRatio||1);
+ el.width=Math.round(w*dpr);el.height=Math.round(h*dpr);context.setTransform(dpr,0,0,dpr,0,0);context.clearRect(0,0,w,h);
+ const all=(data.points||[]).filter(Boolean);const projected=all.map(p=>px(p[0],p[1],0));
+ if(projected.length<2){layer.replaceChildren();rideProjection=null;context.fillStyle='#ece2f8';context.font='15px system-ui';context.textAlign='center';context.fillText('No GPS track available to preview',w/2,h/2);for(const id of ['previewZoomIn','previewZoomOut','previewZoomFit'])$(id).disabled=true;return}
+ for(const id of ['previewZoomIn','previewZoomOut','previewZoomFit'])$(id).disabled=false;
+ if(!ridePreviewView){let minx=Infinity,maxx=-Infinity,miny=Infinity,maxy=-Infinity;
+  for(const point of projected){minx=Math.min(minx,point[0]);maxx=Math.max(maxx,point[0]);miny=Math.min(miny,point[1]);maxy=Math.max(maxy,point[1])}
+  const padding=40,worldSpan=Math.max((maxx-minx)/Math.max(1,w-padding*2),(maxy-miny)/Math.max(1,h-padding*2),1e-7);
+  ridePreviewView={z:clamp(Math.floor(Math.log2(1/worldSpan)),1,18),centerX:(minx+maxx)/2,centerY:(miny+maxy)/2};
+ }
+ const zoom=ridePreviewView.z,worldScale=2**zoom,left=ridePreviewView.centerX*worldScale-w/2,top=ridePreviewView.centerY*worldScale-h/2;
+ rideProjection={scale:worldScale,left,top,w,h,dpr};const marker=$('telemetryMarkerCanvas');marker.width=el.width;marker.height=el.height;
+ layer.replaceChildren();const enabled=state.online;const previewStyle=state.mode==='satellite'?'satellite':state.mode==='light'?'light':'dark';
+ layer.className=previewStyle;$('ridePreviewAttribution').hidden=!enabled;
+ $('ridePreviewAttribution').textContent=previewStyle==='satellite'?'Imagery © Esri and imagery providers':'© OpenStreetMap contributors';
+ $('ridePreviewBadge').textContent=enabled?previewStyle[0].toUpperCase()+previewStyle.slice(1)+' map · GPS route · zoom '+zoom:'Offline · GPS route · zoom '+zoom;
+ if(enabled){const maxTile=2**zoom;for(let y=Math.floor(top/256);y<=Math.floor((top+h)/256);y++){if(y<0||y>=maxTile)continue;for(let x=Math.floor(left/256);x<=Math.floor((left+w)/256);x++){const wrapped=((x%maxTile)+maxTile)%maxTile;const tile=document.createElement('img');tile.alt='';tile.loading='lazy';tile.decoding='async';tile.onerror=()=>{tile.style.visibility='hidden';$('ridePreviewBadge').textContent='Map tiles unavailable · GPS route';$('ridePreviewStatus').textContent='The map provider could not load its background tiles. Your route is still available locally.'};tile.onload=()=>{tile.style.visibility='visible'};tile.referrerPolicy='strict-origin-when-cross-origin';tile.style.transform=`translate3d(${x*256-left}px,${y*256-top}px,0)`;tile.src=tileUrl(zoom,wrapped,y);layer.append(tile)}}}
+ const coord=p=>{const world=px(p[0],p[1],0);return [world[0]*worldScale-left,world[1]*worldScale-top]};
+ context.beginPath();let first=null,last=null;for(const p of data.points){if(p===null){last=null;continue}const xy=coord(p);if(!first)first=xy;if(last)context.lineTo(xy[0],xy[1]);else context.moveTo(xy[0],xy[1]);last=xy}
+ const grad=context.createLinearGradient(0,0,w,h);grad.addColorStop(0,'#FAF0CA');grad.addColorStop(.55,'#F4D35E');grad.addColorStop(1,'#FFCE7C');context.lineCap='round';context.lineJoin='round';context.strokeStyle='#090718';context.lineWidth=7;context.stroke();context.strokeStyle=grad;context.lineWidth=3.6;context.shadowColor='#F4D35E';context.shadowBlur=12;context.stroke();context.shadowBlur=0;
+ if(first){context.beginPath();context.arc(first[0],first[1],5,0,Math.PI*2);context.fillStyle='#d6fbe6';context.fill()}
+ const endpoint=all.at(-1);if(endpoint){const end=coord(endpoint);context.beginPath();context.arc(end[0],end[1],5,0,Math.PI*2);context.fillStyle='#ffc58b';context.fill()}
+ drawTelemetryMarker();
+}
+const previewMap=$('ridePreviewMap'),previewPointers=new Map();let pinchDistance=0;
+const previewAt=e=>{const rect=previewMap.getBoundingClientRect();return [e.clientX-rect.left,e.clientY-rect.top]};
+$('previewZoomIn').onclick=()=>ridePreviewZoom(1);$('previewZoomOut').onclick=()=>ridePreviewZoom(-1);$('previewZoomFit').onclick=ridePreviewFit;
+previewMap.addEventListener('wheel',event=>{if(!previewRide)return;event.preventDefault();const [x,y]=previewAt(event);ridePreviewZoom(event.deltaY<0?1:-1,x,y)},{passive:false});
+previewMap.addEventListener('dblclick',event=>{if(event.target.closest('button,a'))return;event.preventDefault();const [x,y]=previewAt(event);ridePreviewZoom(1,x,y)});
+previewMap.addEventListener('keydown',event=>{if(event.target!==previewMap)return;if(['+','=','-','_','Home'].includes(event.key)){event.preventDefault();if(event.key==='Home')ridePreviewFit();else ridePreviewZoom(['+','='].includes(event.key)?1:-1)}});
+previewMap.addEventListener('pointerdown',event=>{if(!previewRide||!rideProjection||event.target.closest('button,a')||event.button!==0&&event.pointerType==='mouse')return;previewPointers.set(event.pointerId,{x:event.clientX,y:event.clientY});try{previewMap.setPointerCapture(event.pointerId)}catch(e){}previewMap.classList.add('lh-map-dragging');if(previewPointers.size===2){const points=[...previewPointers.values()];pinchDistance=Math.hypot(points[0].x-points[1].x,points[0].y-points[1].y)}});
+previewMap.addEventListener('pointermove',event=>{const before=previewPointers.get(event.pointerId);if(!before)return;previewPointers.set(event.pointerId,{x:event.clientX,y:event.clientY});if(previewPointers.size===1){ridePreviewPan(event.clientX-before.x,event.clientY-before.y);return}if(previewPointers.size===2){const points=[...previewPointers.values()],distance=Math.hypot(points[0].x-points[1].x,points[0].y-points[1].y);const midpoint={clientX:(points[0].x+points[1].x)/2,clientY:(points[0].y+points[1].y)/2};if(pinchDistance&& (distance>pinchDistance*1.25||distance<pinchDistance*.8)){const [x,y]=previewAt(midpoint);ridePreviewZoom(distance>pinchDistance?1:-1,x,y);pinchDistance=distance}}});
+function previewPointerStop(event){previewPointers.delete(event.pointerId);if(previewPointers.size<2)pinchDistance=0;if(!previewPointers.size)previewMap.classList.remove('lh-map-dragging')}
+previewMap.addEventListener('pointerup',previewPointerStop);previewMap.addEventListener('pointercancel',previewPointerStop);previewMap.addEventListener('lostpointercapture',previewPointerStop);
+$('closeRidePreview').onclick=()=>$('ridePreviewDialog').close();$('backToStats').onclick=()=>$('ridePreviewDialog').close();$('ridePreviewDialog').addEventListener('close',()=>{if($('activityEditDialog').open)$('activityEditDialog').close();if($('routeRepairDialog').open)$('routeRepairDialog').close();if($('flyoverDialog').open)$('flyoverDialog').close();if($('elevationDialog').open)elevationClose();++telemetryRequest;telemetrySamples=[];telemetrySelection=-1;previewRide=null;rideProjection=null;ridePreviewView=null;previewPointers.clear();if(ridePreviewFrame)cancelAnimationFrame(ridePreviewFrame);ridePreviewFrame=0;$('ridePreviewTiles').replaceChildren();$('rideTelemetry').hidden=true});
 $('showRideMap').onclick=()=>{if(!previewRide)return;const ride=previewRide;state.activeRideId=ride.id;state.activeRideBounds=ride.bounds;$('clearRide').hidden=false;$('mapCaption').querySelector('.map-caption-title').textContent=ride.name||'Selected GPS activity';$('ridePreviewDialog').close();if($('statsDialog').open)$('statsDialog').close();loadedKey='';fitBounds(ride.bounds,false)};
 $('clearRide').onclick=()=>{state.activeRideId=null;$('clearRide').hidden=true;$('mapCaption').querySelector('.map-caption-title').textContent='Your GPS heatmap';loadedKey='';fitBounds(state.focusBounds||state.bounds)};
 window.addEventListener('resize',()=>{if($('ridePreviewDialog').open&&previewRide){drawRidePreview(previewRide);if(telemetrySamples.length)drawTelemetryChart()}});
 async function refreshInsights(){if($('statsDialog').open&&!$('statsData').hidden)loadDataTable();try{const info=await getJson('/api/insights?'+statsParams());fillStats(info);if($('statsDialog').open&&!$('statsReview').hidden)await loadSpeedReview()}catch(e){$('statAccuracy').textContent='Unable to load statistics: '+e.message}}
-async function refreshStatsFilters(){const s=await getJson('/api/stats');const oldSport=$('statsSport').value,oldYear=$('statsYear').value,oldBike=$('statsBike').value;$('statsSport').replaceChildren();let o=document.createElement('option');o.value='';o.textContent='All types';$('statsSport').append(o);for(const [name] of s.types){let e=document.createElement('option');e.value=name;e.textContent=name;$('statsSport').append(e)}$('statsSport').value=oldSport;$('statsBike').replaceChildren();let allBikes=document.createElement('option');allBikes.value='';allBikes.textContent='All bikes';$('statsBike').append(allBikes);for(const name of s.bikes||[]){const e=document.createElement('option');e.value=name;e.textContent=name;$('statsBike').append(e)}$('statsBike').value=oldBike;const overview=await getJson('/api/insights');$('statsYear').replaceChildren();o=document.createElement('option');o.value='';o.textContent='All years';$('statsYear').append(o);for(const y of overview.years){const e=document.createElement('option');e.value=y.year;e.textContent=y.year;$('statsYear').append(e)}$('statsYear').value=oldYear;statsYears=overview.months;updateStatsMonths()}
+async function refreshStatsFilters(){const s=await getJson('/api/stats');const oldSport=$('statsSport').value,oldYear=$('statsYear').value,oldBike=$('statsBike').value;$('statsSport').replaceChildren();let o=document.createElement('option');o.value='';o.textContent='All types';$('statsSport').append(o);for(const [name] of s.types){if(!matchesActivityFocus(name))continue;let e=document.createElement('option');e.value=name;e.textContent=name;$('statsSport').append(e)}$('statsSport').value=oldSport;$('statsBike').replaceChildren();let allBikes=document.createElement('option');allBikes.value='';allBikes.textContent='All bikes';$('statsBike').append(allBikes);for(const name of s.bikes||[]){const e=document.createElement('option');e.value=name;e.textContent=name;$('statsBike').append(e)}$('statsBike').value=oldBike;const overview=await getJson('/api/insights');$('statsYear').replaceChildren();o=document.createElement('option');o.value='';o.textContent='All years';$('statsYear').append(o);for(const y of overview.years){const e=document.createElement('option');e.value=y.year;e.textContent=y.year;$('statsYear').append(e)}$('statsYear').value=oldYear;statsYears=overview.months;updateStatsMonths()}
 function updateStatsMonths(){const old=$('statsMonth').value,year=$('statsYear').value;$('statsMonth').replaceChildren();const blank=document.createElement('option');blank.value='';blank.textContent='All months';$('statsMonth').append(blank);for(const m of statsYears.filter(m=>!year||m.month.startsWith(year))){const e=document.createElement('option');e.value=m.month;e.textContent=m.month;$('statsMonth').append(e)}$('statsMonth').value=old;if($('statsMonth').value!==old)$('statsMonth').value=''}
-$('statsTop').onclick=()=>{$('statsButton').click()};$('statsButton').onclick=async()=>{selectStatsTab('overview');$('statsDialog').showModal();try{await refreshStatsFilters()}catch(e){$('statAccuracy').textContent=e.message}refreshInsights()};
-$('closeStats').onclick=()=>$('statsDialog').close();$('openSpeedReview').onclick=async()=>{if(settingsDirty){showSettingsStatus('Save your speed-filter settings before reviewing anomalies.',true);return}if(!(savedSettings&& (savedSettings.filter_speed_anomalies||savedSettings.filter_speed_smart))){showSettingsStatus('Enable and save a speed filter to review flagged activities.',true);return}closeSettings();$('statsDialog').showModal();selectStatsTab('review');try{await refreshStatsFilters()}catch(e){}await refreshInsights()};$('units').onchange=async()=>{if(currentInsights)fillStats(currentInsights);loadDataTable();try{await v122Post('/api/display-units',{display_units:$('units').value});$('settingsUnits').value=$('units').value;showSavedSpeedThreshold(settingsSpeedThresholdMph);if(savedSettings)savedSettings.display_units=$('units').value}catch(e){console.warn('Could not store display units:',e.message)}};
+$('statsTop').onclick=()=>{$('statsButton').click()};$('statsButton').onclick=async()=>{if(lhSourcePage.open)lhSourcePage.close();lhRailSelect('overview');selectStatsTab('overview');$('statsDialog').classList.add('lh-integrated-view');$('statsDialog').show();try{await refreshStatsFilters()}catch(e){$('statAccuracy').textContent=e.message}refreshInsights()};
+$('closeStats').onclick=lhReturnMap;$('openSpeedReview').onclick=async()=>{if(settingsDirty){showSettingsStatus('Save your speed-filter settings before reviewing anomalies.',true);return}if(!(savedSettings&& (savedSettings.filter_speed_anomalies||savedSettings.filter_speed_smart))){showSettingsStatus('Enable and save a speed filter to review flagged activities.',true);return}closeSettings();$('statsDialog').classList.add('lh-integrated-view');lhRailSelect('review');$('statsDialog').show();selectStatsTab('review');try{await refreshStatsFilters()}catch(e){}await refreshInsights()};$('units').onchange=async()=>{if(currentInsights)fillStats(currentInsights);loadDataTable();try{await v122Post('/api/display-units',{display_units:$('units').value});$('settingsUnits').value=$('units').value;showSavedSpeedThreshold(settingsSpeedThresholdMph);if(savedSettings)savedSettings.display_units=$('units').value}catch(e){console.warn('Could not store display units:',e.message)}};
 $('statsSport').onchange=refreshInsights;$('statsBike').onchange=refreshInsights;$('statsMonth').onchange=refreshInsights;$('statsYear').onchange=()=>{updateStatsMonths();refreshInsights()};
 let sliderTimer=0;
 for(const id of ['radius','intensity','opacity','definition']){$(id).addEventListener('input',()=>{$(id+'Value').textContent=$(id).value+(id==='radius'?' px':'%');clearTimeout(sliderTimer);sliderTimer=setTimeout(queueRender,85);savePreferences()})}
@@ -6613,12 +10039,12 @@ let restoringDetails=false;
 $('import').onclick=()=>{restoringDetails=false;$('file').click()};
 $('repairDetails').onclick=()=>{restoringDetails=true;if($('statsDialog').open)$('statsDialog').close();$('file').click()};
 const queuedImports=[];let importingManual=false,dragDepth=0;
-const allowedDropFile=name=>/[.](zip|csv|gps)$/i.test(name||'')||/[.](fit|gpx|tcx)([.]gz)?$/i.test(name||'');
+const allowedDropFile=name=>/[.](zip|csv|gps)$/i.test(name||'')||/[.](fit|gpx|tcx|kml|geojson)([.]gz)?$/i.test(name||'')||/[.]kmz$/i.test(name||'');
 function enqueueActivityFiles(files){
  const list=Array.from(files||[]).filter(f=>f&&f.size>0);
  const supported=list.filter(f=>allowedDropFile(f.name));
  const rejected=list.length-supported.length;
- if(!supported.length){$('importStatus').textContent='No supported activity files found. Drop FIT, GPX, TCX, GPS, CSV, or ZIP files.';return}
+ if(!supported.length){$('importStatus').textContent='No supported activity files found. Drop FIT, GPX, TCX, KML, KMZ, GeoJSON, GPS CSV, or ZIP files.';return}
  if(supported.length>50){$('importStatus').textContent='Import up to 50 files per drop; divide this batch into smaller groups.';return}
  queuedImports.push(...supported);
  $('importStatus').classList.toggle('error',!!rejected);
@@ -6635,7 +10061,7 @@ document.addEventListener('dragleave',event=>{if(!event.dataTransfer||!Array.fro
 document.addEventListener('drop',event=>{event.preventDefault();dragDepth=0;showDrop(false);if(event.dataTransfer&&event.dataTransfer.files.length)enqueueActivityFiles(event.dataTransfer.files)});
 window.addEventListener('blur',()=>{dragDepth=0;showDrop(false)});
 let garminUsbDevices=[];
-function garminMessage(message,error=false){const node=$('garminUsbStatus');node.textContent=message;node.style.color=error?'#ffb7be':'#d3c0dc'}
+function garminMessage(message,error=false){const node=$('garminUsbStatus');node.textContent=message;node.style.color=error?'#B85937':'#FAF0CA'}
 $('garminScan').onclick=async()=>{const button=$('garminScan');button.disabled=true;garminMessage('Searching connected USB storage…');$('garminUsbFound').hidden=true;try{const data=await protectedAction('/api/garmin/scan');garminUsbDevices=data.devices||[];if(!garminUsbDevices.length){garminMessage('No Garmin activity folder found. Connect the Edge with a USB data cable and wait for Windows to recognize the removable drive.');return}const select=$('garminUsbDevice');select.replaceChildren();for(const device of garminUsbDevices){const option=document.createElement('option');option.value=device.id;option.textContent=device.label+' · '+device.count.toLocaleString()+' FIT files';select.appendChild(option)}$('garminUsbFound').hidden=false;garminMessage(garminUsbDevices.length+' Garmin drive(s) found. Files will be copied to '+data.archive+' before import.')}catch(e){garminMessage(e.message,true)}finally{button.disabled=false}};
 $('garminUsbImport').onclick=async()=>{const device=$('garminUsbDevice').value;if(!device)return;const button=$('garminUsbImport');button.disabled=true;let started=false;garminMessage('Starting local FIT copy…');try{const r=await fetch('/api/garmin/import',{method:'POST',headers:{'Content-Type':'application/json','X-LibreHeatmaps-Token':TOKEN},body:JSON.stringify({device})});const data=await r.json();if(!r.ok)throw Error(data.error||'USB import could not start');$('import').disabled=true;started=true;pollImport()}catch(e){garminMessage(e.message,true)}finally{if(!started)button.disabled=false}};
 $('garminOpenArchive').onclick=async()=>{try{await protectedAction('/api/garmin/open-archive');garminMessage('Opened local FIT archive.')}catch(e){garminMessage(e.message,true)}};
@@ -6653,6 +10079,8 @@ $('garminPersonalConnect').onclick=async()=>{
 };
 $('garminPersonalDisconnect').onclick=async()=>{if(!confirm('Disconnect Garmin wireless sync on this computer? The existing imported rides will remain.'))return;try{await protectedAction('/api/garmin-personal/disconnect');$('garminPersonalKey').value='';await refreshGarminPersonalStatus()}catch(e){$('garminPersonalStatus').textContent=e.message}};
 $('garminPersonalSync').onclick=async()=>{const button=$('garminPersonalSync');button.disabled=true;try{const result=await protectedAction('/api/garmin-personal/sync');if(result.status!=='started')throw Error('Garmin sync did not start');$('garminPersonalStatus').textContent='Checking Garmin Connect securely…';$('import').disabled=true;setTimeout(pollImport,650)}catch(e){$('garminPersonalStatus').textContent=e.message;button.disabled=false}};
+
+
 $('garminHistoryStart').onclick=async()=>{const btn=$('garminHistoryStart');btn.disabled=true;try{const r=await protectedAction('/api/garmin-personal/history/start');$('garminHistoryStatus').textContent=r.history.message;await refreshGarminPersonalStatus()}catch(e){$('garminHistoryStatus').textContent=e.message;btn.disabled=false}};
 $('garminHistoryPause').onclick=async()=>{const btn=$('garminHistoryPause');btn.disabled=true;try{const r=await protectedAction('/api/garmin-personal/history/pause');$('garminHistoryStatus').textContent=r.history.message;await refreshGarminPersonalStatus()}catch(e){$('garminHistoryStatus').textContent=e.message;btn.disabled=false}};
 let stravaSessionPreviouslyAuthorized=false;
@@ -6682,9 +10110,9 @@ $('stravaBrowserSync').onclick=async()=>{const button=$('stravaBrowserSync');but
 $('stravaBrowserDisconnect').onclick=async()=>{
  if(!confirm('Disconnect Strava and delete the isolated local browser sign-in session? Imported rides will remain in LibreHeatmaps.'))return;
  try{await protectedAction('/api/strava-browser/disconnect');
-  // Keep this screen's opt-in acknowledgement checked so the user can start
-  // another *new* session without re-discovering a hidden prerequisite.
-  // The actual browser credentials and connected state are still deleted.
+ 
+ 
+ 
   await refreshStravaBrowserStatus()
  }catch(e){$('stravaBrowserStatus').textContent=e.message}
 };
@@ -6701,7 +10129,7 @@ const captureStage=$('captureStage'),captureCanvas=$('captureCanvas'),captureCon
 const captureView={lat:state.lat,lon:state.lon,z:state.z,data:null,geometry:null,key:'',controller:null,generation:0,timer:0,drag:null,fitMode:false,session:Math.random().toString(36).slice(2)+Date.now().toString(36),serial:0};
 function captureSize(){return [captureStage.clientWidth,captureStage.clientHeight]}
 function captureShape(){const [a,b]=$('captureShape').value.split(':').map(Number);return a/b}
-function captureStatus(message,error=false){$('captureStatus').textContent=message;$('captureStatus').style.color=error?'#ffb5b5':'#d6c1e4'}
+function captureStatus(message,error=false){$('captureStatus').textContent=message;$('captureStatus').style.color=error?'#B85937':'#FAF0CA'}
 const captureTileNodes=new Map();
 function captureTileMap(){
  const root=$('captureTiles'),credit=$('captureMapCredit'),bg=$('captureBackground').value;
@@ -6794,12 +10222,12 @@ let CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);
 let clientHeartbeat=null,clientStream=null,clientLeaving=false;
 function ping(){if(!clientLeaving)fetch('/api/ping',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,cache:'no-store'}).catch(()=>{})}
 function startClientHeartbeat(){clientLeaving=false;clearInterval(clientHeartbeat);if(clientStream)clientStream.close();ping();clientHeartbeat=setInterval(ping,6000);if(typeof EventSource!=='undefined')clientStream=new EventSource('/api/live?id='+encodeURIComponent(CLIENT_ID)+'&auth='+encodeURIComponent(TOKEN))}
-function leaveClient(){if(clientLeaving)return;clientLeaving=true;clearInterval(clientHeartbeat);clientHeartbeat=null;if(clientStream){clientStream.close();clientStream=null}const body=TOKEN+'\\n'+CLIENT_ID;if(navigator.sendBeacon&&navigator.sendBeacon('/api/leave',new Blob([body],{type:'text/plain'})))return;fetch('/api/leave',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,keepalive:true}).catch(()=>{})}
+function leaveClient(){if(clientLeaving)return;clientLeaving=true;clearInterval(clientHeartbeat);clientHeartbeat=null;if(clientStream){clientStream.close();clientStream=null}const body=TOKEN+'\n'+CLIENT_ID;if(navigator.sendBeacon&&navigator.sendBeacon('/api/leave',new Blob([body],{type:'text/plain'})))return;fetch('/api/leave',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'text/plain'},body:CLIENT_ID,keepalive:true}).catch(()=>{})}
 startClientHeartbeat();
 window.addEventListener('pagehide',leaveClient);
 window.addEventListener('beforeunload',leaveClient);
 window.addEventListener('pageshow',e=>{if(e.persisted){CLIENT_ID=Math.random().toString(36).slice(2)+Date.now().toString(36);startClientHeartbeat()}});
-$('shutdown').onclick=async()=>{if(!confirm('Close the local LibreHeatmaps application?'))return;try{const res=await fetch('/api/shutdown',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN}});if(!res.ok){const info=await res.json();alert(info.error||'Unable to exit right now');return}}catch(e){alert('Unable to contact the local application.');return}clearInterval(clientHeartbeat);document.body.replaceChildren();const d=document.createElement('div');d.style.cssText='font:16px system-ui;color:#ddd;background:#160d27;min-height:100vh;display:grid;place-items:center';d.textContent='LibreHeatmaps has stopped. You can close this tab.';document.body.append(d)};
+$('shutdown').onclick=async()=>{if(!confirm('Close the local LibreHeatmaps application?'))return;try{const res=await fetch('/api/shutdown',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN}});if(!res.ok){const info=await res.json();alert(info.error||'Unable to exit right now');return}}catch(e){alert('Unable to contact the local application.');return}clearInterval(clientHeartbeat);document.body.replaceChildren();const d=document.createElement('div');d.style.cssText='font:16px system-ui;color:#ddd;background:#0D3B66;min-height:100vh;display:grid;place-items:center';d.textContent='LibreHeatmaps has stopped. You can close this tab.';document.body.append(d)};
 let savedSettings=null,settingsDirty=false,settingsSaving=false,settingsSaveError=null,settingsVerifiedJustNow=false,prefTimer=null,prefSequence=Promise.resolve(),appearanceApplying=false,anomalySummaryRequest=0;
 async function updateAnomalySummary(){
  const request=++anomalySummaryRequest,el=$('anomalyReviewCount'),button=$('openSpeedReview');
@@ -6822,7 +10250,7 @@ function applyAppearance(p){if(!p)return;appearanceApplying=true;try{if(PALETTES
 async function writeAppearance(p){const response=await fetch('/api/preferences',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(p),cache:'no-store'});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not save settings');return data.appearance}
 function enqueueAppearance(p){prefSequence=prefSequence.catch(()=>{}).then(()=>writeAppearance(p));return prefSequence}
 function savePreferences(){if(appearanceApplying||$('settingsDialog').open)return;clearTimeout(prefTimer);prefTimer=setTimeout(()=>{enqueueAppearance(captureAppearance()).catch(e=>console.warn('Local preference save failed:',e.message))},220)}
-async function loadPreferences(){let p=null;try{const response=await getJson('/api/preferences');p=response.appearance;$('units').value=response.display_units==='km'?'km':'mi';$('settingsUnits').value=$('units').value}catch(e){console.warn('Local preferences unavailable:',e.message)}applyAppearance(p||{mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84,bike_routes:false,bike_tint_color:"#54dc96"})}
+async function loadPreferences(){let p=null;try{const response=await getJson('/api/preferences');p=response.appearance;$('units').value=response.display_units==='km'?'km':'mi';$('settingsUnits').value=$('units').value;applyActivityFocus(response.activity_focus||'cycling',false)}catch(e){console.warn('Local preferences unavailable:',e.message)}applyAppearance(p||{mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84,bike_routes:true,bike_tint_color:"#54dc96"})}
 async function refreshWatchFolderStatus(){try{const result=await getJson('/api/watch-folder');$('watchStatus').textContent=(result.folder?result.folder+' · ':'')+result.message}catch(e){$('watchStatus').textContent='Watch status unavailable: '+e.message}}
 $('watchBrowse').onclick=async()=>{const button=$('watchBrowse');button.disabled=true;try{const result=await protectedAction('/api/watch-folder/pick');if(result.folder){$('watchFolder').value=result.folder;markSettingsDirty();$('watchStatus').textContent='Folder selected. Save settings to enable automatic import.'}}catch(e){$('watchStatus').textContent=e.message}finally{button.disabled=false}};
 $('watchRescan').onclick=async()=>{if(settingsDirty){$('watchStatus').textContent='Save the watched-folder setting before scanning.';return}try{await protectedAction('/api/watch-folder/scan');$('watchStatus').textContent='Folder scan requested. New activities appear after import completes.';setTimeout(refreshWatchFolderStatus,1700)}catch(e){$('watchStatus').textContent='Could not start scan: '+e.message}};
@@ -6848,11 +10276,11 @@ function updateGarminCustomVisibility(){
  $('garminSyncCustom').hidden=!custom;
  $('garminSyncCustomLabel').hidden=!custom;
 }
-function captureSettings(){return {appearance:captureAppearance(),filter_speed_anomalies:$('filterSpeedAnomalies').checked,filter_speed_smart:$('filterSpeedSmart').checked,advanced_data:$('advancedData').checked,speed_threshold_mph:settingsSpeedThresholdMph,garmin_sync_minutes:$('garminSyncPreset').value==='custom'?Number($('garminSyncCustom').value):Number($('garminSyncPreset').value),strava_sync_minutes:$('stravaSyncPreset').value==='custom'?Number($('stravaSyncCustom').value):Number($('stravaSyncPreset').value),strava_recent_count:Number($('stravaRecentCount').value),display_units:$('settingsUnits').value,watch_folder:$('watchFolder').value.trim()}}
+function captureSettings(){return {appearance:captureAppearance(),filter_speed_anomalies:$('filterSpeedAnomalies').checked,filter_speed_smart:$('filterSpeedSmart').checked,advanced_data:$('advancedData').checked,speed_threshold_mph:settingsSpeedThresholdMph,garmin_sync_minutes:$('garminSyncPreset').value==='custom'?Number($('garminSyncCustom').value):Number($('garminSyncPreset').value),garmin_recent_count:Number($('garminRecentCount').value),strava_sync_minutes:$('stravaSyncPreset').value==='custom'?Number($('stravaSyncCustom').value):Number($('stravaSyncPreset').value),strava_recent_count:Number($('stravaRecentCount').value),display_units:$('settingsUnits').value,watch_folder:$('watchFolder').value.trim(),activity_focus:$('settingsActivityFocus').value}}
 function updateSaveState(){const indicator=$('settingsSaveState'),button=$('saveSettings');indicator.classList.toggle('dirty',settingsDirty);indicator.classList.toggle('error',!!settingsSaveError);indicator.classList.toggle('saved',!settingsDirty&&!settingsSaveError);indicator.textContent=settingsSaving?'Saving and verifying…':settingsSaveError||(settingsDirty?'Changes not saved yet':settingsVerifiedJustNow?'✓ Saved and applied on this computer':'Settings saved on this computer');button.disabled=settingsSaving;button.textContent=settingsSaving?'Saving…':'Save settings'}
 function markSettingsDirty(){if(!$('settingsDialog').open||appearanceApplying)return;settingsSaveError=null;settingsVerifiedJustNow=false;settingsDirty=JSON.stringify(captureSettings())!==JSON.stringify(savedSettings);updateSaveState();$('anomalyStatus').textContent=settingsDirty?'Changes are being previewed. Select Save settings to apply them to Statistics.':'Original recordings are never changed by either speed filter.';updateAnomalySummary()}
-function closeSettings(){if(settingsSaving)return;if(settingsDirty){if(!confirm('Discard unsaved settings changes?'))return;applyAppearance(savedSettings.appearance);$('filterSpeedAnomalies').checked=savedSettings.filter_speed_anomalies;$('filterSpeedSmart').checked=savedSettings.filter_speed_smart;$('advancedData').checked=savedSettings.advanced_data;$('settingsUnits').value=savedSettings.display_units;$('watchFolder').value=savedSettings.watch_folder||'';showSavedSpeedThreshold(savedSettings.speed_threshold_mph);setGarminSyncInterval(savedSettings.garmin_sync_minutes);setStravaSyncInterval(savedSettings.strava_sync_minutes);$('stravaRecentCount').value=savedSettings.strava_recent_count||25;settingsDirty=false;updateSaveState()}$('settingsDialog').close()}
-for(const name of ['filterSpeedAnomalies','filterSpeedSmart','advancedData','watchFolder','garminSyncCustom','stravaSyncCustom'])$(name).addEventListener('change',markSettingsDirty);
+function closeSettings(){if(settingsSaving)return;if(settingsDirty){if(!confirm('Discard unsaved settings changes?'))return;applyAppearance(savedSettings.appearance);$('filterSpeedAnomalies').checked=savedSettings.filter_speed_anomalies;$('filterSpeedSmart').checked=savedSettings.filter_speed_smart;$('advancedData').checked=savedSettings.advanced_data;$('settingsUnits').value=savedSettings.display_units;$('watchFolder').value=savedSettings.watch_folder||'';showSavedSpeedThreshold(savedSettings.speed_threshold_mph);setGarminSyncInterval(savedSettings.garmin_sync_minutes);$('garminRecentCount').value=savedSettings.garmin_recent_count||25;setStravaSyncInterval(savedSettings.strava_sync_minutes);$('stravaRecentCount').value=savedSettings.strava_recent_count||25;applyActivityFocus(savedSettings.activity_focus,false);settingsDirty=false;updateSaveState()}$('settingsDialog').close()}
+for(const name of ['filterSpeedAnomalies','filterSpeedSmart','advancedData','watchFolder','garminSyncCustom','garminRecentCount','stravaSyncCustom','settingsActivityFocus'])$(name).addEventListener('change',markSettingsDirty);
 $('garminSyncPreset').addEventListener('change',()=>{updateGarminCustomVisibility();markSettingsDirty()});
 $('garminSyncCustom').addEventListener('input',markSettingsDirty);
 $('stravaSyncPreset').addEventListener('change',()=>{updateStravaCustomVisibility();markSettingsDirty()});
@@ -6901,7 +10329,7 @@ settingsCategoryButtons.forEach((button,index)=>{
 $('openSettings').onclick=async()=>{
  if(prefTimer){clearTimeout(prefTimer);prefTimer=null;try{await enqueueAppearance(captureAppearance())}catch(e){console.warn('Preference save failed:',e.message)}}
  try{await prefSequence}catch(e){}
- try{const stored=await getJson('/api/settings');$('filterSpeedAnomalies').checked=stored.filter_speed_anomalies;$('filterSpeedSmart').checked=stored.filter_speed_smart;$('advancedData').checked=stored.advanced_data;$('settingsUnits').value=stored.display_units;$('watchFolder').value=stored.watch_folder||'';showSavedSpeedThreshold(stored.speed_threshold_mph);setGarminSyncInterval(stored.garmin_sync_minutes);setStravaSyncInterval(stored.strava_sync_minutes);$('stravaRecentCount').value=stored.strava_recent_count||25;savedSettings=stored;applyAppearance(stored.appearance)}
+ try{const stored=await getJson('/api/settings');$('filterSpeedAnomalies').checked=stored.filter_speed_anomalies;$('filterSpeedSmart').checked=stored.filter_speed_smart;$('advancedData').checked=stored.advanced_data;$('settingsUnits').value=stored.display_units;$('watchFolder').value=stored.watch_folder||'';showSavedSpeedThreshold(stored.speed_threshold_mph);setGarminSyncInterval(stored.garmin_sync_minutes);$('garminRecentCount').value=stored.garmin_recent_count||25;setStravaSyncInterval(stored.strava_sync_minutes);$('stravaRecentCount').value=stored.strava_recent_count||25;$('settingsActivityFocus').value=stored.activity_focus||'cycling';savedSettings=stored;applyAppearance(stored.appearance)}
  catch(e){savedSettings=captureSettings();showSettingsStatus('Could not verify saved preferences: '+e.message,true)}
  settingsDirty=false;settingsSaving=false;settingsSaveError=null;settingsVerifiedJustNow=false;updateSaveState();$('settingsStatus').textContent='';$('settingsDialog').showModal();selectSettingsCategory(activeSettingsCategory);updateAnomalySummary();refreshWatchFolderStatus();refreshGarminPersonalStatus();refreshStravaBrowserStatus();checkForUpdates();
  try{const d=await getJson('/api/system');$('dataFolder').textContent=d.data_directory;$('dataFile').textContent=d.database;$('installedVersion').textContent=d.version}catch(e){showSettingsStatus('Could not read local storage path: '+e.message,true)}
@@ -6914,13 +10342,13 @@ $('saveSettings').onclick=async()=>{if(settingsSaving)return;settingsSaveError=n
  clearTimeout(prefTimer);const payload=captureSettings();const response=await fetch('/api/settings',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(payload),cache:'no-store'});
  const result=await response.json();if(!response.ok)throw Error(result.error||'Could not save settings');
  const verified=await getJson('/api/settings');if(JSON.stringify(verified)!==JSON.stringify(result))throw Error('Saved settings could not be verified; please retry');
- savedSettings=verified;settingsDirty=false;settingsVerifiedJustNow=true;applyAppearance(verified.appearance);$('units').value=verified.display_units;$('watchFolder').value=verified.watch_folder||'';showSavedSpeedThreshold(verified.speed_threshold_mph);setGarminSyncInterval(verified.garmin_sync_minutes);setStravaSyncInterval(verified.strava_sync_minutes);$('stravaRecentCount').value=verified.strava_recent_count||25;refreshWatchFolderStatus();showSettingsStatus('Settings saved, verified, and applied on this computer.');$('anomalyStatus').textContent='Saved speed filters are active in Statistics and Analytics. Original activity records remain unchanged.';await updateAnomalySummary();if($('statsDialog').open)await refreshInsights();
+ savedSettings=verified;settingsDirty=false;settingsVerifiedJustNow=true;applyAppearance(verified.appearance);applyActivityFocus(verified.activity_focus);$('units').value=verified.display_units;$('watchFolder').value=verified.watch_folder||'';showSavedSpeedThreshold(verified.speed_threshold_mph);setGarminSyncInterval(verified.garmin_sync_minutes);$('garminRecentCount').value=verified.garmin_recent_count||25;setStravaSyncInterval(verified.strava_sync_minutes);$('stravaRecentCount').value=verified.strava_recent_count||25;refreshWatchFolderStatus();showSettingsStatus('Settings saved, verified, and applied on this computer.');$('anomalyStatus').textContent='Saved speed filters are active in Statistics and Analytics. Original activity records remain unchanged.';await updateAnomalySummary();if($('statsDialog').open)await refreshInsights();
  }catch(e){settingsSaveError='Save could not be confirmed. Please retry.';settingsDirty=true;showSettingsStatus('Settings verification failed: '+e.message,true)}finally{settingsSaving=false;updateSaveState()}};
-$('resetAppearance').onclick=()=>{applyAppearance({mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84,bike_routes:false,bike_tint_color:"#54dc96"});markSettingsDirty();showSettingsStatus('Defaults previewed. Select Save settings to keep them.')};
+$('resetAppearance').onclick=()=>{applyAppearance({mode:'dark',online:true,palette:'classic',routes:true,heat:true,radius:5,definition:78,intensity:120,opacity:84,bike_routes:true,bike_tint_color:"#54dc96"});markSettingsDirty();showSettingsStatus('Defaults previewed. Select Save settings to keep them.')};
 async function protectedAction(endpoint){const response=await fetch(endpoint,{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN},cache:'no-store'});let data={};try{data=await response.json()}catch(e){}if(!response.ok)throw Error(data.error||('Request failed: '+response.status));return data}
 function showSettingsStatus(message,error=false){$('settingsStatus').textContent=message;$('settingsStatus').classList.toggle('error',error)}
 $('clearViewCache').onclick=async()=>{const button=$('clearViewCache');button.disabled=true;try{await protectedAction('/api/cache/clear-view');loadedKey='';previousGeometry=null;++state.generation;showSettingsStatus('Temporary map calculations cleared. Reloading the view.');scheduleData()}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
-$('clearActivities').onclick=async()=>{if(!state.known){showSettingsStatus('There are no imported activities to delete.');return}if(prompt('Delete LibreHeatmaps activity data only? Original GPX/FIT files, watched-folder preferences, Garmin/Strava connections and other settings will remain. Connected services may reimport missing rides. Type DELETE to confirm:')!=='DELETE')return;const button=$('clearActivities');button.disabled=true;try{const result=await protectedAction('/api/cache/clear-activities');loadedKey='';++state.generation;if(controller)controller.abort();state.data={step:2,cells:[],activities:0,peak:0};previousGeometry=null;for(const id of ['sport','dateFrom','dateTo','search','statsSport','statsBike','statsYear','statsMonth'])$(id).value='';state.bounds=null;state.focusBounds=null;state.known=0;queueRender();await refreshStats(false);if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}showSettingsStatus('Cleared '+result.deleted.toLocaleString()+' activity records and import history. Original GPS files, saved accounts and settings remain untouched. Garmin can now restore missing rides.')}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
+$('clearActivities').onclick=async()=>{if(!state.known){showSettingsStatus('There are no imported activities to delete.');return}if(prompt('Delete LibreHeatmaps activity data only? Original GPX/FIT files, watched-folder preferences, Garmin/Strava connections and other settings will remain. Connected services may reimport missing rides. Type DELETE to confirm:')!=='DELETE')return;const button=$('clearActivities');button.disabled=true;try{const result=await protectedAction('/api/cache/clear-activities');loadedKey='';++state.generation;if(controller)controller.abort();state.data={step:2,cells:[],activities:0,peak:0};previousGeometry=null;for(const id of ['sport','dateFrom','dateTo','search','statsSport','statsBike','statsYear','statsMonth'])$(id).value='';state.bounds=null;state.focusBounds=null;state.activeRideId=null;state.activeRideBounds=null;state.known=0;++statsRefreshRevision;heatVisitGrid.clear();heatVisitTooltip.hidden=true;paintCache=null;$('activityCount').textContent='0';$('pointCount').textContent='0';$('dateRange').textContent='';$('empty').classList.remove('hidden');$('clearRide').hidden=true;restoreImportMapStatus();queueRender();await refreshStats(false);restoreImportMapStatus();if($('statsDialog').open){await refreshStatsFilters();await refreshInsights()}showSettingsStatus('Cleared '+result.deleted.toLocaleString()+' activity records and import history. Original GPS files, saved accounts and settings remain untouched. Garmin can now restore missing rides.')}catch(e){showSettingsStatus(e.message,true)}finally{button.disabled=false}};
 $('openDataFolder').onclick=async()=>{try{await protectedAction('/api/system/open-folder');showSettingsStatus('Opened your local data folder.')}catch(e){showSettingsStatus(e.message,true)}};
 let updateCheckRunning=false,updateCheckTime=0,updateInstallRunning=false;
 async function checkForUpdates(force=false){
@@ -6946,9 +10374,9 @@ $('installUpdate').onclick=async()=>{
 let lastCompletedJobSerial=0;
 let garminHomeActive=false,garminHomeRefreshing=false,garminHomeLastBatch=0,garminHomeLastImported=0,garminRecentHomeActive=false;
 async function showGarminHomeProgress(job){
- // Garmin historical imports run independently of the ordinary file-upload job.
- // Show their progress on the sidebar and map; publish each set of 50 newly
- // committed rides to the heatmap without stopping the historical download.
+ 
+ 
+ 
  const h=(await getJson('/api/garmin-personal/status')).history||{};
  const running=job.status==='running'&&job.source==='garmin_history'&&!!h.active;
  const banner=$('garminHomeProgress');
@@ -6964,7 +10392,7 @@ async function showGarminHomeProgress(job){
  }
  const count=Math.max(0,Number(h.imported)||0),reviewed=Math.max(0,Number(h.reviewed)||0);
  const batchSize=Math.max(1,Number(h.map_batch_size)||50),batches=Math.floor(count/batchSize);
- if(count<garminHomeLastImported)garminHomeLastBatch=0; // a new full-history pass
+ if(count<garminHomeLastImported)garminHomeLastBatch=0;  
  garminHomeLastImported=count;
  garminHomeActive=true;banner.hidden=false;$('importStatus').hidden=true;
  const detail=reviewed.toLocaleString()+' checked · '+count.toLocaleString()+' new rides imported';
@@ -6975,7 +10403,7 @@ async function showGarminHomeProgress(job){
   garminHomeRefreshing=true;
   $('garminHomeHeatStatus').textContent='Refreshing heatmap with '+(batches*batchSize).toLocaleString()+' imported rides…';
   try{
-   await refreshStats(false); // re-read local library without resetting user's map view
+   await refreshStats(false);  
    garminHomeLastBatch=batches;
    $('garminHomeHeatStatus').textContent='Heatmap refresh requested after '+(batches*batchSize).toLocaleString()+' imported rides';
   }catch(e){$('garminHomeHeatStatus').textContent='Map refresh delayed: '+e.message}
@@ -6990,9 +10418,9 @@ function isGarminRecentJob(job){
  return job.status==='running'&&/^(Checking Garmin Connect for wireless rides|Downloading missing Garmin activity recordings|Garmin activity [0-9]+ [(])/.test(String(job.message||''));
 }
 function isGarminHistoryJob(job){
- // The shared job record can outlive a completed history pass; inspect its
- // message as well as its source so subsequent Strava/manual imports are not
- // mistaken for Garmin history.
+ 
+ 
+ 
  return job.source==='garmin_history'&&/^(Importing full Garmin account history|Scanning Garmin history|Garmin full history|Full Garmin history|Garmin history paused|Garmin activity [0-9]+ (failed|could not)|Garmin historical)/i.test(String(job.message||''));
 }
 async function checkBackgroundImports(){
@@ -7254,7 +10682,7 @@ function lhInstallHelp(){
  for(const [selector,title] of [
   ['#yearChart','Distance by year'],['#monthChart','Monthly activity'],
   ['#weekdayChart','Activity by weekday'],['#sportSummary','Types & gear'],
-  ['#speedHistoryChart','Typical riding speed'],['#speedDistributionChart','Speed distribution'],
+  ['#speedHistoryChart','Typical moving speed'],['#speedDistributionChart','Speed distribution'],
   ['#speedDurationChart','Speed versus ride duration'],['#distanceHistoryChart','Distance by period'],
   ['#distanceDistributionChart','Ride distance distribution'],['#distanceDurationChart','Distance versus moving time'],
   ['#movingHistoryChart','Hours on the move'],['#activityFrequencyChart','How often you ride'],
@@ -7281,16 +10709,7 @@ for(const id of lhObserved){const node=$(id);if(node)new MutationObserver(lhQueu
 lhInstallHelp();
 
 
-let timeMachineActive=false,timeMachineYear=0,timeMachineMode='through',timeMachineYears=[],timeMachineTimer=0;
-function timeMachineSelected(){const y=Number($('timeMachineYear').value);const row=timeMachineYears.find(r=>r.year===y);$('timeMachineYearLabel').textContent=String(y);const selected=timeMachineYears.filter(r=>timeMachineMode==='through'?r.year<=y:r.year===y);$('timeMachineNumbers').textContent=selected.reduce((n,r)=>n+r.activities,0).toLocaleString()+' rides · '+distanceLabel(selected.reduce((n,r)=>n+r.distance_m,0));}
-async function openTimeline(){try{const summary=await getJson('/api/timeline');timeMachineYears=summary.years;if(!timeMachineYears.length){alert('Import dated activities to use the Time Machine.');return}const slider=$('timeMachineYear');slider.min=timeMachineYears[0].year;slider.max=timeMachineYears.at(-1).year;slider.value=timeMachineActive?String(timeMachineYear):String(timeMachineYears.at(-1).year);$('timeMachineMode').value=timeMachineMode;timeMachineSelected();$('timeMachineStatus').textContent='';$('timeMachineDialog').show();}catch(e){alert('Could not load timeline: '+e.message)}}
-let timelineInputTimer=0;function stopTimeline(){if(timelineInputTimer){clearTimeout(timelineInputTimer);timelineInputTimer=0}if(timeMachineTimer){clearInterval(timeMachineTimer);timeMachineTimer=0}$('timeMachinePlay').textContent='Play years'}
-function applyTimeline(){clearTimeout(timelineInputTimer);timelineInputTimer=0;timeMachineActive=true;timeMachineYear=Number($('timeMachineYear').value);timeMachineMode=$('timeMachineMode').value;timeMachineSelected();state.activeRideId=null;loadedKey='';scheduleData(35);$('timeMachineStatus').textContent='Showing '+timeMachineYear+(timeMachineMode==='through'?' and earlier':' only')+' on the map.'}
-$('openTimeMachine').onclick=openTimeline;$('timeMachineClose').onclick=()=>{stopTimeline();$('timeMachineDialog').close()};$('timeMachineDialog').addEventListener('close',stopTimeline);
-$('timeMachineYear').oninput=()=>{timeMachineSelected();clearTimeout(timelineInputTimer);timelineInputTimer=setTimeout(applyTimeline,170)};$('timeMachineMode').onchange=()=>{timeMachineMode=$('timeMachineMode').value;timeMachineSelected();applyTimeline()};$('timeMachineApply').onclick=applyTimeline;
-$('timeMachinePrev').onclick=()=>{$('timeMachineYear').value=Math.max(Number($('timeMachineYear').min),Number($('timeMachineYear').value)-1);applyTimeline()};$('timeMachineNext').onclick=()=>{$('timeMachineYear').value=Math.min(Number($('timeMachineYear').max),Number($('timeMachineYear').value)+1);applyTimeline()};
-$('timeMachinePlay').onclick=()=>{if(timeMachineTimer){stopTimeline();return}timeMachineTimer=setInterval(()=>{const slider=$('timeMachineYear');slider.value=Number(slider.value)>=Number(slider.max)?Number(slider.min):Number(slider.value)+1;applyTimeline()},2100);$('timeMachinePlay').textContent='Pause playback'};
-$('timeMachineReset').onclick=()=>{stopTimeline();timeMachineActive=false;state.activeRideId=null;loadedKey='';scheduleData(25);$('timeMachineStatus').textContent='Full history restored.'};
+let timeMachineActive=false,timeMachineYear=0,timeMachineMonth=0,timeMachineMode='through';
 
 let compareLoaded=[],compareFetchSerial=0,compareLoading=false;
 function renderCompareOptions(){
@@ -7312,7 +10731,7 @@ async function loadCompareOptions(append=false){
  const q=$('compareSearch').value.trim(),order=$('compareOrder').value;
  compareLoading=true;$('compareMore').disabled=true;
  try{
-  const url='/api/compare-options?q='+encodeURIComponent(q)+'&order='+order+'&offset='+offset;
+  const url='/api/compare-options?q='+encodeURIComponent(q)+'&order='+order+'&offset='+offset+'&focus='+encodeURIComponent(activityFocus);
   const res=await getJson(url);
   if(serial!==compareFetchSerial)return;
   compareLoaded=append?compareLoaded.concat(res.rows):res.rows;
@@ -7357,9 +10776,9 @@ function drawCompare(a,b){
  paths.forEach((path,index)=>{
   c.beginPath();let previous=null;
   for(const loc of path){if(!loc){previous=null;continue}const xy=pos(loc);if(previous)c.lineTo(xy[0],xy[1]);else c.moveTo(xy[0],xy[1]);previous=loc}
-  c.lineCap='round';c.lineJoin='round';c.strokeStyle=index===0?'#d18aff':'#ffaf6d';c.lineWidth=3.4;c.shadowColor=c.strokeStyle;c.shadowBlur=9;c.stroke();c.shadowBlur=0
+  c.lineCap='round';c.lineJoin='round';c.strokeStyle=index===0?'#FAF0CA':'#F4D35E';c.lineWidth=3.4;c.shadowColor=c.strokeStyle;c.shadowBlur=9;c.stroke();c.shadowBlur=0
  });
- c.font='bold 13px system-ui';c.fillStyle='#e9e0ef';c.fillText('● First ride',18,66);c.fillStyle='#ffad70';c.fillText('● Second ride',147,66)
+ c.font='bold 13px system-ui';c.fillStyle='#FAF0CA';c.fillText('● First ride',18,66);c.fillStyle='#F4D35E';c.fillText('● Second ride',147,66)
 }
 async function compareRides(){const first=$('compareFirst').value,second=$('compareSecond').value;if(!first||!second||first===second){$('compareStatus').textContent='Choose two different rides.';return}try{$('compareStatus').textContent='Loading both local GPS routes…';const [a,b]=await Promise.all([getJson('/api/activity?id='+first),getJson('/api/activity?id='+second)]);drawCompare(a,b);compareRenderMetrics(a,b);$('compareStatus').textContent='First: '+a.name+' · Second: '+b.name+' · Numbers are directly recorded or derived from saved activity summaries; more is not always better.';await loadCompareTraces(a,b)}catch(e){$('compareStatus').textContent='Comparison unavailable: '+e.message}}
 $('compareLoad').onclick=compareRides;
@@ -7370,8 +10789,8 @@ function compareValue(value,kind){if(!Number.isFinite(value))return '—';const 
 function compareDifference(a,b,kind){if(!Number.isFinite(a)||!Number.isFinite(b))return 'Not comparable';let difference=b-a;const unit=kind==='seconds'?' min':kind==='distance'?($('units').value==='mi'?' mi':' km'):kind==='speed'?($('units').value==='mi'?' mph':' km/h'):kind==='height'?($('units').value==='mi'?' ft':' m'):kind==='temp'?($('units').value==='mi'?' °F':' °C'):kind==='bpm'?' bpm':kind==='W'?' W':' rpm';const factor=kind==='seconds'?1/60:kind==='distance'?($('units').value==='mi'?1/1609.344:.001):kind==='height'&&$('units').value==='mi'?3.28084:kind==='speed'?($('units').value==='mi'?2.236936:3.6):kind==='temp'?1.8:1;return(difference>0?'+':'')+nice(difference*factor,(kind==='distance'||kind==='speed'||kind==='temp')?1:0)+unit+(a>0?' ('+(difference>0?'+':'')+nice(difference/a*100,1)+'%)':'')}
 function compareRenderMetrics(a,b){const rows=[['Distance',a.distance_m,b.distance_m,'distance'],['Moving time',a.moving_seconds,b.moving_seconds,'seconds'],['Average speed',a.avg_speed,b.avg_speed,'speed'],['Peak speed',a.max_speed,b.max_speed,'speed'],['Elevation gain',a.elevation_m,b.elevation_m,'height'],['Average power',a.avg_power,b.avg_power,'W'],['Heart rate',a.avg_heart_rate,b.avg_heart_rate,'bpm'],['Cadence',a.avg_cadence,b.avg_cadence,'rpm']];const root=$('compareMetrics');root.replaceChildren();const labels=document.createElement('div');labels.className='v121-compare-metric-row v121-compare-header';for(const value of ['Measurement','First ride','Second ride','Change (second − first)']){const h=document.createElement('span');h.textContent=value;labels.append(h)}root.append(labels);for(const [label,one,two,kind] of rows){const row=document.createElement('div');row.className='v121-compare-metric-row';const items=[label,compareValue(one,kind),compareValue(two,kind),compareDifference(one,two,kind)];items.forEach((v,i)=>{const cell=document.createElement('span');cell.textContent=v;if(i===1)cell.className='v121-a';if(i===2)cell.className='v121-b';row.append(cell)});root.append(row)}}
 function compareTraceData(data,index){const samples=data?.samples||[];if(samples.length<2)return null;const first=samples[0]?.[0],last=samples[samples.length-1]?.[0];if(!Number.isFinite(first)||!Number.isFinite(last)||last<=first)return null;const bins=Array.from({length:100},()=>[]);for(const point of samples){const t=point[0],v=point[index];if(!Number.isFinite(t)||!Number.isFinite(v))continue;const k=Math.max(0,Math.min(99,Math.floor((t-first)/(last-first)*100)));bins[k].push(v)}return bins.map(values=>values.length?values.reduce((a,b)=>a+b,0)/values.length:null)}
-function renderCompareTrace(){const canvas=$('compareTrendCanvas'),context=canvas.getContext('2d'),metric=$('compareTrendMetric').value;if(!metric||!compareMeasure[metric]){canvas.hidden=true;$('compareTrendStatus').textContent='Timestamped sensor traces are not available for these activities.';return}canvas.hidden=false;const [label,kind,index]=compareMeasure[metric],series=compareTelemetry.map(x=>compareTraceData(x,index));compareTrace={series,kind,label};const w=Math.max(260,canvas.clientWidth||600),h=Math.max(180,canvas.clientHeight||225),scale=Math.min(2,devicePixelRatio||1);canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);context.setTransform(scale,0,0,scale,0,0);context.clearRect(0,0,w,h);const all=series.flat().filter(Number.isFinite);if(!all.length){$('compareTrendStatus').textContent='No '+label.toLowerCase()+' readings to compare.';return}let low=Math.min(...all),high=Math.max(...all),padding=(high-low)*.09||1;low-=padding;high+=padding;const left=52,right=w-17,top=17,bottom=h-33;context.font='12px system-ui';context.fillStyle='#bcaacc';context.strokeStyle='#46394e';context.lineWidth=1;for(let n=0;n<=3;n++){const y=top+(bottom-top)*n/3;context.beginPath();context.moveTo(left,y);context.lineTo(right,y);context.stroke();context.fillText(nice(high-(high-low)*n/3,0),8,y+4)}for(let n=0;n<=4;n++){const x=left+(right-left)*n/4;context.fillText(n*25+'%',x-12,h-10)}series.forEach((values,k)=>{context.strokeStyle=compareColors[k];context.lineWidth=2.5;context.lineCap='round';context.lineJoin='round';context.beginPath();let open=false;values.forEach((v,i)=>{if(!Number.isFinite(v)){open=false;return}const x=left+(right-left)*i/99,y=bottom-(v-low)/(high-low)*(bottom-top);if(!open){context.moveTo(x,y);open=true}else context.lineTo(x,y)});context.stroke()});$('compareTrendStatus').textContent='Comparing '+label.toLowerCase()+' through elapsed ride progress. Purple is the first ride; orange is the second. Missing readings are not estimated.'}
-function compareInspectTrace(event){if(!compareTrace)return;const canvas=$('compareTrendCanvas'),rect=canvas.getBoundingClientRect(),w=canvas.clientWidth||rect.width;const pos=Math.max(0,Math.min(99,Math.round((event.clientX-rect.left-52)/(w-69)*99)));const values=compareTrace.series.map(a=>a?.[pos]);$('compareTrendStatus').textContent=(pos+1)+'% of ride · First: '+compareValue(values[0],compareTrace.kind)+' · Second: '+compareValue(values[1],compareTrace.kind)}
+function renderCompareTrace(){const canvas=$('compareTrendCanvas'),context=canvas.getContext('2d'),metric=$('compareTrendMetric').value;if(!metric||!compareMeasure[metric]){canvas.hidden=true;$('compareTrendStatus').textContent='Timestamped sensor traces are not available for these activities.';return}canvas.hidden=false;const [label,kind,index]=compareMeasure[metric],series=compareTelemetry.map(x=>compareTraceData(x,index));compareTrace={series,kind,label};const w=Math.max(260,canvas.clientWidth||600),h=Math.max(180,canvas.clientHeight||225),scale=Math.min(2,devicePixelRatio||1);canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);context.setTransform(scale,0,0,scale,0,0);context.clearRect(0,0,w,h);const all=series.flat().filter(Number.isFinite);if(!all.length){$('compareTrendStatus').textContent='No '+label.toLowerCase()+' readings to compare.';return}let low=Math.min(...all),high=Math.max(...all),padding=(high-low)*.09||1;low-=padding;high+=padding;const left=52,right=w-17,top=17,bottom=h-33;context.font='12px system-ui';context.fillStyle='#DDE6E5';context.strokeStyle='#4D6C86';context.lineWidth=1;for(let n=0;n<=3;n++){const y=top+(bottom-top)*n/3;context.beginPath();context.moveTo(left,y);context.lineTo(right,y);context.stroke();context.fillText(nice(high-(high-low)*n/3,0),8,y+4)}for(let n=0;n<=4;n++){const x=left+(right-left)*n/4;context.fillText(n*25+'%',x-12,h-10)}series.forEach((values,k)=>{context.strokeStyle=compareColors[k];context.lineWidth=2.5;context.lineCap='round';context.lineJoin='round';context.beginPath();let open=false;values.forEach((v,i)=>{if(!Number.isFinite(v)){open=false;return}const x=left+(right-left)*i/99,y=bottom-(v-low)/(high-low)*(bottom-top);if(!open){context.moveTo(x,y);open=true}else context.lineTo(x,y)});context.stroke()});$('compareTrendStatus').textContent='Comparing '+label.toLowerCase()+' through elapsed activity progress. Purple is the first ride; orange is the second. Missing readings are not estimated.'}
+function compareInspectTrace(event){if(!compareTrace)return;const canvas=$('compareTrendCanvas'),rect=canvas.getBoundingClientRect(),w=canvas.clientWidth||rect.width;const pos=Math.max(0,Math.min(99,Math.round((event.clientX-rect.left-52)/(w-69)*99)));const values=compareTrace.series.map(a=>a?.[pos]);$('compareTrendStatus').textContent=(pos+1)+'% of activity · First: '+compareValue(values[0],compareTrace.kind)+' · Second: '+compareValue(values[1],compareTrace.kind)}
 $('compareTrendMetric').onchange=renderCompareTrace;
 $('compareTrendCanvas').addEventListener('pointermove',compareInspectTrace);
 $('compareTrendCanvas').addEventListener('pointerdown',compareInspectTrace);
@@ -7379,14 +10798,181 @@ let compareTraceSerial=0;
 async function loadCompareTraces(a,b){const serial=++compareTraceSerial;const traces=await Promise.all([a,b].map(async item=>{try{return await getJson('/api/telemetry?id='+item.id)}catch(e){return null}}));if(serial!==compareTraceSerial)return;compareTelemetry=traces;const select=$('compareTrendMetric'),old=select.value;select.replaceChildren();for(const [key,entry] of Object.entries(compareMeasure)){if(compareTelemetry.some(data=>data?.available?.includes(key))){const option=document.createElement('option');option.value=key;option.textContent=entry[0];select.append(option)}}if([...select.options].some(o=>o.value===old))select.value=old;renderCompareTrace()}
 
 let currentYearbook=null;
-async function loadYearbook(){try{const years=(await getJson('/api/timeline')).years;const select=$('yearbookYear'),old=select.value;select.replaceChildren();for(const r of years.slice().reverse()){const option=document.createElement('option');option.value=r.year;option.textContent=r.year;select.append(option)}if(old)select.value=old;await refreshYearbook()}catch(e){$('yearbookStatus').textContent=e.message}}
-async function refreshYearbook(){const year=$('yearbookYear').value;if(!year)return;try{const r=await getJson('/api/yearbook?year='+year);currentYearbook=r;const labels=[['Activities',nice(r.activities)],['Distance',distanceLabel(r.distance_m)],['Moving time',timeLabel(r.moving_seconds)],['Active days',nice(r.active_days)],['Elevation gain',nice(r.elevation_m)+' m'],['Most-used bike',r.top_bike||'Not recorded']];const root=$('yearbookMetrics');root.replaceChildren();for(const [label,value] of labels){const el=document.createElement('div');el.className='metric';const strong=document.createElement('strong');strong.textContent=value;const span=document.createElement('span');span.textContent=label;el.append(strong,span);root.append(el)}$('yearbookDetails').replaceChildren();const p=document.createElement('p');p.textContent=r.longest?'Longest ride: '+r.longest.name+' ('+distanceLabel(r.longest.distance_m)+') · Most active month: '+(r.top_month||'Unknown'):'No recorded activities this year.';$('yearbookDetails').append(p);if(r.longest){const btn=document.createElement('button');btn.textContent='Preview longest ride';btn.onclick=()=>openRidePreview(r.longest.id);$('yearbookDetails').append(btn)}$('yearbookStatus').textContent='Year summary calculated from your local activity database.'}catch(e){$('yearbookStatus').textContent=e.message}}
-$('yearbookYear').onchange=refreshYearbook;$('yearbookMap').onclick=async()=>{if(!currentYearbook?.activities)return;$('statsDialog').close();await openTimeline();$('timeMachineMode').value='year';$('timeMachineYear').value=currentYearbook.year;timeMachineMode='year';applyTimeline()};
-$('yearbookExport').onclick=()=>{const r=currentYearbook;if(!r?.activities)return alert('Choose a year with recorded activities.');const canvas=document.createElement('canvas');canvas.width=1400;canvas.height=900;const c=canvas.getContext('2d');const g=c.createLinearGradient(0,0,1400,900);g.addColorStop(0,'#211431');g.addColorStop(1,'#512645');c.fillStyle=g;c.fillRect(0,0,1400,900);c.fillStyle='#e9ccf9';c.font='bold 70px system-ui';c.fillText('LibreHeatmaps · '+r.year,75,140);c.fillStyle='#c9bdd6';c.font='27px system-ui';c.fillText('Your year in review · Activity data stays yours',76,195);const cells=[['Activities',nice(r.activities)],['Distance',distanceLabel(r.distance_m)],['Moving time',timeLabel(r.moving_seconds)],['Active days',nice(r.active_days)],['Elevation gain',nice(r.elevation_m)+' m'],['Favorite bike',r.top_bike||'Not recorded']];cells.forEach(([k,v],i)=>{const x=80+(i%2)*640,y=260+Math.floor(i/2)*180;c.fillStyle='#291c3e';c.fillRect(x,y,600,147);c.fillStyle='#f1e1fa';c.font='bold 42px system-ui';c.fillText(v.slice(0,26),x+24,y+68);c.font='24px system-ui';c.fillStyle='#bfaed1';c.fillText(k,x+24,y+111)});canvas.toBlob(b=>{if(!b)return;const url=URL.createObjectURL(b),a=document.createElement('a');a.href=url;a.download='LibreHeatmaps-Yearbook-'+r.year+'.png';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)},'image/png')};
+async function loadYearbook(){try{const years=(await getJson('/api/timeline?focus='+encodeURIComponent(activityFocus))).years;const select=$('yearbookYear'),old=select.value;select.replaceChildren();for(const r of years.slice().reverse()){const option=document.createElement('option');option.value=r.year;option.textContent=r.year;select.append(option)}if(old)select.value=old;await refreshYearbook()}catch(e){$('yearbookStatus').textContent=e.message}}
+async function refreshYearbook(){const year=$('yearbookYear').value;if(!year)return;try{const r=await getJson('/api/yearbook?year='+year+'&focus='+encodeURIComponent(activityFocus));currentYearbook=r;const labels=[['Activities',nice(r.activities)],['Distance',distanceLabel(r.distance_m)],['Moving time',timeLabel(r.moving_seconds)],['Active days',nice(r.active_days)],['Elevation gain',nice(r.elevation_m)+' m'],...(activityFocus==='foot'?[]:[['Most-used bike',r.top_bike||'Not recorded']])];const root=$('yearbookMetrics');root.replaceChildren();for(const [label,value] of labels){const el=document.createElement('div');el.className='metric';const strong=document.createElement('strong');strong.textContent=value;const span=document.createElement('span');span.textContent=label;el.append(strong,span);root.append(el)}$('yearbookDetails').replaceChildren();const p=document.createElement('p');p.textContent=r.longest?(activityFocus==='foot'?'Longest activity: ':'Longest ride: ')+r.longest.name+' ('+distanceLabel(r.longest.distance_m)+') · Most active month: '+(r.top_month||'Unknown'):'No recorded activities this year.';$('yearbookDetails').append(p);if(r.longest){const btn=document.createElement('button');btn.textContent=activityFocus==='foot'?'Preview longest activity':'Preview longest ride';btn.onclick=()=>openRidePreview(r.longest.id);$('yearbookDetails').append(btn)}$('yearbookStatus').textContent='Year summary calculated from your local activity database.'}catch(e){$('yearbookStatus').textContent=e.message}}
+$('yearbookYear').onchange=refreshYearbook;$('yearbookMap').onclick=async()=>{if(!currentYearbook?.activities)return;$('statsDialog').close();await lhLoadTimeLens();$('timeLensYear').value=String(currentYearbook.year);$('timeLensMonth').value='0';$('timeLensMode').value='year';lhApplyTimeLens();lhTimeCollapsed&&lhSetTimeCollapsed(false);$('timeLensYear').focus()};
+$('yearbookExport').onclick=()=>{const r=currentYearbook;if(!r?.activities)return alert('Choose a year with recorded activities.');const canvas=document.createElement('canvas');canvas.width=1400;canvas.height=900;const c=canvas.getContext('2d');const g=c.createLinearGradient(0,0,1400,900);g.addColorStop(0,'#0D3B66');g.addColorStop(1,'#082741');c.fillStyle=g;c.fillRect(0,0,1400,900);c.fillStyle='#F4D35E';c.font='bold 70px system-ui';c.fillText('LibreHeatmaps · '+r.year,75,140);c.fillStyle='#FAF0CA';c.font='27px system-ui';c.fillText('Your year in review · Activity data stays yours',76,195);const cells=[['Activities',nice(r.activities)],['Distance',distanceLabel(r.distance_m)],['Moving time',timeLabel(r.moving_seconds)],['Active days',nice(r.active_days)],['Elevation gain',nice(r.elevation_m)+' m'],...(activityFocus==='foot'?[]:[['Favorite bike',r.top_bike||'Not recorded']])];cells.forEach(([k,v],i)=>{const x=80+(i%2)*640,y=260+Math.floor(i/2)*180;c.fillStyle='#164A74';c.fillRect(x,y,600,147);c.fillStyle='#FFF7DE';c.font='bold 42px system-ui';c.fillText(v.slice(0,26),x+24,y+68);c.font='24px system-ui';c.fillStyle='#D0DDE6';c.fillText(k,x+24,y+111)});canvas.toBlob(b=>{if(!b)return;const url=URL.createObjectURL(b),a=document.createElement('a');a.href=url;a.download='LibreHeatmaps-Yearbook-'+r.year+'.png';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)},'image/png')};
 
 async function duplicateRequest(payload){const response=await fetch('/api/duplicates/action',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(payload),cache:'no-store'});const data=await response.json();if(!response.ok)throw Error(data.error||'Duplicate action failed');return data}
 let duplicateBusy=false;
-async function refreshDuplicateReview(){const status=$('duplicateStatus'),root=$('duplicatePairs'),archive=$('duplicateArchive');if(duplicateBusy)return;duplicateBusy=true;$('scanDuplicates').disabled=true;status.textContent='Checking timestamped route recordings locally…';try{const result=await getJson('/api/duplicates');root.replaceChildren();archive.replaceChildren();status.textContent=result.pairs.length+' high-confidence potential pairs from '+result.compared+' activities with suitable telemetry. '+(result.truncated?'Showing the first 250 pairs. ':'')+'The scan did not change your library. '+(result.warning||'');for(const pair of result.pairs){const section=document.createElement('div');section.className='v121-duplicate-card';const heading=document.createElement('strong');heading.textContent=pair.first.day+' · '+distanceLabel(pair.first.distance_m)+' · route deviation ~'+pair.median_route_offset_m+' m';section.append(heading);const opts=document.createElement('div');opts.className='v121-duplicate-options';const name='keep-'+pair.first.id+'-'+pair.second.id;const preferred=[pair.first,pair.second].sort((a,b)=>(b.richness-a.richness)||(b.telemetry_count-a.telemetry_count)||(b.points-a.points))[0].id;for(const ride of [pair.first,pair.second]){const label=document.createElement('label'),radio=document.createElement('input'),copy=document.createElement('span');radio.type='radio';radio.name=name;radio.value=ride.id;radio.checked=ride.id===preferred;copy.textContent=ride.name+' · '+ride.filename+' · '+ride.points.toLocaleString()+' GPS points · '+ride.richness+' sensor channels';if(ride.id===preferred){const hint=document.createElement('small');hint.textContent='Suggested keeper';copy.append(document.createTextNode(' · '),hint)}label.append(radio,copy);const row=document.createElement('div');row.className='v121-duplicate-choice';const previewButton=document.createElement('button');previewButton.type='button';previewButton.textContent='Preview route';previewButton.onclick=()=>openRidePreview(ride.id);row.append(label,previewButton);opts.append(row)}section.append(opts);const action=document.createElement('button');action.type='button';action.textContent='Archive other recording';action.onclick=async()=>{const keep=Number(section.querySelector('input:checked')?.value),remove=keep===pair.first.id?pair.second.id:pair.first.id;const chosen=keep===pair.first.id?pair.first:pair.second,removed=remove===pair.first.id?pair.first:pair.second;if(!confirm('Keep "'+chosen.name+'" and archive "'+removed.name+'"?\\n\\nThe archived copy can be restored from this screen. Original source files on disk are not affected.'))return;action.disabled=true;try{await duplicateRequest({action:'archive',keep_id:keep,remove_id:remove});await refreshStats(true);await refreshDuplicateReview()}catch(e){status.textContent='Could not archive: '+e.message;action.disabled=false}};section.append(action);root.append(section)}if(result.archived.length){const title=document.createElement('h4');title.textContent='Archived recordings · available to restore';archive.append(title);for(const item of result.archived){const row=document.createElement('div');row.className='v121-archived-row';const text=document.createElement('span');text.textContent=item.name+' · '+item.archived_at;const restore=document.createElement('button');restore.type='button';restore.textContent='Restore';restore.onclick=async()=>{if(!confirm('Restore '+item.name+' to the active library?'))return;restore.disabled=true;try{await duplicateRequest({action:'restore',archive_id:item.id});await refreshStats(true);await refreshDuplicateReview()}catch(e){status.textContent='Could not restore: '+e.message;restore.disabled=false}};row.append(text,restore);archive.append(row)}}else{const p=document.createElement('p');p.className='muted';p.textContent='No archived duplicates to restore.';archive.append(p)}}catch(e){status.textContent='Duplicate scan unavailable: '+e.message}finally{duplicateBusy=false;$('scanDuplicates').disabled=false}}
+async function refreshDuplicateReview(){const status=$('duplicateStatus'),root=$('duplicatePairs'),archive=$('duplicateArchive');if(duplicateBusy)return;duplicateBusy=true;$('scanDuplicates').disabled=true;status.textContent='Checking timestamped route recordings locally…';try{const result=await getJson('/api/duplicates');root.replaceChildren();archive.replaceChildren();status.textContent=result.pairs.length+' high-confidence potential pairs and '+(result.combined_sources||[]).length+' combined multi-source rides. '+(result.truncated?'Showing the first 250 pairs. ':'')+'Nothing changes until you choose and save. '+(result.warning||''); for(const pair of result.pairs){const section=document.createElement('div');section.className='v121-duplicate-card';const heading=document.createElement('strong');heading.textContent=pair.first.day+' · '+distanceLabel(pair.first.distance_m)+' · route deviation ~'+pair.median_route_offset_m+' m';section.append(heading);const opts=document.createElement('div');opts.className='v121-duplicate-options';const name='keep-'+pair.first.id+'-'+pair.second.id;const preferred=[pair.first,pair.second].sort((a,b)=>(b.richness-a.richness)||(b.telemetry_count-a.telemetry_count)||(b.points-a.points))[0].id;for(const ride of [pair.first,pair.second]){const label=document.createElement('label'),radio=document.createElement('input'),copy=document.createElement('span');radio.type='radio';radio.name=name;radio.value=ride.id;radio.checked=ride.id===preferred;copy.textContent=ride.name+' · '+ride.filename+' · '+ride.points.toLocaleString()+' GPS points · '+ride.richness+' sensor channels';if(ride.id===preferred){const hint=document.createElement('small');hint.textContent='Suggested keeper';copy.append(document.createTextNode(' · '),hint)}label.append(radio,copy);const row=document.createElement('div');row.className='v121-duplicate-choice';const previewButton=document.createElement('button');previewButton.type='button';previewButton.textContent='Preview route';previewButton.onclick=()=>openRidePreview(ride.id);row.append(label,previewButton);opts.append(row)}section.append(opts);const action=document.createElement('button');action.type='button';action.textContent='Combine source recordings';action.onclick=async()=>{const keep=Number(section.querySelector('input:checked')?.value),remove=keep===pair.first.id?pair.second.id:pair.first.id;const chosen=keep===pair.first.id?pair.first:pair.second,removed=remove===pair.first.id?pair.first:pair.second;if(!confirm('Keep "'+chosen.name+'" and archive "'+removed.name+'"?\n\nThe archived copy can be restored from this screen. Original source files on disk are not affected.'))return;action.disabled=true;try{await duplicateRequest({action:'archive',keep_id:keep,remove_id:remove});await refreshStats(true);await refreshDuplicateReview()}catch(e){status.textContent='Could not archive: '+e.message;action.disabled=false}};section.append(action);root.append(section)}if(result.archived.length){const title=document.createElement('h4');title.textContent='Archived recordings · available to restore';archive.append(title);for(const item of result.archived){const row=document.createElement('div');row.className='v121-archived-row';const text=document.createElement('span');text.textContent=item.name+' · '+item.archived_at;const restore=document.createElement('button');restore.type='button';restore.textContent='Restore';restore.onclick=async()=>{if(!confirm('Restore '+item.name+' to the active library?'))return;restore.disabled=true;try{await duplicateRequest({action:'restore',archive_id:item.id});await refreshStats(true);await refreshDuplicateReview()}catch(e){status.textContent='Could not restore: '+e.message;restore.disabled=false}};row.append(text,restore);archive.append(row)}}else{const p=document.createElement('p');p.className='muted';p.textContent='No archived duplicates to restore.';archive.append(p)}}catch(e){status.textContent='Duplicate scan unavailable: '+e.message}finally{duplicateBusy=false;$('scanDuplicates').disabled=false}}
+
+let sourceReviewLoading=0;
+const sourceFieldGroups=[
+ ['Activity identity',['name','sport','day','bike','gear_id']],
+ ['Distance & movement',['recorded_distance_m','moving_seconds','elapsed_seconds','elevation_m','avg_speed','max_speed']],
+ ['Performance & health',['avg_heart_rate','avg_power','calories_kcal','avg_cadence','max_cadence','max_heart_rate','max_power','normalized_power','total_cycles','training_stress_score','intensity_factor']],
+ ['Weather & environment',['avg_temp_c','max_temp_c','weather_temp_c','weather_condition','wind_speed_mps','wind_gust_mps','humidity_pct']],
+ ['GPS & sensor tracks',['route','telemetry']]
+];
+async function openSourceReview(){
+ const dialog=$('sourceReviewDialog'),list=$('sourceReviewList'),status=$('sourceReviewStatus'),request=++sourceReviewLoading;
+ list.replaceChildren();status.textContent='Loading your library-wide source preferences…';$('sourceReviewTitle').textContent='Data source priorities';
+ if(!dialog.open){if(dialog.classList.contains('lh-integrated-view'))dialog.show();else dialog.showModal()}
+ try{
+  const response=await getJson('/api/source-preferences');if(!dialog.open||request!==sourceReviewLoading)return;
+  status.textContent=response.multi_source_activities+' activities currently have matching recordings from multiple sources. These rules apply across the entire library and to future imports.';
+  const hero=document.createElement('div');hero.className='lh-source-policy-hero';
+  hero.innerHTML='<div><strong>One preference for every activity</strong><p>Automatic keeps the existing value. If a preferred source lacks a measurement, LibreHeatmaps uses the available result. Manual corrections and repaired GPS routes stay protected.</p></div>';
+  list.append(hero);
+  const toolbar=document.createElement('div');toolbar.className='lh-source-policy-tools';
+  const reset=document.createElement('button');reset.type='button';reset.textContent='Reset to automatic';
+  const preset=document.createElement('button');preset.type='button';preset.textContent='Garmin metrics · Strava details';
+  toolbar.append(preset,reset);list.append(toolbar);
+  const grid=document.createElement('div');grid.className='lh-source-policy-grid';
+  for(const [section,fields] of sourceFieldGroups){
+   const visible=fields.filter(field=>response.fields.includes(field));if(!visible.length)continue;
+   const block=document.createElement('section');block.className='lh-source-policy-section';
+   const h=document.createElement('h3');h.textContent=section;block.append(h);
+   const icon=document.createElement('span');icon.setAttribute('aria-hidden','true');icon.className='lh-source-group-icon';icon.textContent=section==='GPS & sensor tracks'?'⌖':section==='Activity identity'?'◈':section==='Distance & movement'?'↗':section==='Performance & health'?'♥':'☼';h.prepend(icon);
+   for(const field of visible){
+    const row=document.createElement('label');row.className='lh-source-policy-row';
+    const info=document.createElement('span');info.className='lh-source-policy-field';
+    const title=document.createElement('strong');title.textContent=v123FieldLabels[field]||(field==='route'?'GPS track / route':field==='telemetry'?'Sensor telemetry':field.replaceAll('_',' '));
+    const counts=response.availability[field]||{};const available=Object.entries(counts).filter(x=>x[1]>0).map(([name,count])=>name+' · '+count+' recording'+(count===1?'':'s'));
+    const hint=document.createElement('small');hint.textContent=available.length?available.join('  /  '):'Available when a source provides this field';
+    info.append(title,hint);
+    const select=document.createElement('select');select.dataset.field=field;select.setAttribute('aria-label','Preferred source for '+title.textContent);
+    for(const provider of response.providers){const opt=document.createElement('option');opt.value=provider;opt.textContent=provider==='Auto'?'Automatic (default)':provider;select.append(opt)}
+    select.value=response.preferences[field]||'Auto';row.append(info,select);block.append(row)
+   }
+   grid.append(block)
+  }
+  list.append(grid);
+  const controls=document.createElement('div');controls.className='lh-source-policy-footer';
+  const note=document.createElement('span');note.textContent='No activity-by-activity setup. Original GPS files are never modified.';
+  const save=document.createElement('button');save.type='button';save.className='primary';save.textContent='Apply to entire library';controls.append(note,save);list.append(controls);
+  const selects=[...grid.querySelectorAll('select[data-field]')];
+  reset.onclick=()=>{selects.forEach(x=>x.value='Auto')};
+  preset.onclick=()=>{for(const sel of selects)sel.value=['name','sport','day','bike','gear_id'].includes(sel.dataset.field)?'Strava':'Garmin'};
+  save.onclick=async()=>{
+   const preferences=Object.fromEntries(selects.map(x=>[x.dataset.field,x.value]));
+   if(!confirm('Apply these field-source preferences across your complete activity library? Your original GPS files and local manual corrections will remain unchanged.'))return;
+   save.disabled=true;status.textContent='Updating combined recordings using your saved source preferences…';
+   try{
+    const response=await fetch('/api/source-preferences',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({preferences}),cache:'no-store'});
+    const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Could not update preferences');
+    status.textContent='Saved. Applied rules to '+result.activities_reviewed+' combined activities. Future matching imports will follow these preferences.';
+    await refreshStats(true);
+    if(previewRide&&$('ridePreviewDialog').open)await openRidePreview(previewRide.id);
+   }catch(e){status.textContent='Source preferences not changed: '+e.message}
+   finally{save.disabled=false}
+  };
+ }catch(e){status.textContent='Could not load data source preferences: '+e.message}
+}
+ 
+const lhWorkspaceRail=$('lhNavMap').closest('.terrain-rail');
+function lhMobileIntegratedOffset(){
+ const brand=document.querySelector('body>header')?.getBoundingClientRect(),rail=lhWorkspaceRail.getBoundingClientRect();
+ const bottom=Math.ceil(Math.max(brand?.bottom||0,rail.bottom));
+ document.documentElement.style.setProperty('--lh-mobile-rail-bottom',bottom+'px');
+}
+lhMobileIntegratedOffset();
+window.addEventListener('resize',()=>requestAnimationFrame(lhMobileIntegratedOffset));
+const lhSourcePage=$('sourceReviewDialog');
+const lhSourceBody=document.createElement('div');lhSourceBody.className='lh-source-workspace-main';
+while(lhSourcePage.firstChild)lhSourceBody.append(lhSourcePage.firstChild);
+const lhSourceSidebar=document.createElement('nav');lhSourceSidebar.className='lh-source-workspace-sidebar';
+lhSourceSidebar.setAttribute('aria-label','Data source navigation');
+lhSourceSidebar.innerHTML='<span class="lh-source-eyebrow">LIBRARY CONTROLS</span><h2>Data sources</h2><p>Choose where each measurement comes from once. Your preferences apply to matching recordings throughout the library.</p><div class="lh-source-sidebar-active">Field priorities</div><p class="lh-source-sidebar-note">Original GPS files and manually corrected activity data remain protected.</p>';
+lhSourcePage.append(lhSourceSidebar,lhSourceBody);
+function lhRailSelect(name){lhMobileIntegratedOffset();
+ const links=[['lhNavMap','map'],['lhNavOverview','overview'],['lhNavAnalytics','analytics'],['lhNavAdvanced','advanced'],['lhNavCompare','compare'],['lhNavYearbook','yearbook'],['lhNavActivities','activities'],['lhNavData','data'],['lhNavReview','review'],['lhNavCalendar','calendar'],['lhNavSources','sources']];
+ for(const [id,key] of links){const node=$(id);node.classList.toggle('lh-quicknav-active',key===name);node.setAttribute('aria-current',key===name?'page':'false')}
+}
+function lhReturnMap(){lhCalendarClose();if($('statsDialog').open)$('statsDialog').close();if(lhSourcePage.open)lhSourcePage.close();lhRailSelect('map');requestAnimationFrame(updateMap)}
+function lhOpenSourceWorkspace(){lhCalendarClose();if($('statsDialog').open)$('statsDialog').close();lhSourcePage.classList.add('lh-integrated-view');lhRailSelect('sources');openSourceReview()}
+$('statsDialog').addEventListener('close',()=>{if(!lhSourcePage.open&&!lhCalState.open)lhRailSelect('map')});
+lhSourcePage.addEventListener('close',()=>{lhSourcePage.classList.remove('lh-integrated-view');if(!$('statsDialog').open&&!lhCalState.open)lhRailSelect('map')});
+$('openActivitySources').onclick=()=>{lhSourcePage.classList.remove('lh-integrated-view');openSourceReview()};
+$('headerSources').onclick=lhOpenSourceWorkspace;
+$('lhNavMap').onclick=lhReturnMap;
+function lhOpenInsightsDestination(name){
+ lhCalendarClose();$('statsTop').click();selectStatsTab(name);lhRailSelect(name);
+}
+for(const [id,name] of [['lhNavOverview','overview'],['lhNavAnalytics','analytics'],['lhNavAdvanced','advanced'],['lhNavCompare','compare'],['lhNavYearbook','yearbook'],['lhNavActivities','activities'],['lhNavData','data'],['lhNavReview','review']]){
+ $(id).onclick=()=>lhOpenInsightsDestination(name);
+}
+$('lhNavSources').onclick=lhOpenSourceWorkspace;
+$('lhNavCalendar').onclick=lhCalendarOpen;
+ 
+$('lhRailSettings').onclick=()=>$('openSettings').click();
+$('lhRailExit').onclick=()=>$('shutdown').click();
+const lhNavAction=(action)=>{
+ if(action==='map')return lhReturnMap();
+ if(action==='sources')return lhOpenSourceWorkspace();
+ if(action==='import'||action==='time'||action==='map-layers'){
+  lhReturnMap();requestAnimationFrame(()=>{if(action==='time'){if(document.querySelector('#timeLens')?.classList.contains('collapsed'))$('timeLensCollapse')?.click()}
+   else {const node=action==='import'?document.querySelector('.lh-import-panel'):document.querySelector('.lh-map-panel');node?.scrollIntoView({block:'start',behavior:'smooth'})}});return;
+ }
+ if(['overview','analytics','advanced','compare','yearbook','activities','data','review'].includes(action))lhOpenInsightsDestination(action);
+};
+for(const shortcut of document.querySelectorAll('.lh-nav-flyout [data-rail-action]'))shortcut.addEventListener('click',event=>{event.stopPropagation();lhNavAction(shortcut.dataset.railAction);shortcut.blur()});
+document.querySelector('.terrain-rail').addEventListener('keydown',event=>{if(event.key==='Escape'){document.activeElement?.blur?.();$('lhNavMap').focus();event.stopPropagation()}});
+
+$('openLibrarySources').onclick=()=>{lhSourcePage.classList.remove('lh-integrated-view');openSourceReview()};
+$('closeSourceReview').onclick=()=>{lhSourcePage.close();requestAnimationFrame(updateMap)};
+$('sourceReviewDialog').addEventListener('close',()=>{++sourceReviewLoading});
+function v123SourceValue(key,raw){
+ const imperial=$('units').value==='mi',number=Number(raw);
+ if(typeof raw!=='number'||!Number.isFinite(number))return String(raw).slice(0,72);
+ if(key==='recorded_distance_m')return distanceLabel(number);
+ if(key==='elevation_m')return nice(number*(imperial?3.28084:1),0)+(imperial?' ft':' m');
+ if(key==='moving_seconds'||key==='elapsed_seconds')return timeLabel(number);
+ if(key==='avg_speed'||key==='max_speed'||key==='wind_speed_mps'||key==='wind_gust_mps')return nice(number*(imperial?2.236936:3.6),1)+(imperial?' mph':' km/h');
+ if(key==='avg_temp_c'||key==='max_temp_c'||key==='weather_temp_c')return nice(imperial?number*9/5+32:number,1)+(imperial?' °F':' °C');
+ if(key==='avg_power'||key==='max_power'||key==='normalized_power')return nice(number,0)+' W';
+ if(key==='avg_cadence'||key==='max_cadence')return nice(number,0)+' rpm';
+ if(key==='avg_heart_rate'||key==='max_heart_rate')return nice(number,0)+' bpm';
+ if(key==='calories_kcal')return nice(number,0)+' kcal';
+ return String(raw).slice(0,72);
+}
+const v123FieldLabels={name:'Activity name',sport:'Activity type',day:'Date',bike:'Bike',gear_id:'Gear ID',recorded_distance_m:'Recorded distance',moving_seconds:'Moving time',elapsed_seconds:'Elapsed time',elevation_m:'Elevation gain',avg_speed:'Average speed',max_speed:'Maximum speed',avg_heart_rate:'Average heart rate',avg_power:'Average power',calories_kcal:'Calories',avg_cadence:'Average cadence',max_cadence:'Maximum cadence',total_cycles:'Total cycles / strokes',max_power:'Maximum power',normalized_power:'Normalized power',training_stress_score:'Training stress',intensity_factor:'Intensity factor',max_heart_rate:'Maximum heart rate',avg_temp_c:'Average temperature',max_temp_c:'Maximum temperature',weather_temp_c:'Weather temperature',wind_speed_mps:'Wind speed',wind_gust_mps:'Wind gust',humidity_pct:'Humidity',weather_condition:'Weather condition'};
+function v123SourceSelection(root,group,options={}){
+ const card=document.createElement('details');card.className='v121-duplicate-card v123-source-card';card.open=!!options.expanded;
+ const title=document.createElement('summary');title.textContent=(group.day||'Unknown date')+' · '+group.name+' · '+group.sources.length+' available recordings';card.append(title);
+ const intro=document.createElement('p');intro.className='muted';intro.textContent='Choose which recording supplies shared measurements. Measurements found in only one recording are added automatically. Your originals and manual edits are preserved.';card.append(intro);
+ const context=document.createElement('div');context.className='lh-source-context';for(const src of group.sources){const chip=document.createElement('span');chip.className='lh-source-chip';chip.textContent=src.provider+' · '+src.label;context.append(chip)}card.append(context);
+ const info=document.createElement('p');info.className='lh-source-help';info.textContent='Each selector lists actual recorded values and filenames. Keep current value means no replacement is made for that field. Changing a route or timestamped trace is optional; nothing is edited until Save.';card.append(info);
+ const entries=Object.entries(v123FieldLabels).filter(([key])=>group.sources.some(src=>src.fields[key]!==undefined && src.fields[key]!==null));
+ const grid=document.createElement('div');grid.className='v123-source-grid';let previousSection='';
+ const sectionOf=key=>['name','sport','day','bike','gear_id'].includes(key)?'Activity identity & equipment':(['recorded_distance_m','moving_seconds','elapsed_seconds','elevation_m','avg_speed','max_speed'].includes(key)?'Distance, time & elevation':'Sensors & conditions');
+ for(const [key,label] of entries){
+  const available=group.sources.filter(src=>src.fields[key]!==undefined&&src.fields[key]!==null);
+  if(available.length<2)continue;
+  const section=sectionOf(key);if(section!==previousSection){const heading=document.createElement('div');heading.className='lh-source-subgroup';heading.textContent=section;grid.append(heading);previousSection=section}
+  const field=document.createElement('label');field.className='v123-source-field';field.append(document.createTextNode(label));
+  const select=document.createElement('select');select.dataset.field=key;
+  const keep=document.createElement('option');keep.value='';keep.textContent='Keep current value';select.append(keep);
+  for(const src of available){const o=document.createElement('option');o.value=String(src.id);const raw=src.fields[key];o.textContent=src.provider+' · '+src.label+' · '+v123SourceValue(key,raw);select.append(o)}
+  select.value=String(group.choices[key]||'');field.append(select);grid.append(field)
+ }
+ previousSection='';
+ for(const [key,label,property] of [['route','GPS route geometry','has_route'],['telemetry','Timestamped sensor trace','has_telemetry']]){
+  const available=group.sources.filter(src=>src[property]);if(available.length<2)continue;
+  if(!previousSection){const heading=document.createElement('div');heading.className='lh-source-subgroup';heading.textContent='GPS route & recorded samples';grid.append(heading);previousSection='route'}
+  const field=document.createElement('label');field.className='v123-source-field';field.append(document.createTextNode(label));
+  const select=document.createElement('select');select.dataset.field=key;const keep=document.createElement('option');keep.value='';keep.textContent='Keep current recording';select.append(keep);
+  for(const src of available){const o=document.createElement('option');o.value=String(src.id);o.textContent=src.provider+' · '+src.label;select.append(o)}
+  select.value=String(group.choices[key]||'');field.append(select);grid.append(field)
+ }
+ const helper=document.createElement('div');helper.className='settings-actions';
+ const prefer=document.createElement('button');prefer.type='button';prefer.textContent='Garmin measurements + Strava names';
+ prefer.onclick=()=>{for(const sel of grid.querySelectorAll('select')){const key=sel.dataset.field,target=(['name','sport'].includes(key)?'Strava':'Garmin');const src=group.sources.find(v=>v.provider===target&&(key==='route'?v.has_route:key==='telemetry'?v.has_telemetry:v.fields[key]!==null&&v.fields[key]!==undefined));if(src&&[...sel.options].some(o=>o.value===String(src.id)))sel.value=String(src.id)}};
+ const save=document.createElement('button');save.type='button';save.textContent='Save source choices';save.className='primary';
+ save.onclick=async()=>{const choices={};for(const sel of grid.querySelectorAll('select'))if(sel.value)choices[sel.dataset.field]=Number(sel.value);if(!confirm('Save the selected source preferences for '+Object.keys(choices).length+' data fields? Original files and manually edited values are preserved.'))return;save.disabled=true;try{await duplicateRequest({action:'choose_sources',activity_id:group.activity_id,choices});await refreshStats(true);if(options.onSaved)await options.onSaved();else await refreshDuplicateReview()}catch(e){const status=$('sourceReviewDialog').open?$('sourceReviewStatus'):$('duplicateStatus');status.textContent='Could not save source choices: '+e.message;save.disabled=false}};
+ helper.append(prefer,save);card.append(grid,helper);root.append(card);
+}
 $('scanDuplicates').onclick=refreshDuplicateReview;
 $('backupLibrary').onclick=async()=>{
  if(!confirm('Download a full library backup? It contains original GPS routes, settings and sensor measurements. Store the ZIP privately.'))return;
@@ -7401,6 +10987,1336 @@ $('backupLibrary').onclick=async()=>{
 };
 
 $('restoreLibrary').onclick=()=>$('restoreLibraryFile').click();$('restoreLibraryFile').onchange=async()=>{const file=$('restoreLibraryFile').files[0];if(!file)return;if(!confirm('This will replace your current local activity library and settings with '+file.name+'. Have you downloaded a current backup?'))return;$('libraryStatus').textContent='Verifying and restoring backup…';try{const res=await fetch('/api/library-restore',{method:'POST',headers:{'X-LibreHeatmaps-Token':TOKEN},body:file});const data=await res.json();if(!res.ok)throw Error(data.error||'Restore failed');$('libraryStatus').textContent='Library restored: '+data.activities+' activities. Reloading local views.';timeMachineActive=false;await refreshStats(true);if($('statsDialog').open)await refreshInsights()}catch(e){$('libraryStatus').textContent='Restore failed: '+e.message}finally{$('restoreLibraryFile').value=''}};
+
+
+ 
+let lhTimeYears=[],lhTimeMonths=new Map(),lhTimeInputTimer=0,lhTimePlaying=0,lhTimeCollapsed=false;
+const lhTime=$('timeLens');
+function lhMonthLabel(m){return m?$('timeLensMonth').options[m].textContent:'all months'}
+function lhUpdateTimeLabel(){
+ const y=Number($('timeLensYear').value),m=Number($('timeLensMonth').value);
+ $('timeLensYearLabel').textContent=lhTimeYears.length?String(y):'—';
+ $('timeLensYearSelect').value=String(y);
+ let description='All recorded years';
+ if(timeMachineActive)description=(timeMachineMode==='year'?'Only ':'Through ')+(m?lhMonthLabel(m)+' '+y:y);
+ $('timeLensDescription').textContent=description;
+ const monthKey=y+'-'+String(m).padStart(2,'0'),count=m?(lhTimeMonths.get(monthKey)||0):(lhTimeYears.find(row=>row.year===y)?.activities||0);
+ $('timeLensStatus').textContent=lhTimeYears.length?(count.toLocaleString()+' recorded activities in '+(m?lhMonthLabel(m)+' '+y:y)):'No dated activities yet';
+ $('timeLensAll').disabled=!timeMachineActive;
+}
+async function lhLoadTimeLens(){try{
+ const result=await getJson('/api/timeline?focus='+encodeURIComponent(activityFocus));
+ lhTimeYears=result.years||[];lhTimeMonths=new Map((result.months||[]).map(v=>[v.month,v.activities]));
+ const slider=$('timeLensYear'),yearSelect=$('timeLensYearSelect');
+ slider.disabled=!lhTimeYears.length;
+ if(!lhTimeYears.length){lhTime.hidden=true;return}lhTime.hidden=false;
+ const year=timeMachineActive&&timeMachineYear>=lhTimeYears[0].year&&timeMachineYear<=lhTimeYears.at(-1).year?timeMachineYear:lhTimeYears.at(-1).year;
+ slider.min=lhTimeYears[0].year;slider.max=lhTimeYears.at(-1).year;slider.value=String(year);
+ yearSelect.replaceChildren();for(let y=lhTimeYears[0].year;y<=lhTimeYears.at(-1).year;y++){const opt=document.createElement('option');opt.value=String(y);opt.textContent=String(y);yearSelect.append(opt)}
+ $('timeLensMonth').value=String(timeMachineMonth);$('timeLensMode').value=timeMachineMode;lhUpdateTimeLabel();
+}catch(e){$('timeLensStatus').textContent='Timeline unavailable: '+e.message}}
+function lhStopTimePlayback(){if(lhTimePlaying){clearInterval(lhTimePlaying);lhTimePlaying=0}$('timeLensPlay').textContent='Play'}
+function lhApplyTimeLens(){if(!lhTimeYears.length)return;
+ lhStopTimePlayback();timeMachineActive=true;timeMachineYear=Number($('timeLensYear').value);timeMachineMonth=Number($('timeLensMonth').value);timeMachineMode=$('timeLensMode').value;
+ state.activeRideId=null;$('clearRide').hidden=true;loadedKey='';scheduleData(60);lhUpdateTimeLabel();lhRefreshOpenPlace();
+}
+let lhTimeDetailOpen=false;
+function lhSetTimeDetail(value){lhTimeDetailOpen=!!value;
+ $('timeLensDetail').hidden=!lhTimeDetailOpen||lhTimeCollapsed;
+ $('timeLensMore').textContent=lhTimeDetailOpen?'Less':'Details';
+ $('timeLensMore').setAttribute('aria-expanded',String(lhTimeDetailOpen&&!lhTimeCollapsed));
+}
+function lhSetTimeCollapsed(value){lhTimeCollapsed=!!value;lhTime.classList.toggle('collapsed',lhTimeCollapsed);
+ $('timeLensBody').hidden=lhTimeCollapsed;
+ $('timeLensCollapse').textContent=lhTimeCollapsed?'Time Lens · Show':'Hide';
+ $('timeLensCollapse').setAttribute('aria-expanded',String(!lhTimeCollapsed));
+ $('timeLensMore').hidden=lhTimeCollapsed;
+ lhSetTimeDetail(lhTimeDetailOpen);
+ try{localStorage.setItem('libreheatmaps.timelens.collapsed',lhTimeCollapsed?'1':'0')}catch(e){}
+}
+$('timeLensYear').addEventListener('input',()=>{lhUpdateTimeLabel();clearTimeout(lhTimeInputTimer);lhTimeInputTimer=setTimeout(lhApplyTimeLens,160)});
+$('timeLensYearSelect').addEventListener('change',()=>{$('timeLensYear').value=$('timeLensYearSelect').value;lhApplyTimeLens()});
+$('timeLensMonth').addEventListener('change',lhApplyTimeLens);
+$('timeLensMode').addEventListener('change',lhApplyTimeLens);
+$('timeLensPrev').addEventListener('click',()=>{const el=$('timeLensYear');el.value=Math.max(Number(el.min),Number(el.value)-1);lhApplyTimeLens()});
+$('timeLensNext').addEventListener('click',()=>{const el=$('timeLensYear');el.value=Math.min(Number(el.max),Number(el.value)+1);lhApplyTimeLens()});
+function lhStepMonth(delta){const y=Number($('timeLensYear').value),m=Number($('timeLensMonth').value);
+ const date=new Date(Date.UTC(y,m?m-1:(delta<0?12:-1),1));date.setUTCMonth(date.getUTCMonth()+delta);
+ const targetY=Math.min(Number($('timeLensYear').max),Math.max(Number($('timeLensYear').min),date.getUTCFullYear()));
+ if(targetY!==date.getUTCFullYear())return;
+ $('timeLensYear').value=String(targetY);$('timeLensMonth').value=String(date.getUTCMonth()+1);lhApplyTimeLens();
+}
+$('timeLensMonthPrev').addEventListener('click',()=>lhStepMonth(-1));
+$('timeLensMonthNext').addEventListener('click',()=>lhStepMonth(1));
+$('timeLensAll').addEventListener('click',()=>{lhStopTimePlayback();timeMachineActive=false;timeMachineMonth=0;$('timeLensMonth').value='0';state.activeRideId=null;loadedKey='';scheduleData(60);lhUpdateTimeLabel();lhRefreshOpenPlace()});
+$('timeLensPlay').addEventListener('click',()=>{if(lhTimePlaying){lhStopTimePlayback();return}if(!lhTimeYears.length)return;
+ if(matchMedia('(prefers-reduced-motion: reduce)').matches){$('timeLensStatus').textContent='Playback is disabled with reduced motion; choose a period manually.';return}
+ $('timeLensMonth').value='0';
+ lhTimePlaying=setInterval(()=>{if(document.hidden){lhStopTimePlayback();return}
+ const slider=$('timeLensYear');slider.value=Number(slider.value)>=Number(slider.max)?Number(slider.min):Number(slider.value)+1;
+ timeMachineActive=true;timeMachineYear=Number(slider.value);timeMachineMonth=0;timeMachineMode=$('timeLensMode').value;
+ state.activeRideId=null;loadedKey='';scheduleData(60);lhUpdateTimeLabel();lhRefreshOpenPlace();},2200);
+ $('timeLensPlay').textContent='Pause';
+});
+$('timeLensMore').addEventListener('click',()=>lhSetTimeDetail(!lhTimeDetailOpen));
+$('timeLensCollapse').addEventListener('click',()=>lhSetTimeCollapsed(!lhTimeCollapsed));
+try{if(localStorage.getItem('libreheatmaps.timelens.collapsed')==='1')lhSetTimeCollapsed(true)}catch(e){}
+setTimeout(lhLoadTimeLens,350);
+$('activityFocus').addEventListener('change',()=>setTimeout(lhLoadTimeLens,500));
+for(const id of ['sport','dateFrom','dateTo','search'])$(id).addEventListener('input',lhRefreshOpenPlace);
+$('activityFocus').addEventListener('change',lhRefreshOpenPlace);
+$('clear').addEventListener('click',lhRefreshOpenPlace);
+
+let lhPlacePosition=null,lhPlaceRequest=0,lhPlaceAbort=null,lhPlaceRefreshTimer=0,lhPlaceCalendarYear=null;
+function lhClosePlace(){++lhPlaceRequest;if(lhPlaceAbort)lhPlaceAbort.abort();
+  $('placeInspector').hidden=true;$('placePin').hidden=true;lhPlacePosition=null;lhPlaceCalendarYear=null;$('placeResults').replaceChildren();
+}
+$('placeClose').addEventListener('click',lhClosePlace);
+function lhRefreshOpenPlace(){clearTimeout(lhPlaceRefreshTimer);if(!lhPlacePosition||$('placeInspector').hidden)return;
+  lhPlaceRefreshTimer=setTimeout(()=>{if(lhPlacePosition&&!$('placeInspector').hidden)lhExplorePlace(lhPlacePosition.lat,lhPlacePosition.lon)},240);
+}
+function lhPlaceMarker(){if(!lhPlacePosition)return;const v=viewport(),[x,y]=px(lhPlacePosition.lat,lhPlacePosition.lon);
+  $('placePin').style.left=Math.round(x-v.left)+'px';$('placePin').style.top=Math.round(y-v.top)+'px'
+}
+async function lhFocusRouteFromPlace(item,button){
+  button.disabled=true;button.textContent='Loading…';
+  try{
+    const ride=await getJson('/api/activity?id='+encodeURIComponent(item.id));
+    if(!Array.isArray(ride.bounds)||ride.bounds.length!==4||ride.bounds.some(n=>!Number.isFinite(n)))throw Error('Route has no valid map bounds');
+    state.activeRideId=ride.id;state.activeRideBounds=ride.bounds;
+    $('clearRide').hidden=false;$('mapCaption').querySelector('.map-caption-title').textContent=ride.name||'Selected GPS activity';
+    loadedKey='';lhClosePlace();fitBounds(ride.bounds,false);
+  }catch(e){button.textContent='Try again';button.title='Could not focus route: '+e.message;button.disabled=false}
+}
+function lhPlaceResultRow(item){const row=document.createElement('div');row.className='lh-place-route';
+  const b=document.createElement('button');b.type='button';b.className='lh-place-activity';
+  const title=document.createElement('strong');title.textContent=item.name||'Untitled activity';
+  const detail=document.createElement('span');detail.textContent=[item.day||'Undated',item.sport||'Unknown',item.nearest_m+' m away'].join(' · ');
+  b.append(title,detail);b.title='Open activity details and recorded telemetry';b.addEventListener('click',()=>openRidePreview(item.id));
+  const focus=document.createElement('button');focus.className='lh-place-focus';focus.type='button';focus.textContent='On map';
+  focus.title='Show only this recorded GPS route on the main heatmap';focus.setAttribute('aria-label','Show '+(item.name||'Untitled activity')+' on map');
+  focus.addEventListener('click',()=>lhFocusRouteFromPlace(item,focus));row.append(b,focus);return row;
+}
+async function lhSelectVisitPeriod(year,month){
+  await lhLoadTimeLens();
+  if(!lhTimeYears.some(x=>x.year===Number(year)))return;
+  $('timeLensYear').value=String(year);$('timeLensMonth').value=String(month);$('timeLensMode').value='year';lhApplyTimeLens();
+}
+function lhPlaceVisitCalendar(monthCounts){
+  const years=[...new Set(Object.keys(monthCounts).map(k=>k.slice(0,4)))].filter(y=>/^[0-9]{4}$/.test(y)).sort();
+  if(!years.length)return null;
+  if(!years.includes(lhPlaceCalendarYear))lhPlaceCalendarYear=years.at(-1);
+  const wrap=document.createElement('section');wrap.className='lh-place-calendar';
+  const head=document.createElement('div');head.className='lh-place-calendar-head';
+  const heading=document.createElement('strong');heading.textContent='Visit rhythm · by month';
+  const selector=document.createElement('select');selector.setAttribute('aria-label','Visit year');
+  for(const y of years){const option=document.createElement('option');option.value=y;option.textContent=y;selector.append(option)}
+  selector.value=lhPlaceCalendarYear;head.append(heading,selector);
+  const months=document.createElement('div');months.className='lh-place-calendar-months';
+  const label=document.createElement('p');label.className='lh-place-calendar-note';label.textContent='Counts are recorded activities near this point within your current filters.';
+  const shortMonths=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function drawMonths(){months.replaceChildren();for(let i=1;i<=12;i++){
+    const count=monthCounts[selector.value+'-'+String(i).padStart(2,'0')]||0;
+    const el=document.createElement(count?'button':'span');el.className='lh-place-month'+(count?'':' lh-place-month-empty');
+    const m=document.createElement('span');m.textContent=shortMonths[i-1];const n=document.createElement('b');n.textContent=count?String(count):'—';el.append(m,n);
+    if(count){el.type='button';el.title='Show '+count+' nearby recorded '+(count===1?'activity':'activities')+' in '+shortMonths[i-1]+' '+selector.value;
+      el.setAttribute('aria-label',el.title);el.addEventListener('click',()=>lhSelectVisitPeriod(selector.value,i));}
+    months.append(el);
+  }}
+  selector.addEventListener('change',()=>{lhPlaceCalendarYear=selector.value;drawMonths()});drawMonths();wrap.append(head,months,label);return wrap;
+}
+async function lhExplorePlace(lat,lon){
+  if(!lhPlacePosition||Math.abs(lhPlacePosition.lat-lat)>1e-7||Math.abs(lhPlacePosition.lon-lon)>1e-7)lhPlaceCalendarYear=null;
+  $('placeInspector').hidden=false;lhPlacePosition={lat,lon};lhPlaceMarker();$('placePin').hidden=false;
+  $('placeCoordinates').textContent=lat.toFixed(5)+'°, '+lon.toFixed(5)+'°';
+  const id=++lhPlaceRequest;const target=$('placeResults');target.replaceChildren();
+  $('placeHint').textContent='Searching your local recorded GPS routes…';
+  if(lhPlaceAbort)lhPlaceAbort.abort();lhPlaceAbort=new AbortController();
+  try{
+    const p=filterParams();p.set('lat',String(lat));p.set('lon',String(lon));p.set('radius_m',$('placeRadius').value);
+    const res=await fetch('/api/place-lens?'+p.toString(),{signal:lhPlaceAbort.signal,cache:'no-store'});
+    if(!res.ok){let msg;try{msg=(await res.json()).error}catch(e){}throw Error(msg||'Place query failed ('+res.status+')')}
+    const result=await res.json();if(id!==lhPlaceRequest||$('placeInspector').hidden)return;
+    $('placeHint').textContent=result.radius_m+' m search radius · '+result.matched_activities.toLocaleString()+' matching recorded activities';
+    const summary=document.createElement('div');summary.className='lh-place-summary';
+    summary.textContent=result.matched_activities?('First '+(result.first_visit||'undated')+' · Last '+(result.last_visit||'undated')):'No activity routes passed close to this point within the selected filters.';
+    target.append(summary);
+    if(result.matched_activities && result.year_counts && Object.keys(result.year_counts).length){
+      const years=document.createElement('div');years.className='lh-place-years';
+      const label=document.createElement('strong');label.textContent='Visited by year';years.append(label);
+      for(const [year,count] of Object.entries(result.year_counts)){
+        const chip=document.createElement('button');chip.type='button';chip.textContent=year+' · '+count;chip.title='Show nearby activities from '+year;
+        chip.addEventListener('click',()=>lhSelectVisitPeriod(year,0));
+        years.append(chip)
+      }
+      target.append(years);
+    }
+    if(result.matched_activities&&result.month_counts){const calendar=lhPlaceVisitCalendar(result.month_counts);if(calendar)target.append(calendar)}
+    if(result.limited){const warn=document.createElement('p');warn.className='lh-place-limited';warn.textContent='Partial result: this search reached its safety limit. Zoom in, narrow the date range, or filter activities for a more complete match.';target.append(warn)}
+    for(const a of result.activities)target.append(lhPlaceResultRow(a));
+    if(result.matched_activities>result.activities.length){const more=document.createElement('p');more.className='lh-place-limited';more.textContent='Showing the first '+result.activities.length+' matches. Narrow your filters to explore more.';target.append(more)}
+  }catch(e){if(e.name==='AbortError')return;$('placeHint').textContent='Unable to search this place: '+e.message}
+}
+$('placeRadius').addEventListener('change',()=>{if(lhPlacePosition)lhExplorePlace(lhPlacePosition.lat,lhPlacePosition.lon)});
+ 
+ 
+let lhPlaceTap=null;
+interactive.addEventListener('pointerdown',e=>{lhPlaceTap=e.button===0?{x:e.clientX,y:e.clientY,id:e.pointerId}:null},true);
+interactive.addEventListener('pointerup',e=>{
+  const origin=lhPlaceTap;lhPlaceTap=null;
+  if(!origin||origin.id!==e.pointerId||e.button!==0||Math.hypot(e.clientX-origin.x,e.clientY-origin.y)>8)return;
+  const rect=interactive.getBoundingClientRect(),v=viewport(),coord=geo(v.left+e.clientX-rect.left,v.top+e.clientY-rect.top);
+  if(Number.isFinite(coord[0])&&Number.isFinite(coord[1]))lhExplorePlace(coord[0],((coord[1]+180)%360+360)%360-180);
+});
+interactive.addEventListener('pointercancel',()=>lhPlaceTap=null);
+interactive.addEventListener('keydown',e=>{if(e.target!==interactive)return;
+  if(e.key==='Enter'||e.key===' '){e.preventDefault();lhExplorePlace(state.lat,state.lon)}
+});
+window.addEventListener('resize',lhPlaceMarker);
+ 
+
+const lhCommands=[
+ {label:'Explore heatmap',keywords:'map explore routes',run:()=>{$('lhNavMap').click()}},
+ {label:'Explore activity history',keywords:'time year history lens',run:()=>{lhTimeCollapsed&&$('timeLensCollapse').click();$('timeLensYear').focus()}},
+ {label:'Inspect a place',keywords:'place visits location tracks',run:()=>{interactive.focus();lhExplorePlace(state.lat,state.lon)}},
+ {label:'Activities',keywords:'library routes list',run:()=>{$('lhNavActivities').click()}},
+ {label:'Activity insights',keywords:'statistics charts analysis',run:()=>{$('lhNavAnalytics').click()}},
+ {label:'Global data source priorities',keywords:'garmin strava field merge sources',run:()=>{$('headerSources').click()}},
+ {label:'Import GPS files',keywords:'fit gpx tcx kml upload',run:()=>{$('import').click()}},
+ {label:'Settings',keywords:'appearance units garmin sync',run:()=>{$('openSettings').click()}},
+];
+const lhCommandDialog=$('lhCommandDialog');
+function lhRenderCommands(){const q=$('lhCommandSearch').value.toLowerCase().trim(),box=$('lhCommandResults');box.replaceChildren();
+  for(const entry of lhCommands.filter(e=>(e.label+' '+e.keywords).toLowerCase().includes(q)).slice(0,9)){
+    const b=document.createElement('button');b.type='button';b.role='option';b.textContent=entry.label;
+    b.onclick=()=>{lhCommandDialog.close();entry.run()};box.append(b)
+  }
+  if(!box.children.length){const d=document.createElement('div');d.textContent='No matching actions';box.append(d)}
+}
+function lhOpenCommands(){lhCommandDialog.showModal();$('lhCommandSearch').value='';lhRenderCommands();$('lhCommandSearch').focus()}
+document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){
+    e.preventDefault();if(lhCommandDialog.open)lhCommandDialog.close();else lhOpenCommands();return
+  }
+  if(e.key==='Escape'&&!document.querySelector('dialog[open]')&&!$('placeInspector').hidden){lhClosePlace();interactive.focus()}
+});
+$('lhCommandSearch').addEventListener('input',lhRenderCommands);
+$('lhCommandSearch').addEventListener('keydown',e=>{if(e.key==='Enter'){$('lhCommandResults').querySelector('button')?.click();e.preventDefault()}});
+$('lhCommandClose').addEventListener('click',()=>lhCommandDialog.close());
+
+let elevationTrace=[],elevationOriginSamples=[],elevationSelected=0,elevationYaw=46,elevationInitialYaw=46,elevationPitch=42,elevationZoom=1,elevationStretch=1.5,elevationColor='elevation',elevationSession=0,elevationDrag=null,elevationChart=null;
+let elevationPanX=0,elevationPanY=0,elevationViewMode='rotate',elevationPlaying=false,elevationFrame=0,elevationReplayLast=0,elevationReplayFraction=0,elevationPlaybackDistance=null,elevationReplayTelemetryAt=0;
+function elevationMeters(a,b){
+ const r=Math.PI/180,dy=(b[0]-a[0])*r,dx=(b[1]-a[1])*r;
+ const q=Math.sin(dy/2)**2+Math.cos(a[0]*r)*Math.cos(b[0]*r)*Math.sin(dx/2)**2;
+ return 12742000*Math.asin(Math.min(1,Math.sqrt(Math.max(0,q))));
+}
+function elevationBuild(samples){
+ if(!Array.isArray(samples))return [];
+ const points=[];let last=null,total=0;
+ for(let i=0;i<samples.length;i++){
+  const s=samples[i];if(!Array.isArray(s)||s.length<9||!Number.isFinite(s[1])||!Number.isFinite(s[2])||!Number.isFinite(s[8])||Math.abs(s[1])>90||Math.abs(s[2])>180)continue;
+  const point={lat:s[1],lon:s[2],alt:s[8],sampleIndex:i,dist:0,gap:false};
+  if(last){const step=elevationMeters([last.lat,last.lon],[point.lat,point.lon]);
+   if(!Number.isFinite(step)||step>1500){point.gap=true}else if(step>0.25){total+=step}}
+  point.dist=total;points.push(point);last=point;
+ }
+ if(points.length<3||total<10)return [];
+ 
+ for(let i=0;i<points.length;i++){
+  let a=i,b=i;while(a>0&&!points[a].gap&&points[i].dist-points[a].dist<20)a--;
+  while(b<points.length-1&&!points[b+1].gap&&points[b].dist-points[i].dist<20)b++;
+  const run=points[b].dist-points[a].dist;points[i].grade=run>=5?100*(points[b].alt-points[a].alt)/run:null;
+ }
+ const max=1100;const stride=Math.max(1,Math.ceil(points.length/max));
+ if(stride===1)return elevationReconcilePasses(points);
+ const reduced=[];for(let i=0;i<points.length;i++){if(i%stride===0||i===points.length-1||points[i].gap||points[i+1]?.gap)reduced.push(points[i])}
+ return elevationReconcilePasses(reduced);
+}
+ 
+ 
+ 
+ 
+ 
+function elevationReconcilePasses(points){
+ if(!points||points.length<4)return points||[];
+ 
+ 
+ 
+ const lat0=points.reduce((a,p)=>a+p.lat,0)/points.length;
+ const mLat=111320,mLon=111320*Math.max(.15,Math.cos(lat0*Math.PI/180));
+ const cell=9,grid=new Map(),key=(x,y)=>x+','+y;
+ for(let i=0;i<points.length;i++){
+  const p=points[i];p.displayAlt=p.alt;p.displayLat=p.lat;p.displayLon=p.lon;
+  p._x=p.lon*mLon;p._y=p.lat*mLat;
+  p._cx=Math.floor(p._x/cell);p._cy=Math.floor(p._y/cell);
+  const previous=points[Math.max(0,i-1)],next=points[Math.min(points.length-1,i+1)];
+  const vx=(next.lon-previous.lon)*mLon,vy=(next.lat-previous.lat)*mLat,len=Math.hypot(vx,vy);
+  p._heading=len>.5?[vx/len,vy/len]:null;
+  const k=key(p._cx,p._cy);if(!grid.has(k))grid.set(k,[]);grid.get(k).push(i);
+ }
+ 
+ 
+ 
+ for(let i=0;i<points.length;i++){
+  const p=points[i],near=[];
+  for(let dx=-2;dx<=2;dx++)for(let dy=-2;dy<=2;dy++){
+   for(const j of grid.get(key(p._cx+dx,p._cy+dy))||[]){
+    const q=points[j];if(Math.abs(p.dist-q.dist)<60||Math.abs(i-j)<12)continue;
+    if(Math.abs(p.alt-q.alt)>15)continue;
+    if(p._heading&&q._heading&&Math.abs(p._heading[0]*q._heading[0]+p._heading[1]*q._heading[1])<.84)continue;
+    const d=Math.hypot(p._x-q._x,p._y-q._y);if(d>12)continue;
+    near.push({p:q,d});
+   }
+  }
+  if(!near.length)continue;
+  const closestPeer=near.sort((a,b)=>a.d-b.d)[0].p;
+ 
+ 
+ 
+  p.displayAlt=(p.alt+closestPeer.alt)/2;
+ 
+ 
+  const closest=near.slice(0,4);
+  let sx=p._x*2,sy=p._y*2,sw=2;
+  for(const item of closest){const weight=Math.max(.15,1-item.d/14);sx+=item.p._x*weight;sy+=item.p._y*weight;sw+=weight}
+  p.displayLon=(sx/sw)/mLon;p.displayLat=(sy/sw)/mLat;
+ }
+ for(const p of points){delete p._x;delete p._y;delete p._cx;delete p._cy;delete p._heading}
+ return points;
+}
+function elevationRouteYaw(points){
+ 
+ const lat=points.reduce((sum,p)=>sum+p.lat,0)/points.length,lon=points.reduce((sum,p)=>sum+p.lon,0)/points.length;
+ const xScale=111320*Math.cos(lat*Math.PI/180);
+ let xx=0,yy=0,xy=0;
+ for(const p of points){const x=(p.lon-lon)*xScale,y=(p.lat-lat)*111320;xx+=x*x;yy+=y*y;xy+=x*y}
+ const angle=Math.atan2(2*xy,xx-yy)/2;
+ return 12-angle*180/Math.PI;
+}
+function elevationGradeColor(grade){
+ if(grade===null||!Number.isFinite(grade))return '#B9C1BB';
+ if(grade<=-3)return '#628EA7';if(grade<-.75)return '#8DAAB6';if(grade<=1)return '#F3DB92';if(grade<5)return '#DCA04B';return '#B85C42';
+}
+ 
+function elevationAltitudeColor(value,min,max){
+ const t=Math.max(0,Math.min(1,(value-min)/Math.max(.001,max-min)));
+ const stops=[[59,153,194],[104,193,181],[244,211,94],[233,149,67]];
+ const k=Math.min(2,Math.floor(t*3)),f=t*3-k;
+ return 'rgb('+stops[k].map((a,i)=>Math.round(a+(stops[k+1][i]-a)*f)).join(',')+')';
+}
+function elevationLegendUpdate(){
+ const legend=$('elevationLegend');
+ legend.setAttribute('aria-label',elevationColor==='grade'?'Color by recorded route grade':'Color by measured elevation');
+ const items=elevationColor==='grade'?
+  [['#628EA7','Descending'],['#F3DB92','Nearly level'],['#DCA04B','Climbing'],['#B85C42','Steep climbing']]:
+  [['#3B99C2','Lower elevation'],['#68C1B5','Mid elevation'],['#F4D35E','Higher elevation'],['#E99543','Highest elevation']];
+ legend.replaceChildren();for(const [color,label] of items){const span=document.createElement('span'),swatch=document.createElement('i');swatch.style.background=color;span.append(swatch,document.createTextNode(label));legend.append(span)}
+}
+let lhElevationMapLast=0,lhElevationGeoFollow=true,lhElevationGeoZoom=0;
+function lhElevationGeoButtons(){
+ $('elevationGeoFollow').setAttribute('aria-pressed',String(lhElevationGeoFollow));
+ $('elevationGeoOverview').setAttribute('aria-pressed',String(!lhElevationGeoFollow));
+}
+function lhElevationMapRefresh(force=false){
+ const stage=$('elevationMapReference'),section=$('elevationGeography');if(!stage||!section?.open)return;
+ if(!elevationTrace.length){stage.querySelector('.lh-mini-tiles')?.replaceChildren();stage._lhRouteProjection=null;return}
+ if(!force&&performance.now()-lhElevationMapLast<110)return;lhElevationMapLast=performance.now();
+ const current=elevationTrace[Math.max(0,Math.min(elevationTrace.length-1,elevationSelected))];
+ const length=elevationTrace.at(-1).dist||1,progress=Math.max(0,Math.min(1,(elevationPlaybackDistance??current.dist)/length));
+ $('elevationGeoPosition').textContent=distanceLabel(current.dist)+' · '+Math.round(progress*100)+'% traveled';
+ $('elevationGeoCoords').textContent=current.lat.toFixed(5)+'°, '+current.lon.toFixed(5)+'°';
+ lhDrawLocalRouteMap(stage,elevationTrace,current,{follow:lhElevationGeoFollow,zoomOffset:lhElevationGeoZoom,overviewZoomOffset:lhElevationGeoZoom,progress});
+}
+$('elevationGeography')?.addEventListener('toggle',()=>lhElevationMapRefresh(true));
+$('elevationGeoFollow').addEventListener('click',()=>{lhElevationGeoFollow=true;lhElevationGeoZoom=0;lhElevationGeoButtons();lhElevationMapRefresh(true)});
+$('elevationGeoOverview').addEventListener('click',()=>{lhElevationGeoFollow=false;lhElevationGeoZoom=0;lhElevationGeoButtons();lhElevationMapRefresh(true)});
+$('elevationGeoPlus').addEventListener('click',()=>{lhElevationGeoZoom=Math.min(5,lhElevationGeoZoom+1);lhElevationGeoButtons();lhElevationMapRefresh(true)});
+$('elevationGeoMinus').addEventListener('click',()=>{lhElevationGeoZoom=Math.max(-5,lhElevationGeoZoom-1);lhElevationGeoButtons();lhElevationMapRefresh(true)});
+ 
+$('elevationMapReference').addEventListener('wheel',event=>{
+ if(!$('elevationDialog').open||!elevationTrace.length)return;
+ event.preventDefault();event.stopPropagation();
+ const delta=event.deltaY<0?1:-1;
+ lhElevationGeoZoom=Math.max(-5,Math.min(5,lhElevationGeoZoom+delta));
+ lhElevationMapRefresh(true);
+},{passive:false});
+ 
+$('elevationMapReference').addEventListener('click',event=>{
+ const layer=event.currentTarget,view=layer._lhRouteProjection;
+ if(!view||!elevationTrace.length)return;
+ const rect=layer.getBoundingClientRect(),x=event.clientX-rect.left,y=event.clientY-rect.top;
+ if(x<0||y<0||x>rect.width||y>rect.height)return;
+ let best=Infinity,index=-1;
+ for(let i=0;i<elevationTrace.length;i++){
+  const p=elevationTrace[i];if(p.gap)continue;
+  const lon=view.centerLon+((p.lon-view.centerLon+540)%360-180);
+  const [px,py]=view.merc(p.lat,lon,view.zoom),d=(px-view.left-x)**2+(py-view.top-y)**2;
+  if(d<best){best=d;index=i}
+ }
+ if(index<0||best>24*24)return;
+ elevationStopPlayback();elevationPlaybackDistance=null;
+ elevationReplayFraction=elevationTrace[index].dist/Math.max(1,elevationTrace.at(-1).dist);
+ elevationSelection(index,true);lhElevationMapRefresh(true);
+});
+function elevationDrawing(){
+ const canvas=$('elevationCanvas'),ctx=canvas.getContext('2d');if(!ctx)return;
+ const w=Math.max(320,Math.round(canvas.clientWidth||900)),h=Math.max(260,Math.round(canvas.clientHeight||440)),dpr=Math.min(2,window.devicePixelRatio||1);
+ canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+ const points=elevationTrace;
+ lhElevationMapRefresh();
+ if(!points.length){ctx.fillStyle='#FAF0CA';ctx.font='600 15px system-ui';ctx.textAlign='center';ctx.fillText('Recorded GPS elevation is required',w/2,h/2);elevationChart=null;return}
+ const mn=Math.min(...points.map(p=>p.displayAlt??p.alt)),mx=Math.max(...points.map(p=>p.displayAlt??p.alt)),meanLat=points.reduce((s,p)=>s+p.lat,0)/points.length;
+ const meanLon=points.reduce((s,p)=>s+p.lon,0)/points.length,ym=meanLat;
+ const coords=points.map(p=>[((p.displayLon??p.lon)-meanLon)*111320*Math.cos(meanLat*Math.PI/180),((p.displayLat??p.lat)-ym)*111320]);
+ const scaleBase=Math.max(20,...coords.map(p=>Math.max(Math.abs(p[0]),Math.abs(p[1]))));
+ const ang=elevationYaw*Math.PI/180,tilt=elevationPitch*Math.PI/180;
+ const projected=points.map((p,i)=>{
+  const x=coords[i][0]/scaleBase,y=coords[i][1]/scaleBase;
+  const u=x*Math.cos(ang)-y*Math.sin(ang),depth=x*Math.sin(ang)+y*Math.cos(ang);
+  const floor=depth*Math.sin(tilt)*.73+.40;
+ 
+  const z=.085+((p.displayAlt??p.alt)-mn)/Math.max(1,mx-mn)*.29*elevationStretch;
+  return {u,depth,ground:floor,peak:floor-z*Math.cos(tilt)};
+ });
+ const xs=projected.map(p=>p.u),ys=projected.flatMap(p=>[p.ground,p.peak]);
+ const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+ const factor=Math.min((w-116)/Math.max(.1,maxX-minX),(h-128)/Math.max(.1,maxY-minY))*elevationZoom;
+ const centerX=(minX+maxX)/2,centerY=(minY+maxY)/2;
+ const X=v=>w/2+(v-centerX)*factor+elevationPanX,Y=v=>h/2+(v-centerY)*factor+elevationPanY;
+ 
+ const order=[];for(let i=1;i<points.length;i++)if(!points[i].gap)order.push(i);
+ order.sort((a,b)=>(projected[b].depth+projected[b-1].depth)-(projected[a].depth+projected[a-1].depth));
+ const colorAt=i=>elevationColor==='grade'?elevationGradeColor(points[i].grade):elevationAltitudeColor(points[i].displayAlt??points[i].alt,mn,mx);
+ 
+ for(const i of order){const a=projected[i-1],b=projected[i];
+  ctx.fillStyle=colorAt(i);ctx.globalAlpha=.30;
+  ctx.beginPath();ctx.moveTo(X(a.u),Y(a.peak));ctx.lineTo(X(b.u),Y(b.peak));ctx.lineTo(X(b.u),Y(b.ground));ctx.lineTo(X(a.u),Y(a.ground));ctx.closePath();ctx.fill();
+ }
+ ctx.globalAlpha=1;
+ 
+ const ribStep=Math.max(14,Math.round(points.length/24));ctx.strokeStyle='#B6D0D4';ctx.lineWidth=1;ctx.globalAlpha=.23;
+ for(let i=0;i<points.length;i+=ribStep){const p=projected[i];if(points[i].gap)continue;ctx.beginPath();ctx.moveTo(X(p.u),Y(p.peak));ctx.lineTo(X(p.u),Y(p.ground));ctx.stroke()}
+ ctx.globalAlpha=1;
+ 
+ ctx.lineJoin='round';ctx.lineCap='round';
+ ctx.beginPath();for(let i=0;i<projected.length;i++){const p=projected[i];if(i===0||points[i].gap)ctx.moveTo(X(p.u),Y(p.peak));else ctx.lineTo(X(p.u),Y(p.peak))}
+ ctx.lineWidth=7;ctx.strokeStyle='#08243C';ctx.globalAlpha=.92;ctx.stroke();ctx.globalAlpha=1;
+ for(let i=1;i<projected.length;i++){if(points[i].gap)continue;const a=projected[i-1],b=projected[i];ctx.beginPath();ctx.moveTo(X(a.u),Y(a.peak));ctx.lineTo(X(b.u),Y(b.peak));ctx.lineWidth=3.8;ctx.strokeStyle=colorAt(i);ctx.stroke()}
+ 
+ const idx=Math.max(0,Math.min(points.length-1,elevationSelected));
+ let selected=projected[idx];
+ if(elevationPlaybackDistance!==null && points.length>1){
+  const at=Math.max(0,Math.min(points.at(-1).dist,elevationPlaybackDistance));let low=0,high=points.length-1;
+  while(low<high){const mid=(low+high)>>1;if(points[mid].dist<at)low=mid+1;else high=mid}
+  const end=Math.max(1,low),begin=end-1,a=points[begin],b=points[end];const t=b.dist>a.dist?(at-a.dist)/(b.dist-a.dist):0;
+  const from=projected[begin],to=projected[end];selected={u:from.u+(to.u-from.u)*t,peak:from.peak+(to.peak-from.peak)*t,ground:from.ground+(to.ground-from.ground)*t};
+  ctx.beginPath();let opened=false;
+  for(let j=0;j<=begin;j++){const q=projected[j];if(j===0||points[j].gap){ctx.moveTo(X(q.u),Y(q.peak));opened=true}else ctx.lineTo(X(q.u),Y(q.peak))}
+  if(opened)ctx.lineTo(X(selected.u),Y(selected.peak));
+  ctx.strokeStyle='#FFF6DB';ctx.lineWidth=5.5;ctx.globalAlpha=.92;ctx.stroke();ctx.globalAlpha=1;
+ }
+ 
+ if(selected){const xx=X(selected.u),yy=Y(selected.peak),ground=Y(selected.ground);
+  ctx.save();ctx.strokeStyle='#FFF5D7';ctx.globalAlpha=.52;ctx.lineWidth=1.7;ctx.setLineDash([5,5]);ctx.beginPath();ctx.moveTo(xx,yy+10);ctx.lineTo(xx,ground);ctx.stroke();ctx.restore();
+  ctx.beginPath();ctx.arc(xx,yy,12,0,Math.PI*2);ctx.fillStyle='#0D3B66';ctx.fill();ctx.lineWidth=3;ctx.strokeStyle='#FFF8E1';ctx.stroke();
+  ctx.beginPath();ctx.arc(xx,yy,6,0,Math.PI*2);ctx.fillStyle='#F4D35E';ctx.fill();
+  ctx.font='700 12px system-ui';const label='SELECTED POINT',tw=ctx.measureText(label).width,pad=12,bw=tw+pad*2,bh=30;
+  const bx=Math.max(10,Math.min(w-bw-10,xx-bw/2)),by=yy>56?yy-49:yy+20;
+  ctx.fillStyle='#FAF0CA';ctx.strokeStyle='#F4D35E';ctx.lineWidth=1.4;ctx.beginPath();ctx.roundRect(bx,by,bw,bh,7);ctx.fill();ctx.stroke();
+  ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle='#0D3B66';ctx.fillText(label,bx+bw/2,by+bh/2);ctx.textBaseline='alphabetic';
+ }
+ 
+ const endpointStart={x:X(projected[0].u),y:Y(projected[0].peak)},endpointFinish={x:X(projected.at(-1).u),y:Y(projected.at(-1).peak)};
+ const labelW=68,labelH=23,clampX=x=>Math.max(8,Math.min(w-labelW-8,x)),clampY=y=>Math.max(8,Math.min(h-labelH-8,y));
+ const startBox={x:clampX(endpointStart.x-labelW-16),y:clampY(endpointStart.y-32),w:labelW,h:labelH};
+ const finishBox={x:clampX(endpointFinish.x+16),y:clampY(endpointFinish.y-32),w:labelW,h:labelH};
+ const intersect=(a,b)=>a.x<b.x+b.w+7&&a.x+a.w+7>b.x&&a.y<b.y+b.h+7&&a.y+a.h+7>b.y;
+ if(intersect(startBox,finishBox)){finishBox.y=clampY(startBox.y+(startBox.y+labelH*2+20<h?labelH+14:-(labelH+14)));if(intersect(startBox,finishBox)){startBox.y=clampY(finishBox.y-(labelH+14))}}
+ function elevationEndpointLabel(box,p,label,color){
+  const bx=box.x+box.w/2,by=box.y+box.h/2;
+  ctx.save();ctx.strokeStyle='#F4D35E';ctx.lineWidth=1.4;ctx.globalAlpha=.85;ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(bx,by);ctx.stroke();ctx.globalAlpha=1;
+  ctx.fillStyle='#0D3B66';ctx.strokeStyle='#FAF0CA';ctx.lineWidth=1;ctx.beginPath();ctx.roundRect(box.x,box.y,box.w,box.h,5);ctx.fill();ctx.stroke();
+  ctx.beginPath();ctx.arc(p.x,p.y,4,0,Math.PI*2);ctx.fillStyle=color;ctx.fill();ctx.strokeStyle='#0D3B66';ctx.lineWidth=1.5;ctx.stroke();
+  ctx.font='700 11px system-ui';ctx.fillStyle='#FAF0CA';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(label,bx,by);ctx.restore();
+ }
+ elevationEndpointLabel(startBox,endpointStart,'START','#F4D35E');elevationEndpointLabel(finishBox,endpointFinish,'FINISH','#FAF0CA');
+ elevationChart={projected,X,Y,selectedScreen:{x:X(selected.u),y:Y(selected.peak)},endpointLabels:[startBox,finishBox],endpointCoords:[endpointStart,endpointFinish]};
+}
+
+function lhSampleReading(sample,index,type){
+ const v=Array.isArray(sample)?sample[index]:null;
+ if(!Number.isFinite(v))return '—';
+ const imperial=$('units').value==='mi';
+ if(type==='speed')return (v*(imperial?2.236936:3.6)).toFixed(1)+(imperial?' mph':' km/h');
+ if(type==='cadence')return Math.round(v)+' rpm';
+ if(type==='power')return Math.round(v)+' W';
+ if(type==='heart')return Math.round(v)+' bpm';
+ if(type==='temp')return (imperial?(v*9/5+32):v).toFixed(1)+(imperial?' °F':' °C');
+ return '—';
+}
+function lhElevationLiveSensors(tracePoint){
+ const sample=tracePoint&&elevationOriginSamples[tracePoint.sampleIndex];
+ $('elevSpeedLive').textContent=lhSampleReading(sample,3,'speed');
+ $('elevCadenceLive').textContent=lhSampleReading(sample,6,'cadence');
+ $('elevPowerLive').textContent=lhSampleReading(sample,5,'power');
+ $('elevHeartLive').textContent=lhSampleReading(sample,4,'heart');
+ $('elevTempLive').textContent=lhSampleReading(sample,7,'temp');
+ const first=elevationOriginSamples.find(s=>Array.isArray(s)&&Number.isFinite(s[0]))?.[0];
+ const t=Array.isArray(sample)&&Number.isFinite(sample[0])&&Number.isFinite(first)?Math.max(0,Math.round(sample[0]-first)):null;
+ const secs=t===null?'recording unavailable':(Math.floor(t/3600)>0?Math.floor(t/3600)+':':'')+String(Math.floor(t%3600/60)).padStart(2,'0')+':'+String(t%60).padStart(2,'0');
+ $('elevationSensorTime').textContent=t===null?'Selected GPS point':secs+' recorded';
+}
+function elevationSelection(index,syncTelemetry=true){
+ if(!elevationTrace.length)return;
+ elevationSelected=Math.max(0,Math.min(elevationTrace.length-1,Math.round(index)));
+ const p=elevationTrace[elevationSelected],alts=elevationTrace.map(q=>q.alt),factor=$('units').value==='mi'?3.28084:1,unit=$('units').value==='mi'?' ft':' m';
+ $('elevationProgress').value=String(elevationSelected);
+ $('elevationPlaybackStatus').textContent=(elevationPlaying?'Playing':'Ready')+' · '+Math.round((elevationPlaybackDistance===null?p.dist:elevationPlaybackDistance)/Math.max(1,elevationTrace.at(-1).dist)*100)+'%';
+ $('elevDistance').textContent=distanceLabel(p.dist);
+ $('elevAltitude').textContent=Math.round(p.alt*factor)+unit;
+ $('elevGrade').textContent=p.grade===null?'Unavailable':p.grade.toFixed(1)+'%';
+ $('elevRange').textContent=Math.round(Math.min(...alts)*factor)+'–'+Math.round(Math.max(...alts)*factor)+unit;
+ lhElevationLiveSensors(p);
+ if(syncTelemetry&&telemetrySamples.length===elevationOriginSamples.length&&telemetrySamples[p.sampleIndex]===elevationOriginSamples[p.sampleIndex])selectTelemetrySample(p.sampleIndex);
+ elevationDrawing();
+}
+function elevationStopPlayback(){elevationPlaying=false;if(elevationFrame)cancelAnimationFrame(elevationFrame);elevationFrame=0;elevationReplayLast=0;$('elevationPlay').textContent='Play route';$('elevationPlay').setAttribute('aria-label','Play 3D route');if(elevationTrace.length)$('elevationPlaybackStatus').textContent='Paused · '+Math.round(elevationReplayFraction*100)+'%'}
+function elevationPlaybackStep(ts){if(!elevationPlaying||!$('elevationDialog').open||document.hidden||!elevationTrace.length){elevationStopPlayback();return}
+ if(!elevationReplayLast)elevationReplayLast=ts;
+ const delta=Math.min(.15,Math.max(0,(ts-elevationReplayLast)/1000));elevationReplayLast=ts;
+ 
+ elevationReplayFraction=Math.min(1,elevationReplayFraction+delta*Number($('elevationSpeed').value||1)/80);
+ elevationPlaybackDistance=elevationReplayFraction*elevationTrace.at(-1).dist;
+ let lo=0,hi=elevationTrace.length-1;while(lo<hi){const mid=(lo+hi)>>1;if(elevationTrace[mid].dist<elevationPlaybackDistance)lo=mid+1;else hi=mid}
+ elevationSelected=Math.max(0,lo);$('elevationProgress').value=String(elevationSelected);
+ const now=performance.now();if(now-elevationReplayTelemetryAt>180){elevationReplayTelemetryAt=now;elevationSelection(elevationSelected,true)}else{elevationSelection(elevationSelected,false)}
+ if(elevationReplayFraction>=1){elevationStopPlayback();$('elevationPlaybackStatus').textContent='Finished · 100%';return}
+ elevationFrame=requestAnimationFrame(elevationPlaybackStep)
+}
+function elevationPlay(){if(!elevationTrace.length)return;if(elevationPlaying){elevationStopPlayback();return}
+ if(elevationReplayFraction>=1){elevationReplayFraction=0;elevationSelected=0;elevationPlaybackDistance=0}
+ elevationPlaying=true;elevationReplayLast=performance.now();$('elevationPlay').textContent='Pause';$('elevationPlay').setAttribute('aria-label','Pause 3D route');elevationFrame=requestAnimationFrame(elevationPlaybackStep)
+}
+function elevationSetViewMode(next){elevationViewMode=next==='pan'?'pan':'rotate';$('elevationRotate').setAttribute('aria-pressed',String(elevationViewMode==='rotate'));$('elevationPan').setAttribute('aria-pressed',String(elevationViewMode==='pan'));$('elevationCanvas').classList.toggle('elev-pan-mode',elevationViewMode==='pan');$('elevationHint').textContent=elevationViewMode==='pan'?'Drag to pan · Scroll to zoom · Rotate to orbit':'Drag to rotate · Shift+drag to pan · Scroll to zoom'}
+async function elevationOpen(){
+ const ride=previewRide;if(!ride)return;
+ const dialog=$('elevationDialog'),serial=++elevationSession;
+ elevationStopPlayback();elevationTrace=[];elevationOriginSamples=[];elevationSelected=0;elevationYaw=46;elevationInitialYaw=46;elevationPitch=42;elevationZoom=1;elevationStretch=1.5;elevationPanX=0;elevationPanY=0;elevationPlaybackDistance=null;elevationReplayFraction=0;elevationReplayTelemetryAt=0;elevationSetViewMode('rotate');document.querySelectorAll('[data-elevation-preset]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.elevationPreset==='route')));$('elevationPlay').disabled=true;$('elevationPlaybackStatus').textContent='Ready · 0%';elevationColor='elevation';$('elevationColor').value='elevation';elevationLegendUpdate();
+ $('elevationPitch').value='42';$('elevationZoom').value='1';$('elevationStretch').value='1.5';$('elevationProgress').disabled=true;
+ $('elevationSubtitle').textContent=ride.name||'Recorded GPS activity';$('elevationStatus').textContent='Reading recorded GPS altitude from your local library…';
+ if(!dialog.open)dialog.showModal();requestAnimationFrame(elevationDrawing);
+ try{
+  const samples=telemetrySamples.length?telemetrySamples:(await getJson('/api/telemetry?id='+encodeURIComponent(ride.id))).samples;
+  if(serial!==elevationSession||!dialog.open||previewRide?.id!==ride.id)return;
+  elevationOriginSamples=Array.isArray(samples)?samples:[];elevationTrace=elevationBuild(elevationOriginSamples);elevationYaw=elevationInitialYaw=elevationTrace.length?elevationRouteYaw(elevationTrace):46;
+  if(!elevationTrace.length){$('elevationStatus').textContent='This activity does not have enough usable per-point elevation recordings. Import the original FIT, GPX or TCX with elevation to enable this view; no altitude is fabricated.';elevationDrawing();return}
+  $('elevationProgress').max=String(elevationTrace.length-1);$('elevationProgress').disabled=false;$('elevationPlay').disabled=false;
+  const near=telemetrySelection>=0?elevationTrace.findIndex(p=>p.sampleIndex>=telemetrySelection):-1;
+  elevationSelection(near>=0?near:0);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{if(serial===elevationSession&&dialog.open)lhElevationMapRefresh(true)}));
+  setTimeout(()=>{if(serial===elevationSession&&dialog.open)lhElevationMapRefresh(true)},350);
+  $('elevationStatus').textContent=elevationTrace.length.toLocaleString()+' route points · Playback condenses the route to about 80 seconds at 1×, not the rider’s actual speed. Drag to rotate or switch to Pan.';
+ }catch(error){if(serial===elevationSession&&dialog.open){$('elevationStatus').textContent='Elevation data could not be loaded: '+error.message;elevationDrawing()}}
+}
+function elevationClose(){elevationStopPlayback();elevationSession++;elevationTrace=[];elevationOriginSamples=[];elevationDrag=null;elevationChart=null;if($('elevationDialog').open)$('elevationDialog').close()}
+$('openElevation').addEventListener('click',elevationOpen);
+$('elevationClose').addEventListener('click',elevationClose);
+$('elevationDialog').addEventListener('close',()=>{elevationStopPlayback();elevationSession++;elevationTrace=[];elevationOriginSamples=[];elevationDrag=null;elevationChart=null});
+$('elevationReset').addEventListener('click',()=>{elevationYaw=elevationInitialYaw;elevationPitch=42;elevationZoom=1;elevationStretch=1.5;elevationPanX=0;elevationPanY=0;$('elevationPitch').value='42';$('elevationZoom').value='1';$('elevationStretch').value='1.5';elevationDrawing()});
+for(const [id,set] of [['elevationPitch',v=>elevationPitch=v],['elevationZoom',v=>elevationZoom=v],['elevationStretch',v=>elevationStretch=v]]){$(id).addEventListener('input',()=>{set(Number($(id).value));elevationDrawing()})}
+$('elevationProgress').addEventListener('input',()=>{lhElevationMapLast=0;elevationStopPlayback();elevationPlaybackDistance=null;elevationSelected=Number($('elevationProgress').value);elevationReplayFraction=elevationTrace.length>1?elevationTrace[elevationSelected].dist/Math.max(1,elevationTrace.at(-1).dist):0;elevationSelection(elevationSelected)});
+$('elevationPlay').addEventListener('click',elevationPlay);$('elevationRotate').addEventListener('click',()=>elevationSetViewMode('rotate'));$('elevationPan').addEventListener('click',()=>elevationSetViewMode('pan'));
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&elevationPlaying)elevationStopPlayback()});
+
+ 
+function elevationCameraPreset(view){
+ if(!elevationTrace.length)return;
+ if(view==='top'){elevationYaw=elevationInitialYaw;elevationPitch=75}
+ else if(view==='side'){elevationYaw=elevationInitialYaw;elevationPitch=18}
+ else {elevationYaw=elevationInitialYaw;elevationPitch=42}
+ elevationPanX=0;elevationPanY=0;
+ $('elevationPitch').value=String(elevationPitch);
+ document.querySelectorAll('[data-elevation-preset]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.elevationPreset===view)));
+ elevationDrawing();
+}
+document.querySelectorAll('[data-elevation-preset]').forEach(b=>b.addEventListener('click',()=>elevationCameraPreset(b.dataset.elevationPreset)));
+
+const elevationCanvas=$('elevationCanvas');
+elevationCanvas.addEventListener('pointerdown',e=>{if(e.button!==0&&e.button!==2)return;if(!elevationTrace.length)return;e.preventDefault();elevationDrag={id:e.pointerId,x:e.clientX,y:e.clientY,yaw:elevationYaw,pitch:elevationPitch,panX:elevationPanX,panY:elevationPanY,mode:(e.shiftKey||e.button===2||elevationViewMode==='pan')?'pan':'rotate'};elevationCanvas.setPointerCapture(e.pointerId)});
+elevationCanvas.addEventListener('contextmenu',e=>e.preventDefault());
+elevationCanvas.addEventListener('pointermove',e=>{if(!elevationDrag||elevationDrag.id!==e.pointerId)return;const dx=e.clientX-elevationDrag.x,dy=e.clientY-elevationDrag.y;if(elevationDrag.mode==='pan'){elevationPanX=Math.max(-elevationCanvas.clientWidth*.7,Math.min(elevationCanvas.clientWidth*.7,elevationDrag.panX+dx));elevationPanY=Math.max(-elevationCanvas.clientHeight*.7,Math.min(elevationCanvas.clientHeight*.7,elevationDrag.panY+dy))}else{elevationYaw=(elevationDrag.yaw+dx*.34+3600)%360;elevationPitch=Math.max(15,Math.min(75,elevationDrag.pitch+dy*.13));$('elevationPitch').value=String(elevationPitch)}elevationDrawing()});
+for(const name of ['pointerup','pointercancel','lostpointercapture'])elevationCanvas.addEventListener(name,()=>{elevationDrag=null});
+elevationCanvas.addEventListener('wheel',e=>{if(!elevationTrace.length)return;e.preventDefault();elevationZoom=Math.max(.7,Math.min(3,elevationZoom+(e.deltaY<0?.15:-.15)));$('elevationZoom').value=String(elevationZoom);elevationDrawing()},{passive:false});
+elevationCanvas.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','+','-',' '].includes(e.key)){e.preventDefault();if(e.key===' ')return elevationPlay();if(e.key==='Home')$('elevationReset').click();if(e.shiftKey||elevationViewMode==='pan'){if(e.key==='ArrowLeft')elevationPanX-=18;if(e.key==='ArrowRight')elevationPanX+=18;if(e.key==='ArrowUp')elevationPanY-=18;if(e.key==='ArrowDown')elevationPanY+=18}else{if(e.key==='ArrowLeft')elevationYaw-=8;if(e.key==='ArrowRight')elevationYaw+=8;if(e.key==='ArrowUp')elevationPitch=Math.min(75,elevationPitch+5);if(e.key==='ArrowDown')elevationPitch=Math.max(15,elevationPitch-5)}if(e.key==='+')elevationZoom=Math.min(3,elevationZoom+.1);if(e.key==='-')elevationZoom=Math.max(.7,elevationZoom-.1);$('elevationPitch').value=String(elevationPitch);$('elevationZoom').value=String(elevationZoom);elevationDrawing()}});
+$('elevationColor').addEventListener('change',()=>{elevationColor=$('elevationColor').value==='grade'?'grade':'elevation';elevationLegendUpdate();elevationDrawing()});
+$('elevationExport').addEventListener('click',()=>{if(!elevationTrace.length)return;$('elevationCanvas').toBlob(blob=>{if(!blob)return;const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='LibreHeatmaps-3D-elevation.png';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1200)},'image/png')});
+ 
+ 
+const lhSpatialMotionQuery=window.matchMedia('(prefers-reduced-motion: reduce)');
+const lhSpatialRail=document.querySelector('.terrain-rail');
+if(lhSpatialRail){
+ const targetSelector='.lh-nav-entry>button,.lh-nav-utilities>button';
+ lhSpatialRail.addEventListener('pointermove',event=>{
+  if(lhSpatialMotionQuery.matches||event.pointerType==='touch')return;
+  const button=event.target.closest(targetSelector);
+  if(!button||!lhSpatialRail.contains(button))return;
+  const rect=button.getBoundingClientRect();
+  const x=Math.max(-1,Math.min(1,(event.clientX-(rect.left+rect.width/2))/(rect.width/2)));
+  const y=Math.max(-1,Math.min(1,(event.clientY-(rect.top+rect.height/2))/(rect.height/2)));
+  button.style.setProperty('--lh-tilt-y',(x*6).toFixed(2)+'deg');
+  button.style.setProperty('--lh-tilt-x',(-y*4).toFixed(2)+'deg');
+ });
+ lhSpatialRail.addEventListener('pointerout',event=>{
+  const button=event.target.closest(targetSelector);
+  if(button&&!button.contains(event.relatedTarget)){
+   button.style.removeProperty('--lh-tilt-y');button.style.removeProperty('--lh-tilt-x');
+  }
+ });
+}
+window.addEventListener('resize',()=>{if($('elevationDialog').open)elevationDrawing()});
+if(typeof ResizeObserver!=='undefined'){const geoResize=new ResizeObserver(()=>{if($('elevationDialog').open&&elevationTrace.length)lhElevationMapRefresh(true)});geoResize.observe($('elevationMapReference'))}
+
+
+ 
+ 
+const lhJourneyCanvas=$('lhJourneyCanvas');
+const lhJourneyContext=lhJourneyCanvas.getContext('2d',{alpha:false});
+const lhJourney={active:false,yaw:-37,pitch:42,zoom:1,panX:0,panY:0,height:1.3,supportOpacity:.25,selected:-1,screenSegments:[],pointer:null,dragged:false,top:false,detailed:false};
+const lhJourneyClamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+ 
+function lhJourneyColor(t){
+ const stops=(PALETTES[$('palette').value]||PALETTES.classic).colors;
+ const x=lhJourneyClamp(t,0,1)*(stops.length-1),i=Math.min(stops.length-2,Math.floor(x)),f=x-i;
+ const rgb=s=>[1,3,5].map(k=>parseInt(s.slice(k,k+2),16));
+ const a=rgb(stops[i]),b=rgb(stops[i+1]);
+ return `rgb(${a.map((v,k)=>Math.round(v+(b[k]-v)*f)).join(',')})`;
+}
+function lhJourneyCompassUpdate(){
+ const yaw=((lhJourney.yaw%360)+360)%360;
+ const heading=((360-yaw)%360);
+ const dirs=['N','NE','E','SE','S','SW','W','NW'];
+ const direction=dirs[Math.round(heading/45)%8];
+ $('lhJourneyCompassDial').style.transform=`rotate(${lhJourney.yaw}deg)`;
+ $('lhJourneyBearing').textContent=`${String(Math.round(heading)).padStart(3,'0')}° ${direction}`;
+ $('lhJourneyCompass').setAttribute('aria-label',`Compass rose. View heading ${Math.round(heading)} degrees ${direction}. Click to align north up.`);
+}
+function lhJourneySelectionInfo(segment){
+ if(!segment){$('lhJourneyInspectCount').textContent='Select a route segment';$('lhJourneyInspectMessage').textContent='Height and color both represent recorded visits. Click a raised route to inspect its passage count.';return;}
+ $('lhJourneyInspectCount').textContent=`${Math.round(segment.visits).toLocaleString()} recorded passages`;
+ $('lhJourneyInspectMessage').textContent='A local travel-frequency count for this route segment, not altitude or elevation gain.';
+}
+function lhJourneySetButtons(){
+ $('lhJourneyTop').setAttribute('aria-pressed',String(lhJourney.top));
+ $('lhJourneyOrbit').setAttribute('aria-pressed',String(!lhJourney.top));
+}
+function lhJourneyResetView(){
+ Object.assign(lhJourney,{yaw:-37,pitch:42,zoom:1,panX:0,panY:0,height:1.3,supportOpacity:.25,selected:-1,top:false});
+ $('lhJourneyHeight').value='1.3';$('lhJourneySupport').value='0.25';$('lhJourneySupportValue').textContent='25%';lhJourneySetButtons();lhJourneyDraw();
+}
+function lhJourneyOpen(){
+ lhJourney.active=true;$('lhJourneySpace').hidden=false;
+ lhJourneyResetView();
+ 
+ if(state.known&&(!state.data?.segments?.length))scheduleData(0);
+ requestAnimationFrame(()=>requestAnimationFrame(lhJourneyDraw));
+}
+function lhJourneyClose(){
+ lhJourney.active=false;$('lhJourneySpace').hidden=true;
+ $('lhJourneyEnter').focus({preventScroll:true});
+}
+function lhJourneyScene(w,h){
+ const dataset=state.data||{},segments=Array.isArray(dataset.segments)?dataset.segments:[],step=Number(dataset.step)||1;
+ const v=viewport(),extent=Math.max(100,v.w,v.h),cx=v.left+v.w/2,cy=v.top+v.h/2;
+ const extracted=[];const cap=3400,stride=Math.max(1,Math.ceil(segments.length/cap));
+ for(let i=0;i<segments.length;i+=stride){
+  const segment=segments[i];if(!segment||segment.length<5)continue;
+  const [a,b,c,d,n0,n1=n0]=segment;
+  if(![a,b,c,d,n0,n1].every(Number.isFinite))continue;
+  const mx=(a+c)*step/2,my=(b+d)*step/2;
+  if(mx<v.left-v.w*.23||mx>v.left+v.w*1.23||my<v.top-v.h*.23||my>v.top+v.h*1.23)continue;
+  const visits=Math.max(0,(n0+n1)*.5),peak=Math.max(1,dataset.peak||1);
+  const z=lhJourneyClamp(Math.log1p(visits)/Math.log1p(peak),0,1);
+  extracted.push({index:i,ax:(a*step-cx)/extent*2.2,ay:(b*step-cy)/extent*2.2,bx:(c*step-cx)/extent*2.2,by:(d*step-cy)/extent*2.2,z,visits});
+ }
+ const ang=lhJourney.yaw*Math.PI/180,rad=lhJourney.pitch*Math.PI/180;
+ const cos=Math.cos(ang),sin=Math.sin(ang),depth=lhJourney.top?1:Math.sin(rad),heightFactor=lhJourney.top?0:lhJourney.height;
+ const scale=Math.min(w*.38,h*.55)*lhJourney.zoom;
+ function point(x,y,z=0){
+  const side=x*cos-y*sin,back=x*sin+y*cos;
+  return {x:w/2+side*scale+lhJourney.panX,y:h*.58+back*scale*depth-z*scale*.38*heightFactor+lhJourney.panY,depth:back};
+ }
+ return {segments:extracted,point,scale};
+}
+function lhJourneyDraw(){
+ if(!lhJourney.active)return;
+ const canvas=lhJourneyCanvas,c=lhJourneyContext;if(!c)return;lhJourneyCompassUpdate();
+ const w=Math.max(300,Math.round(canvas.clientWidth||650)),h=Math.max(250,Math.round(canvas.clientHeight||440)),dpr=Math.min(2,window.devicePixelRatio||1);
+ if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr)}
+ c.setTransform(dpr,0,0,dpr,0,0);
+ const sky=c.createLinearGradient(0,0,0,h);sky.addColorStop(0,'#0B2F4E');sky.addColorStop(1,'#091E34');c.fillStyle=sky;c.fillRect(0,0,w,h);
+ const scene=lhJourneyScene(w,h);const {segments,point}=scene;
+ $('lhJourneyEmpty').hidden=segments.length>0;
+ const dataset=state.data||{},peak=Math.max(0,Number(dataset.peak)||0);
+ const chosenPalette=PALETTES[$('palette').value]||PALETTES.classic;
+ $('lhJourneySpace').style.setProperty('--lh-journey-palette',chosenPalette.name);
+ document.querySelector('#lhJourneySpace .lh-journey-gradient').style.background=`linear-gradient(90deg,${chosenPalette.colors.join(',')})`;
+ $('lhJourneyPaletteName').textContent=`Heatmap palette · ${$('legendPalette').selectedOptions[0]?.textContent||'Classic glow'}`;
+ const msg=segments.length?`${segments.length.toLocaleString()} displayed route segments · peak ${Math.round(peak).toLocaleString()} recorded passages · filtered local view`:'No recorded routes in the current geographic view';
+ $('lhJourneySummary').textContent=msg+(lhJourney.detailed?' · detailed supports':' · clean route view');
+ 
+ c.save();c.lineWidth=1;c.strokeStyle='#61849A';c.globalAlpha=.19;
+ for(let j=-4;j<=4;j++){
+  let p=point(j*.29,-1.3),q=point(j*.29,1.3);
+  c.beginPath();c.moveTo(p.x,p.y);c.lineTo(q.x,q.y);c.stroke();
+  p=point(-1.3,j*.29);q=point(1.3,j*.29);
+  c.beginPath();c.moveTo(p.x,p.y);c.lineTo(q.x,q.y);c.stroke();
+ }
+ c.restore();
+ const ordered=segments.map(s=>({s,depth:(point(s.ax,s.ay).depth+point(s.bx,s.by).depth)/2})).sort((a,b)=>b.depth-a.depth);
+ const visible=[],colorLines=[];
+ for(const {s} of ordered){
+  const a=point(s.ax,s.ay,s.z),b=point(s.bx,s.by,s.z);
+  const g1=point(s.ax,s.ay,0),g2=point(s.bx,s.by,0);
+  if((a.x<-100&&b.x<-100)||(a.x>w+100&&b.x>w+100)||(a.y<-120&&b.y<-120)||(a.y>h+120&&b.y>h+120))continue;
+  const hot=lhJourney.selected===s.index;
+  const hue=lhJourneyColor(s.z);
+ 
+ 
+ 
+  if(!lhJourney.top&&lhJourney.supportOpacity>0&&(lhJourney.detailed||lhJourney.supportOpacity>=.55||(s.z>=.34&&s.index%7===0))){
+   c.beginPath();c.moveTo(g1.x,g1.y);c.lineTo(g2.x,g2.y);c.lineTo(b.x,b.y);c.lineTo(a.x,a.y);c.closePath();
+   c.fillStyle=hue;c.globalAlpha=lhJourney.supportOpacity;c.fill();c.globalAlpha=1;
+  }
+  c.lineCap=lhJourney.detailed?'round':'butt';c.lineJoin='round';c.beginPath();c.moveTo(a.x,a.y);c.lineTo(b.x,b.y);
+  c.strokeStyle='#061E32';c.lineWidth=hot?8:(lhJourney.detailed?5.8:6.2);c.stroke();
+  colorLines.push({a,b,hot,hue});
+  if(hot){c.beginPath();c.arc((a.x+b.x)/2,(a.y+b.y)/2,7,0,Math.PI*2);c.fillStyle='#F4D35E';c.fill();c.lineWidth=2;c.strokeStyle='#FFFDF7';c.stroke()}
+  visible.push({index:s.index,visits:s.visits,x:(a.x+b.x)/2,y:(a.y+b.y)/2,ax:a.x,ay:a.y,bx:b.x,by:b.y});
+ }
+ 
+ 
+ for(const line of colorLines){
+  c.lineCap='round';c.beginPath();c.moveTo(line.a.x,line.a.y);c.lineTo(line.b.x,line.b.y);
+  c.strokeStyle=line.hot?'#FFFFFF':line.hue;c.lineWidth=line.hot?4.8:(lhJourney.detailed?2.8:3.8);c.stroke();
+ }
+ lhJourney.screenSegments=visible;lhJourneySelectionInfo(visible.find(s=>s.index===lhJourney.selected));
+ if(lhJourney.selected>=0){const pick=visible.find(s=>s.index===lhJourney.selected);
+  if(pick){const label=`${Math.round(pick.visits)} recorded passages`,tw=c.measureText(label).width;
+   const lx=lhJourneyClamp(pick.x+14,10,w-185),ly=lhJourneyClamp(pick.y-28,32,h-20);
+   c.fillStyle='#FAF0CA';c.beginPath();c.roundRect(lx,ly-21,Math.max(150,tw+24),32,7);c.fill();
+   c.fillStyle='#0D3B66';c.font='700 12px system-ui';c.fillText(label,lx+10,ly);}
+ }
+}
+window.lhJourneySpaceRefresh=()=>{if(lhJourney.active)requestAnimationFrame(lhJourneyDraw)};
+$('lhJourneyEnter').addEventListener('click',lhJourneyOpen);
+$('lhJourneyExit').addEventListener('click',lhJourneyClose);
+$('lhJourneyReset').addEventListener('click',lhJourneyResetView);
+$('lhJourneyCompass').addEventListener('click',()=>{lhJourney.yaw=0;lhJourneyDraw();lhJourneyCanvas.focus({preventScroll:true})});
+$('lhJourneyTop').addEventListener('click',()=>{lhJourney.top=true;lhJourney.pitch=0;lhJourneySetButtons();lhJourneyDraw()});
+$('lhJourneyOrbit').addEventListener('click',()=>{lhJourney.top=false;lhJourney.pitch=42;lhJourneySetButtons();lhJourneyDraw()});
+$('lhJourneyLeft').addEventListener('click',()=>{lhJourney.yaw-=15;lhJourneyDraw()});
+$('lhJourneyRight').addEventListener('click',()=>{lhJourney.yaw+=15;lhJourneyDraw()});
+$('lhJourneyHeight').addEventListener('input',event=>{lhJourney.height=Number(event.target.value);lhJourneyDraw()});
+$('lhJourneySupport').addEventListener('input',event=>{lhJourney.supportOpacity=lhJourneyClamp(Number(event.target.value),0,1);$('lhJourneySupportValue').textContent=Math.round(lhJourney.supportOpacity*100)+'%';lhJourneyDraw()});
+$('lhJourneyDetail').addEventListener('click',()=>{lhJourney.detailed=!lhJourney.detailed;$('lhJourneyDetail').setAttribute('aria-pressed',String(lhJourney.detailed));lhJourneyDraw()});
+function lhJourneyPosition(e){const r=lhJourneyCanvas.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top}}
+lhJourneyCanvas.addEventListener('pointerdown',e=>{
+ if(e.button!==0&&e.button!==2)return;
+ lhJourney.pointer={id:e.pointerId,x:e.clientX,y:e.clientY,initialX:e.clientX,initialY:e.clientY,pan:e.shiftKey||e.button===2};
+ lhJourney.dragged=false;lhJourneyCanvas.setPointerCapture(e.pointerId);
+});
+lhJourneyCanvas.addEventListener('pointermove',e=>{
+ const p=lhJourney.pointer;if(!p||p.id!==e.pointerId)return;
+ const dx=e.clientX-p.x,dy=e.clientY-p.y;
+ if(Math.abs(e.clientX-p.initialX)+Math.abs(e.clientY-p.initialY)>6)lhJourney.dragged=true;
+ if(p.pan){lhJourney.panX+=dx;lhJourney.panY+=dy}else{lhJourney.yaw+=dx*.25;if(!lhJourney.top)lhJourney.pitch=lhJourneyClamp(lhJourney.pitch+dy*.22,12,72)}
+ p.x=e.clientX;p.y=e.clientY;lhJourneyDraw();
+});
+lhJourneyCanvas.addEventListener('pointerup',e=>{
+ const p=lhJourney.pointer;if(!p||p.id!==e.pointerId)return;
+ if(!lhJourney.dragged){const hit=lhJourneyPosition(e);let nearest=null,best=24*24;
+  for(const s of lhJourney.screenSegments){
+   const dx=s.bx-s.ax,dy=s.by-s.ay;
+   const t=lhJourneyClamp(((hit.x-s.ax)*dx+(hit.y-s.ay)*dy)/Math.max(.001,dx*dx+dy*dy),0,1);
+   const d=(s.ax+dx*t-hit.x)**2+(s.ay+dy*t-hit.y)**2;
+   if(d<best){best=d;nearest=s}
+  }
+  lhJourney.selected=nearest?.index??-1;lhJourneyDraw();
+ }
+ lhJourney.pointer=null;
+});
+lhJourneyCanvas.addEventListener('pointercancel',()=>lhJourney.pointer=null);
+lhJourneyCanvas.addEventListener('contextmenu',e=>e.preventDefault());
+lhJourneyCanvas.addEventListener('wheel',e=>{
+ if(!lhJourney.active)return;
+ e.preventDefault();lhJourney.zoom=lhJourneyClamp(lhJourney.zoom*(e.deltaY<0?1.12:.89),.4,4);lhJourneyDraw();
+},{passive:false});
+lhJourneyCanvas.addEventListener('keydown',e=>{
+ if(e.key==='Escape'){lhJourneyClose();return}
+ if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','+','=','-'].includes(e.key))return;
+ e.preventDefault();
+ if(e.key==='ArrowLeft')lhJourney.yaw-=8;
+ if(e.key==='ArrowRight')lhJourney.yaw+=8;
+ if(e.key==='ArrowUp')lhJourney.panY-=12;
+ if(e.key==='ArrowDown')lhJourney.panY+=12;
+ if(e.key==='+'||e.key==='=')lhJourney.zoom=lhJourneyClamp(lhJourney.zoom*1.12,.4,4);
+ if(e.key==='-')lhJourney.zoom=lhJourneyClamp(lhJourney.zoom*.89,.4,4);
+ lhJourneyDraw();
+});
+
+
+ 
+ 
+const lhDashboardRoot=$('statsOverview');
+const lhDashCanvas=$('lhDashCanvas');
+const lhDashStorageKey='libreheatmaps:overview-cards:v2';
+const lhDashDefaults={visible:[],order:[],favorites:[],favoritesEnabled:true,favoritesFirst:true};
+const lhDashStarter=['total.activities','total.total-distance','total.moving-time',
+ 'total.peak-recorded-speed','record.longest-ride','record.longest-activity',
+ 'record.coldest-weather','history.most-active-month','history.most-active-year','trend.year'];
+function lhDashLoad(){
+ try{const raw=JSON.parse(localStorage.getItem(lhDashStorageKey)||'null');
+  if(!raw||typeof raw!=='object')return {...lhDashDefaults};
+  const clean=a=>Array.isArray(a)?[...new Set(a.filter(v=>typeof v==='string'&&v.length<150))].slice(0,450):[];
+  return {visible:clean(raw.visible),order:clean(raw.order),favorites:clean(raw.favorites),
+   favoritesEnabled:raw.favoritesEnabled!==false,favoritesFirst:raw.favoritesFirst!==false};
+ }catch(e){return {...lhDashDefaults}}
+}
+let lhDashState=lhDashLoad();
+let lhDashStored=false;
+try{lhDashStored=!!localStorage.getItem(lhDashStorageKey)}catch(e){}
+let lhDashWidgets=new Map(),lhDashCustomizeOpen=false;
+const lhDashSlug=s=>String(s||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,92);
+function lhDashSave(){try{localStorage.setItem(lhDashStorageKey,JSON.stringify(lhDashState))}catch(e){ }}
+function lhDashItem(id,label,category,value,note='',rideId=null,chart=null){
+ if(!id||lhDashWidgets.has(id))return;
+ lhDashWidgets.set(id,{id,label,category,value,note,rideId,chart});
+}
+function lhDashboardSync(){
+ lhDashWidgets=new Map();
+ for(const group of document.querySelectorAll('#metricGrid .stats-metric-group')){
+  for(const card of group.querySelectorAll('.stats-metric-cards > .metric')){
+   const label=card.querySelector('span')?.textContent?.trim(),value=card.querySelector('strong')?.textContent?.trim();
+   if(!label)continue;
+   lhDashItem('total.'+lhDashSlug(label),label,'Activity totals',value||'Not recorded','',card.dataset.lhPreviewId||null);
+  }
+ }
+ for(const card of document.querySelectorAll('#facts .stats-record-grid .record-metric')){
+  const label=card.querySelector('span')?.textContent?.trim();if(!label)continue;
+  lhDashItem('record.'+lhDashSlug(label),label,'Personal records',card.querySelector('strong')?.textContent||'Not recorded',card.querySelector('small')?.textContent||'',card.dataset.lhPreviewId||null);
+ }
+ for(const card of document.querySelectorAll('#milestones .record-metric')){
+  const label=card.querySelector('span')?.textContent?.trim();if(!label)continue;
+  lhDashItem('history.'+lhDashSlug(label),label,'Milestones',card.querySelector('strong')?.textContent||'Not recorded',card.querySelector('small')?.textContent||'',card.dataset.lhPreviewId||null);
+ }
+ for(const [key,name] of [['year','Distance by year'],['month','Monthly activity'],['weekday','Activity by weekday']]){
+  const chart=$({year:'yearChart',month:'monthChart',weekday:'weekdayChart'}[key]);
+  if(chart)lhDashItem('trend.'+key,name,'Trends & patterns','','',null,chart);
+ }
+ for(const row of document.querySelectorAll('#sportSummary .sport-row')){
+  const label=row.querySelector('span')?.textContent?.trim(),val=row.querySelector('strong')?.textContent?.trim();
+  if(label)lhDashItem('gear.'+lhDashSlug(label),label,'Types & gear',val||'Not recorded');
+ }
+ const current=[...lhDashWidgets.keys()];
+ if(!lhDashStored){
+  lhDashState.visible=current.filter(id=>lhDashStarter.includes(id));
+ 
+  if(!lhDashState.visible.length)lhDashState.visible=current.slice(0,6);
+  lhDashStored=true;lhDashSave();
+ }
+ for(const id of current)if(!lhDashState.order.includes(id))lhDashState.order.push(id);
+ lhDashSave();lhDashRender();
+}
+function lhDashReorder(id,delta){
+ const i=lhDashState.order.indexOf(id);if(i<0)return;
+ const j=Math.max(0,Math.min(lhDashState.order.length-1,i+delta));if(j===i)return;
+ lhDashState.order.splice(i,1);lhDashState.order.splice(j,0,id);lhDashSave();lhDashRender();
+}
+function lhDashDragTo(from,to){
+ if(from===to||!lhDashWidgets.has(from)||!lhDashWidgets.has(to))return;
+ const arr=lhDashState.order.filter(x=>x!==from),ix=arr.indexOf(to);if(ix<0)return;
+ arr.splice(ix,0,from);lhDashState.order=arr;lhDashSave();lhDashRender();
+}
+function lhDashToggleVisible(id){
+ const v=new Set(lhDashState.visible);v.has(id)?v.delete(id):v.add(id);
+ lhDashState.visible=[...v];lhDashSave();lhDashRender();
+}
+function lhDashToggleFavorite(id){
+ const f=new Set(lhDashState.favorites);f.has(id)?f.delete(id):f.add(id);
+ lhDashState.favorites=[...f];lhDashSave();lhDashRender();
+}
+function lhDashButton(label,title,fn,pressed){
+ const b=document.createElement('button');b.type='button';b.textContent=label;b.title=title;b.setAttribute('aria-label',title);
+ if(pressed!==undefined)b.setAttribute('aria-pressed',String(pressed));b.onclick=fn;return b;
+}
+function lhDashMakeCard(d){
+ const card=document.createElement('article');card.className='lh-dash-card';card.dataset.lhCard=d.id;
+ if(lhDashState.favoritesEnabled&&lhDashState.favorites.includes(d.id))card.classList.add('lh-dash-card-favorite');
+ const top=document.createElement('div');top.className='lh-dash-card-top';
+ const category=document.createElement('span');category.className='lh-dash-card-category';category.textContent=d.category;
+ const star=lhDashButton(lhDashState.favorites.includes(d.id)?'★':'☆',
+  (lhDashState.favorites.includes(d.id)?'Remove ':'Add ')+d.label+(lhDashState.favorites.includes(d.id)?' from':' to')+' favorites',()=>lhDashToggleFavorite(d.id),lhDashState.favorites.includes(d.id));
+ star.className='lh-dash-card-star';star.hidden=!lhDashState.favoritesEnabled;
+ top.append(category,star);card.append(top);
+ const title=document.createElement('h5');title.textContent=d.label;
+ if(d.chart){card.classList.add('lh-dash-chart-card');card.append(title);const copy=d.chart.cloneNode(true);copy.removeAttribute('id');copy.classList.add('lh-dash-chart-content');copy.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));card.append(copy)}
+ else {const value=document.createElement('strong');value.className='lh-dash-card-value';value.textContent=d.value||'Not recorded';card.append(value,title);
+  if(d.note){const note=document.createElement('p');note.textContent=d.note;card.append(note)}
+  if(d.rideId){const link=lhDashButton('View activity','Open recorded activity for '+d.label,()=>{lhRecordPreviewHide();openRidePreview(d.rideId)});
+   link.className='lh-dash-card-link';card.append(link)}
+ }
+ 
+ card.draggable=true;
+ card.addEventListener('dragstart',e=>{e.dataTransfer?.setData('text/plain',d.id);if(e.dataTransfer)e.dataTransfer.effectAllowed='move'});
+ card.addEventListener('dragover',e=>{e.preventDefault();card.classList.add('lh-dash-drag-target')});
+ card.addEventListener('dragleave',()=>card.classList.remove('lh-dash-drag-target'));
+ card.addEventListener('drop',e=>{e.preventDefault();card.classList.remove('lh-dash-drag-target');lhDashDragTo(e.dataTransfer?.getData('text/plain'),d.id)});
+ card.addEventListener('dragend',()=>card.classList.remove('lh-dash-drag-target'));
+ card.addEventListener('pointermove',e=>{if(e.pointerType==='touch')return;const r=card.getBoundingClientRect();
+  card.style.setProperty('--lh-light-x',Math.round((e.clientX-r.left)/Math.max(1,r.width)*100)+'%');
+  card.style.setProperty('--lh-light-y',Math.round((e.clientY-r.top)/Math.max(1,r.height)*100)+'%')});
+ card.addEventListener('pointerleave',()=>{card.style.removeProperty('--lh-light-x');card.style.removeProperty('--lh-light-y')});
+ return card;
+}
+function lhDashRenderEditor(){
+ const list=$('lhDashRows');list.replaceChildren();const q=$('lhDashSearch').value.trim().toLowerCase();
+ const available=lhDashState.order.filter(id=>lhDashWidgets.has(id));let shown=0;
+ for(const id of available){const d=lhDashWidgets.get(id);
+  if(q&&!(`${d.label} ${d.category}`.toLowerCase().includes(q)))continue;shown++;
+  const row=document.createElement('div');row.className='lh-dashboard-editor-row';row.dataset.lhWidget=id;row.draggable=true;
+  const label=document.createElement('label');const checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.checked=lhDashState.visible.includes(id);
+  checkbox.setAttribute('aria-label','Show '+d.label);checkbox.onchange=()=>lhDashToggleVisible(id);
+  const name=document.createElement('span');name.textContent=d.label;const detail=document.createElement('small');detail.textContent=d.category;
+  const text=document.createElement('span');text.className='lh-dashboard-editor-label';text.append(name,detail);label.append(checkbox,text);
+  const actions=document.createElement('div');actions.className='lh-dashboard-editor-row-actions';
+  const favorite=lhDashButton(lhDashState.favorites.includes(id)?'★':'☆','Toggle favorite for '+d.label,()=>lhDashToggleFavorite(id),lhDashState.favorites.includes(id));
+  favorite.disabled=!lhDashState.favoritesEnabled;
+  const up=lhDashButton('↑','Move '+d.label+' up',()=>lhDashReorder(id,-1));
+  const down=lhDashButton('↓','Move '+d.label+' down',()=>lhDashReorder(id,1));
+  up.disabled=available.indexOf(id)===0;down.disabled=available.indexOf(id)===available.length-1;
+  actions.append(favorite,up,down);row.append(label,actions);
+  row.addEventListener('dragstart',e=>{e.dataTransfer?.setData('text/plain',id);if(e.dataTransfer)e.dataTransfer.effectAllowed='move'});
+  row.addEventListener('dragover',e=>{e.preventDefault();row.classList.add('lh-drag-target')});
+  row.addEventListener('dragleave',()=>row.classList.remove('lh-drag-target'));
+  row.addEventListener('drop',e=>{e.preventDefault();row.classList.remove('lh-drag-target');lhDashDragTo(e.dataTransfer?.getData('text/plain'),id)});
+  row.addEventListener('dragend',()=>row.classList.remove('lh-drag-target'));
+  list.append(row);
+ }
+ if(!shown){const hint=document.createElement('p');hint.className='lh-dash-editor-noresults';hint.textContent='No cards match your search.';list.append(hint)}
+}
+function lhDashRender(){
+ const present=new Set(lhDashWidgets.keys()),available=lhDashState.order.filter(id=>present.has(id));
+ const visible=available.filter(id=>lhDashState.visible.includes(id));
+ const favorites=new Set(lhDashState.favorites);
+ const sorted=lhDashState.favoritesEnabled&&lhDashState.favoritesFirst?
+  [...visible.filter(id=>favorites.has(id)),...visible.filter(id=>!favorites.has(id))]:visible;
+ lhDashCanvas.replaceChildren();for(const id of sorted)lhDashCanvas.append(lhDashMakeCard(lhDashWidgets.get(id)));
+ $('lhDashEmpty').hidden=sorted.length>0;
+ $('lhDashBoardCount').textContent=sorted.length+' selected metric'+(sorted.length===1?'':'s');
+ $('lhDashSummary').textContent=visible.length+' visible · '+available.length+' available · '+available.filter(id=>favorites.has(id)).length+' starred · saved in this browser';
+ $('lhDashFavoritesFirst').setAttribute('aria-pressed',String(lhDashState.favoritesEnabled));
+ $('lhDashFavoritesFirst').textContent='★ Favorites: '+(lhDashState.favoritesEnabled?'On':'Off');
+ $('lhDashPinPriority').checked=lhDashState.favoritesFirst;
+ if(lhDashCustomizeOpen)lhDashRenderEditor();
+}
+$('lhDashFavoritesFirst').onclick=()=>{lhDashState.favoritesEnabled=!lhDashState.favoritesEnabled;lhDashSave();lhDashRender()};
+$('lhDashPinPriority').onchange=()=>{lhDashState.favoritesFirst=$('lhDashPinPriority').checked;lhDashSave();lhDashRender()};
+$('lhDashSearch').addEventListener('input',()=>lhDashRenderEditor());
+$('lhDashCustomize').onclick=()=>{lhDashCustomizeOpen=!lhDashCustomizeOpen;$('lhDashEditor').hidden=!lhDashCustomizeOpen;
+ $('lhDashCustomize').setAttribute('aria-expanded',String(lhDashCustomizeOpen));
+ $('lhDashCustomize').textContent=lhDashCustomizeOpen?'Done editing':'Edit entire Overview';if(lhDashCustomizeOpen){lhOverviewRenderEditor();lhDashRenderEditor();}else $('insightsMain').scrollTop=0};
+$('lhDashReset').onclick=()=>{lhDashState={...lhDashDefaults,visible:[...lhDashStarter.filter(id=>lhDashWidgets.has(id))],order:[...lhDashWidgets.keys()]};
+ lhDashSave();lhDashRender()};
+const lhOverviewSectionDefs=[
+ {key:'glance',label:'At a glance',id:'lhOverviewGlanceSection'},
+ {key:'totals',label:'Your activity totals',id:'overviewSummaryHeading'},
+ {key:'records',label:'Your activity records',id:'overviewRecordsHeading'},
+ {key:'trends',label:'Trends & patterns',id:'overviewTrendsHeading'},
+ {key:'milestones',label:'Milestones & habits',id:'overviewHistoryHeading'},
+ {key:'gear',label:'Types & gear',id:'overviewMixHeading'}
+];
+const lhOverviewPrefKey='libreheatmaps:overview-layout:v1';
+const lhOverviewBase=()=>({sectionOrder:lhOverviewSectionDefs.map(d=>d.key),hiddenSections:[],hiddenCards:[],cardOrder:{},groupOrder:{}});
+function lhOverviewLoad(){
+ const defaults=lhOverviewBase();
+ try{
+  const raw=JSON.parse(localStorage.getItem(lhOverviewPrefKey)||'null');
+  if(!raw||typeof raw!=='object')return defaults;
+  const clean=a=>Array.isArray(a)?[...new Set(a.filter(v=>typeof v==='string'&&v.length<160))].slice(0,400):[];
+  const order=clean(raw.sectionOrder).filter(v=>defaults.sectionOrder.includes(v));
+  defaults.sectionOrder=[...order,...defaults.sectionOrder.filter(v=>!order.includes(v))];
+  defaults.hiddenSections=clean(raw.hiddenSections).filter(v=>defaults.sectionOrder.includes(v));
+  defaults.hiddenCards=clean(raw.hiddenCards);
+  if(raw.cardOrder&&typeof raw.cardOrder==='object'&&!Array.isArray(raw.cardOrder)){
+   for(const [key,value] of Object.entries(raw.cardOrder).slice(0,60)){
+    if(typeof key==='string'&&key.length<160)defaults.cardOrder[key]=clean(value);
+   }
+  }
+  if(raw.groupOrder&&typeof raw.groupOrder==='object'&&!Array.isArray(raw.groupOrder)){
+   for(const [key,value] of Object.entries(raw.groupOrder).slice(0,20))if(defaults.sectionOrder.includes(key))defaults.groupOrder[key]=clean(value);
+  }
+ }catch(e){}
+ return defaults;
+}
+let lhOverviewPrefs=lhOverviewLoad();
+let lhOverviewBuckets=[];
+function lhOverviewSave(){try{localStorage.setItem(lhOverviewPrefKey,JSON.stringify(lhOverviewPrefs))}catch(e){}}
+function lhOverviewNodes(section){
+ if(section==='glance')return $('lhOverviewGlanceSection');
+ const def=lhOverviewSectionDefs.find(d=>d.key===section),heading=def?$(def.id):null;
+ return heading?.closest('.stats-story-section')||null;
+}
+function lhOverviewBucket(section,key,title,parent,nodes){
+ const entries=nodes.map((node,index)=>{
+  const label=node.querySelector('.insights-card-title h4')?.textContent?.trim()||node.querySelector('h4')?.textContent?.trim()||node.querySelector('span')?.textContent?.trim()||node.textContent.trim().slice(0,80);
+  const stable=section==='gear'?label.replace(/\s*\(\d+\)\s*$/,''):label;
+  let category='';
+  if(section==='gear'&&node.classList.contains('bike-row')){let previous=node.previousElementSibling;while(previous&&previous.classList.contains('bike-row'))previous=previous.previousElementSibling;category=previous?.querySelector('span')?.textContent?.replace(/\s*\(\d+\)\s*$/,'')||''}
+  const id=section+':'+lhDashSlug(category+'-'+(stable||String(index)));
+  return {id,label,node};
+ });
+ lhOverviewBuckets.push({section,key,title,parent,entries});
+}
+function lhOverviewCollect(){
+ lhOverviewBuckets=[];
+ for(const group of document.querySelectorAll('#metricGrid .stats-metric-group')){
+  const cards=group.querySelector('.stats-metric-cards');
+  if(cards)lhOverviewBucket('totals','totals-'+[...group.classList].find(v=>v.startsWith('stats-group--')),(group.querySelector('h5')?.textContent||'Activity totals'),cards,[...cards.children].filter(n=>n.classList.contains('metric')));
+ }
+ for(const group of document.querySelectorAll('#facts .stats-record-group')){
+  const cards=group.querySelector('.stats-record-grid'),title=group.querySelector('h5')?.textContent||'Records';
+  if(cards)lhOverviewBucket('records','records-'+lhDashSlug(title),title,cards,[...cards.children].filter(n=>n.classList.contains('record-metric')));
+ }
+ const milestone=$('milestones');if(milestone)lhOverviewBucket('milestones','milestones-all','Milestone cards',milestone,[...milestone.children].filter(n=>n.classList.contains('record-metric')));
+ const trendGrid=$('yearChart')?.closest('.insights-trends-grid');
+ if(trendGrid)lhOverviewBucket('trends','trends-primary','Distance by year and monthly activity',trendGrid,[...trendGrid.children].filter(n=>n.classList.contains('insights-content-card')));
+ const weekday=$('weekdayChart')?.closest('.insights-content-card');if(weekday)lhOverviewBucket('trends','trends-weekday','Activity by weekday',weekday.parentElement,[weekday]);
+ const gear=$('sportSummary');if(gear)lhOverviewBucket('gear','gear-all','Recorded activity types and bicycles',gear,[...gear.children].filter(n=>n.classList.contains('sport-row')));
+}
+function lhOverviewApply(){
+ const root=$('statsOverview');
+ if(!root)return;
+ for(const def of lhOverviewSectionDefs){const node=lhOverviewNodes(def.key);if(node){node.classList.add('lh-overview-section');node.dataset.lhOverviewSection=def.key;node.hidden=lhOverviewPrefs.hiddenSections.includes(def.key)}}
+ for(const key of lhOverviewPrefs.sectionOrder){const node=lhOverviewNodes(key);if(node)root.append(node)}
+ for(const group of lhOverviewBuckets){
+  const current=new Map(group.entries.map(e=>[e.id,e]));
+  const saved=lhOverviewPrefs.cardOrder[group.key]||[];
+  const ordered=[...saved.filter(id=>current.has(id)),...group.entries.map(e=>e.id).filter(id=>!saved.includes(id))];
+  for(const id of ordered){const entry=current.get(id);if(entry){entry.node.hidden=lhOverviewPrefs.hiddenCards.includes(entry.id);group.parent.append(entry.node)}}
+  const empty=!group.entries.length;
+  const holder=group.parent.closest('.stats-metric-group,.stats-record-group');
+  if(holder&&!empty)holder.hidden=group.entries.every(e=>lhOverviewPrefs.hiddenCards.includes(e.id));
+ }
+ for(const section of ['totals','records','trends']){
+  const node=lhOverviewNodes(section);if(!node)continue;
+  const groups=lhOverviewBuckets.filter(g=>g.section===section);
+  const saved=lhOverviewPrefs.groupOrder[section]||[];
+  const ordered=[...saved.filter(k=>groups.some(g=>g.key===k)),...groups.map(g=>g.key).filter(k=>!saved.includes(k))];
+  if(section==='totals'||section==='records'){
+   const host=node.querySelector(section==='totals'?'#metricGrid':'#facts');
+   if(host)for(const key of ordered){const group=groups.find(g=>g.key===key);const wrap=group?.parent.closest('.stats-metric-group,.stats-record-group');if(wrap&&wrap.parentNode===host)host.append(wrap)}
+  }else{
+   const primary=node.querySelector('.insights-trends-grid'),weekday=node.querySelector('.insights-weekday');
+   if(primary&&weekday){if(ordered.indexOf('trends-weekday')<ordered.indexOf('trends-primary'))primary.before(weekday);else primary.after(weekday)}
+  }
+ }
+ const trendGrid=$('yearChart')?.closest('.insights-trends-grid');
+ if(trendGrid)trendGrid.hidden=[...trendGrid.children].every(n=>n.hidden);
+ for(const def of lhOverviewSectionDefs){
+  const node=lhOverviewNodes(def.key);if(!node)continue;
+  const head=def.key==='glance'?node.querySelector('.lh-dashboard-board-head'):node.querySelector('.stats-story-heading');
+  if(!head)continue;
+  let edit=head.querySelector('.lh-overview-edit-entry');
+  if(!edit){edit=document.createElement('button');edit.type='button';edit.className='lh-overview-edit-entry';edit.textContent='Edit cards';edit.setAttribute('aria-label','Edit cards in '+def.label);head.append(edit)}
+  edit.onclick=()=>lhOverviewOpenSection(def.key);
+ }
+
+ const items=[['glance','At a glance','lhOverviewGlanceSection'],['totals','Your activity totals','overviewSummaryHeading'],['records','Personal records','overviewRecordsHeading'],['trends','Trends & patterns','overviewTrendsHeading'],['milestones','Milestones & habits','overviewHistoryHeading'],['gear','Types & gear','overviewMixHeading']];
+ if(typeof lhContextSets!=='undefined'){
+  lhContextSets.overview.items=lhOverviewPrefs.sectionOrder.filter(k=>!lhOverviewPrefs.hiddenSections.includes(k)).map(k=>{const x=items.find(v=>v[0]===k);return [x[1],x[2]]});
+  if(typeof lhCurrentContext!=='undefined'&&lhCurrentContext==='overview'&&typeof lhContextBuild==='function')lhContextBuild('overview');
+ }
+}
+function lhOverviewSync(){lhOverviewCollect();lhOverviewApply();if(lhDashCustomizeOpen)lhOverviewRenderEditor()}
+function lhOverviewMoveSection(key,direction){
+ const list=lhOverviewPrefs.sectionOrder,index=list.indexOf(key),next=index+direction;
+ if(index<0||next<0||next>=list.length)return;
+ [list[index],list[next]]=[list[next],list[index]];lhOverviewSave();lhOverviewApply();lhOverviewRenderEditor();
+}
+function lhOverviewMoveCard(group,id,direction){
+ const list=[...(lhOverviewPrefs.cardOrder[group.key]||[]).filter(v=>group.entries.some(e=>e.id===v)),...group.entries.map(e=>e.id).filter(v=>!(lhOverviewPrefs.cardOrder[group.key]||[]).includes(v))];
+ const index=list.indexOf(id),next=index+direction;
+ if(index<0||next<0||next>=list.length)return;
+ [list[index],list[next]]=[list[next],list[index]];lhOverviewPrefs.cardOrder[group.key]=list;lhOverviewSave();lhOverviewSync();
+}
+function lhOverviewMoveGroup(section,key,direction){
+ const groups=lhOverviewBuckets.filter(g=>g.section===section).map(g=>g.key);
+ const saved=lhOverviewPrefs.groupOrder[section]||[];
+ const list=[...saved.filter(k=>groups.includes(k)),...groups.filter(k=>!saved.includes(k))];
+ const i=list.indexOf(key),j=i+direction;
+ if(i<0||j<0||j>=list.length)return;
+ [list[i],list[j]]=[list[j],list[i]];lhOverviewPrefs.groupOrder[section]=list;
+ lhOverviewSave();lhOverviewSync();
+}
+function lhOverviewOpenSection(key){
+ lhOverviewSelected=key;
+ if(!lhDashCustomizeOpen)$('lhDashCustomize').click();
+ lhOverviewRenderEditor();
+ const editor=$('lhDashEditor'),scroll=$('insightsMain');
+ if(editor&&scroll){const a=editor.getBoundingClientRect(),b=scroll.getBoundingClientRect();scroll.scrollTo({top:scroll.scrollTop+a.top-b.top-14,behavior:'instant'})}
+}
+function lhOverviewToggle(section,id,checked){
+ const field=section?'hiddenSections':'hiddenCards',list=new Set(lhOverviewPrefs[field]);
+ if(checked)list.delete(id);else list.add(id);
+ lhOverviewPrefs[field]=[...list];lhOverviewSave();lhOverviewApply();lhOverviewRenderEditor();
+}
+function lhOverviewMakeAction(label,description,fn,disabled){
+ const b=document.createElement('button');b.type='button';b.textContent=label;b.setAttribute('aria-label',description);b.title=description;b.disabled=!!disabled;b.onclick=fn;return b;
+}
+let lhOverviewSelected='totals';
+function lhOverviewRenderEditor(){
+ const sectionList=$('lhOverviewSectionsEditor'),cardsList=$('lhOverviewCardsList');
+ if(!sectionList||!cardsList)return;
+ if(!lhOverviewSectionDefs.some(d=>d.key===lhOverviewSelected))lhOverviewSelected='totals';
+ const lastScroll=cardsList.scrollTop;
+ sectionList.replaceChildren();cardsList.replaceChildren();
+ const intro=document.createElement('p');intro.className='lh-overview-sidebar-caption';intro.textContent='SECTION ORDER · SHOW / HIDE';sectionList.append(intro);
+ for(const [index,key] of lhOverviewPrefs.sectionOrder.entries()){
+  const def=lhOverviewSectionDefs.find(d=>d.key===key),groups=lhOverviewBuckets.filter(g=>g.section===key);
+  const total=key==='glance'?lhDashWidgets.size:groups.reduce((n,g)=>n+g.entries.length,0);
+  const visible=key==='glance'?lhDashState.visible.filter(id=>lhDashWidgets.has(id)).length:groups.reduce((n,g)=>n+g.entries.filter(e=>!lhOverviewPrefs.hiddenCards.includes(e.id)).length,0);
+  const row=document.createElement('div');row.className='lh-overview-studio-section';row.dataset.section=key;
+  row.classList.toggle('lh-overview-studio-selected',key===lhOverviewSelected);
+  const top=document.createElement('div');top.className='lh-overview-studio-section-top';
+  const select=document.createElement('button');select.type='button';select.className='lh-overview-studio-select';
+  const name=document.createElement('strong');name.textContent=def.label;const count=document.createElement('small');count.textContent=visible+' / '+total+' cards selected';select.append(name,count);
+  select.onclick=()=>{lhOverviewSelected=key;lhOverviewRenderEditor()};
+  const cb=document.createElement('input');cb.type='checkbox';cb.checked=!lhOverviewPrefs.hiddenSections.includes(key);cb.setAttribute('aria-label','Show '+def.label+' section');cb.onchange=()=>lhOverviewToggle(true,key,cb.checked);
+  top.append(select,cb);
+  const actions=document.createElement('div');actions.className='lh-overview-studio-section-actions';
+  const up=lhOverviewMakeAction('↑','Move '+def.label+' section up',()=>lhOverviewMoveSection(key,-1),index===0);
+  const down=lhOverviewMakeAction('↓','Move '+def.label+' section down',()=>lhOverviewMoveSection(key,1),index===lhOverviewPrefs.sectionOrder.length-1);
+  const edit=lhOverviewMakeAction('Edit cards','Choose cards in '+def.label,()=>{lhOverviewSelected=key;lhOverviewRenderEditor()});
+  actions.append(edit,up,down);row.append(top,actions);sectionList.append(row);
+  row.draggable=true;
+  row.addEventListener('dragstart',e=>{e.dataTransfer?.setData('text/plain',key);if(e.dataTransfer)e.dataTransfer.effectAllowed='move'});
+  row.addEventListener('dragover',e=>e.preventDefault());
+  row.addEventListener('drop',e=>{e.preventDefault();const from=e.dataTransfer?.getData('text/plain');if(!lhOverviewPrefs.sectionOrder.includes(from)||from===key)return;
+   const arr=lhOverviewPrefs.sectionOrder.filter(k=>k!==from),i=arr.indexOf(key);arr.splice(i,0,from);lhOverviewPrefs.sectionOrder=arr;lhOverviewSave();lhOverviewApply();lhOverviewRenderEditor()});
+ }
+ const selected=lhOverviewSectionDefs.find(d=>d.key===lhOverviewSelected);
+ const quick=$('lhOverviewQuickSelect');quick.replaceChildren();
+ for(const def of lhOverviewSectionDefs){const option=document.createElement('option');option.value=def.key;option.textContent=def.label;quick.append(option)}
+ quick.value=lhOverviewSelected;quick.onchange=()=>{lhOverviewSelected=quick.value;lhOverviewRenderEditor()};
+ $('lhOverviewPickerTitle').textContent=selected.label;
+ const isGlance=selected.key==='glance';$('lhDashGlancePicker').hidden=!isGlance;cardsList.hidden=isGlance;
+ if(isGlance){$('lhOverviewPickerDesc').textContent='Add any available recorded metric, remove cards you do not need, star favorites, and rearrange cards.';
+  $('lhOverviewPickerCount').textContent=lhDashState.visible.filter(id=>lhDashWidgets.has(id)).length+' of '+lhDashWidgets.size+' visible';lhDashRenderEditor();return}
+ const groups=lhOverviewBuckets.filter(g=>g.section===selected.key);
+ const all=groups.flatMap(g=>g.entries);const visible=all.filter(e=>!lhOverviewPrefs.hiddenCards.includes(e.id)).length;
+ $('lhOverviewPickerCount').textContent=visible+' of '+all.length+' visible';
+ $('lhOverviewPickerDesc').textContent='Check a card to add it, uncheck it to remove it. Use arrows to rearrange cards and groups. Only recorded measurements are offered.';
+ const groupSaved=lhOverviewPrefs.groupOrder[selected.key]||[];
+ const groupKeys=[...groupSaved.filter(k=>groups.some(g=>g.key===k)),...groups.map(g=>g.key).filter(k=>!groupSaved.includes(k))];
+ for(const [groupIndex,key] of groupKeys.entries()){
+  const group=groups.find(g=>g.key===key);if(!group)continue;
+  const block=document.createElement('section');block.className='lh-overview-studio-group';
+  const header=document.createElement('div');header.className='lh-overview-studio-group-head';
+  const title=document.createElement('h6');title.textContent=group.title;header.append(title);
+  if(groupKeys.length>1){const actions=document.createElement('div');actions.className='lh-overview-section-editor-actions';
+   actions.append(lhOverviewMakeAction('↑','Move '+group.title+' group up',()=>lhOverviewMoveGroup(selected.key,key,-1),groupIndex===0),lhOverviewMakeAction('↓','Move '+group.title+' group down',()=>lhOverviewMoveGroup(selected.key,key,1),groupIndex===groupKeys.length-1));header.append(actions)}
+  block.append(header);
+  const saved=lhOverviewPrefs.cardOrder[group.key]||[];
+  const ordered=[...saved.filter(id=>group.entries.some(e=>e.id===id)),...group.entries.map(e=>e.id).filter(id=>!saved.includes(id))];
+  if(!ordered.length){const p=document.createElement('p');p.textContent='No measurements recorded for this group yet.';block.append(p)}
+  for(const [i,id] of ordered.entries()){
+   const entry=group.entries.find(e=>e.id===id);if(!entry)continue;
+   const row=document.createElement('div');row.className='lh-overview-studio-card';row.dataset.card=id;
+   const label=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.checked=!lhOverviewPrefs.hiddenCards.includes(id);check.setAttribute('aria-label','Show '+entry.label+' in '+selected.label);check.onchange=()=>lhOverviewToggle(false,id,check.checked);
+   const name=document.createElement('span');name.textContent=entry.label;label.append(check,name);
+   const actions=document.createElement('div');actions.className='lh-overview-section-editor-actions';
+   actions.append(lhOverviewMakeAction('↑','Move '+entry.label+' up',()=>lhOverviewMoveCard(group,id,-1),i===0),lhOverviewMakeAction('↓','Move '+entry.label+' down',()=>lhOverviewMoveCard(group,id,1),i===ordered.length-1));
+   row.append(label,actions);block.append(row);
+   row.draggable=true;row.addEventListener('dragstart',e=>{e.dataTransfer?.setData('text/plain',id);if(e.dataTransfer)e.dataTransfer.effectAllowed='move'});
+   row.addEventListener('dragover',e=>e.preventDefault());row.addEventListener('drop',e=>{e.preventDefault();const from=e.dataTransfer?.getData('text/plain');if(!ordered.includes(from)||from===id)return;
+    const arr=ordered.filter(v=>v!==from);arr.splice(arr.indexOf(id),0,from);lhOverviewPrefs.cardOrder[group.key]=arr;lhOverviewSave();lhOverviewSync()});
+  }
+  cardsList.append(block);
+ }
+ cardsList.scrollTop=lastScroll;
+}
+$('lhDashCustomize').addEventListener('click',()=>{if(lhDashCustomizeOpen)lhOverviewRenderEditor()});
+$('lhDashReset').addEventListener('click',()=>{lhOverviewPrefs=lhOverviewBase();lhOverviewSave();lhOverviewSync()});
+
+
+ 
+ 
+const lhContextSets={
+ overview:{title:'Overview',description:'Your dashboard and existing insights, all in one place.',items:[
+  ['At a glance','lhOverviewGlanceSection'],['Your activity totals','overviewSummaryHeading'],['Personal records','overviewRecordsHeading'],
+  ['Trends & patterns','overviewTrendsHeading'],['Milestones & habits','overviewHistoryHeading'],['Types & gear','overviewMixHeading']]},
+ analytics:{title:'Analytics',description:'Jump to the charts and views you want.',items:[
+  ['Chart controls','.analytics-toolbar'],['All charts','analyticsGrid','analytics:all'],['Speed charts','analyticsGrid','analytics:speed'],
+  ['Distance charts','analyticsGrid','analytics:distance'],['Time & frequency','analyticsGrid','analytics:time']]},
+ advanced:{title:'Advanced data',description:'Available device and weather measurements.',items:[
+  ['Conditions & effort','#statsAdvanced .stats-story-heading'],['Recorded metrics','advancedCards'],['Charts & details','advancedGraphs']]},
+ compare:{title:'Compare activities',description:'From choosing two recordings to their visual comparison.',items:[
+  ['Choose activities','.v120-compare-pickers'],['Route comparison','.v120-compare-stage'],
+  ['Measurements','compareMetrics'],['Performance trends','.v121-compare-trends']]},
+ yearbook:{title:'Year in review',description:'Choose a year in the report to explore all its highlights on one page.',items:[]},
+ activities:{title:'Activities',description:'Find your next recording without hunting down the page.',items:[
+  ['Recent activities','recentActivityHeading'],['Longest routes','longestActivityHeading']]},
+ data:{title:'Data explorer',description:'Filter your source records, choose columns, and browse.',items:[
+  ['Search & filters','.data-filters'],['Visible columns','.data-columns'],['Activity table','dataTable'],['Pages & export','.data-pagination']]},
+ review:{title:'Review anomalies',description:'Inspect flagged activity records and approved exceptions.',items:[
+  ['Review summary','reviewSummary'],['Currently excluded','reviewExcluded'],['Approved exceptions','reviewAllowed']]}
+};
+let lhCurrentContext='',lhContextScrollBound=false;
+function lhContextResolve(identifier){
+ if(identifier.startsWith('.')||identifier.startsWith('#'))return document.querySelector(identifier);
+ return $(identifier);
+}
+function lhContextMark(button){
+ for(const item of $('lhContextLinks').querySelectorAll('.lh-context-link')){
+  const selected=item===button;item.setAttribute('aria-current',selected?'location':'false');
+ }
+}
+function lhContextJump(identifier,action,button){
+ if(action&&action.startsWith('analytics:')){
+  const key=action.slice(10),filter=document.querySelector('[data-analytics-category="'+key+'"]');
+  if(filter){filter.click();for(const entry of document.querySelectorAll('[data-analytics-category]'))entry.setAttribute('aria-pressed',String(entry===filter))}
+ }
+ const node=lhContextResolve(identifier);if(!node)return;
+ const scroll=$('insightsMain'),box=scroll.getBoundingClientRect(),target=node.getBoundingClientRect();
+ scroll.scrollTo({top:Math.max(0,scroll.scrollTop+(target.top-box.top)-18),behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
+ lhContextMark(button);
+}
+function lhContextBuild(key){
+ const config=lhContextSets[key]||lhContextSets.overview;
+ lhCurrentContext=key;$('lhContextHeading').textContent=config.title;$('lhContextDescription').textContent=config.description;
+
+ const root=$('lhContextLinks');root.replaceChildren();
+ for(const [index,[label,identifier,action]] of config.items.entries()){
+  const button=document.createElement('button');button.type='button';button.className='lh-context-link';
+  button.innerHTML='<span class="lh-context-index" aria-hidden="true">'+String(index+1).padStart(2,'0')+'</span><span class="lh-context-label"></span><span class="lh-context-chevron" aria-hidden="true">›</span>';
+  button.querySelector('.lh-context-label').textContent=label;
+  button.setAttribute('aria-current',index===0?'location':'false');
+  button.onclick=()=>lhContextJump(identifier,action,button);
+  root.append(button);
+ }
+}
+ 
+lhContextBuild('overview');
+
+ 
+const lhCalState={open:false,year:new Date().getFullYear(),month:new Date().getMonth(),day:null,view:'month',initialized:false,data:null,loading:0,dayLoading:0};
+const lhCalMonthNames=['January','February','March','April','May','June','July','August','September','October','November','December'];
+const lhCalPad=n=>String(n).padStart(2,'0');
+function lhCalDate(year,month,day){return String(year).padStart(4,'0')+'-'+lhCalPad(month+1)+'-'+lhCalPad(day)}
+function lhCalFocus(){return activityFocus}
+function lhCalendarClose(){
+ if(!lhCalState.open)return;
+ lhCalState.open=false;lhCalState.loading++;lhCalState.dayLoading++;
+ $('lhCalendarWorkspace').hidden=true;$('lhNavCalendar').setAttribute('aria-expanded','false');
+}
+async function lhCalendarOpen(){
+ if($('statsDialog').open)$('statsDialog').close();if(lhSourcePage.open)lhSourcePage.close();
+ if(lhJourney.active)lhJourneyClose();
+ lhCalState.open=true;$('lhCalendarWorkspace').hidden=false;$('lhCalendarWorkspace').scrollTop=0;$('lhNavCalendar').setAttribute('aria-expanded','true');
+ lhRailSelect('calendar');$('lhCalFocus').value=lhCalFocus();
+ await lhCalendarLoad(!lhCalState.initialized);
+}
+async function lhCalendarLoad(selectLatest=false){
+ if(!lhCalState.open)return;
+ const ticket=++lhCalState.loading,focus=lhCalFocus();
+ $('lhCalBoardBody').textContent='Reading your local activity dates…';
+ try{
+  let response=await getJson('/api/calendar?year='+lhCalState.year+'&focus='+encodeURIComponent(focus));
+  if(ticket!==lhCalState.loading||!lhCalState.open||focus!==lhCalFocus())return;
+  if(selectLatest&&response.latest_day&&/^\d{4}-\d{2}-\d{2}$/.test(response.latest_day)){
+   const latestYear=Number(response.latest_day.slice(0,4));
+   if(latestYear!==lhCalState.year){response=await getJson('/api/calendar?year='+latestYear+'&focus='+encodeURIComponent(focus));if(ticket!==lhCalState.loading||!lhCalState.open||focus!==lhCalFocus())return;lhCalState.year=latestYear}
+   lhCalState.month=Number(response.latest_day.slice(5,7))-1;
+   lhCalState.day=response.latest_day;
+  }
+  lhCalState.initialized=true;lhCalState.data=response;
+  if(lhCalState.day&&!lhCalState.day.startsWith(String(lhCalState.year)))lhCalState.day=null;
+  lhCalendarRender();
+  lhCalendarRenderDay();
+ }catch(error){if(ticket===lhCalState.loading){$('lhCalBoardBody').textContent='Calendar unavailable: '+error.message;$('lhCalMetrics').replaceChildren()}}
+}
+function lhCalendarMetric(label,value){const node=document.createElement('div');node.className='lh-cal-metric';const strong=document.createElement('strong');strong.textContent=value;const span=document.createElement('span');span.textContent=label;node.append(strong,span);return node}
+function lhCalendarRender(){
+ const data=lhCalState.data;if(!data)return;
+ const key=String(lhCalState.year)+'-'+lhCalPad(lhCalState.month+1),month=data.months[key]||{count:0,distance_m:0,moving_seconds:0,active_days:0};
+ const yearMode=lhCalState.view==='year';$('lhCalMonthView').setAttribute('aria-pressed',String(!yearMode));$('lhCalYearView').setAttribute('aria-pressed',String(yearMode));
+ $('lhCalTitle').textContent=yearMode?'The year '+lhCalState.year:lhCalMonthNames[lhCalState.month]+' '+lhCalState.year;
+ $('lhCalMetrics').replaceChildren(lhCalendarMetric('Recorded activities',nice(yearMode?data.total_count:month.count)),lhCalendarMetric('Distance traveled',distanceLabel(yearMode?data.total_distance_m:month.distance_m)),lhCalendarMetric('Moving time',timeLabel(yearMode?Object.values(data.months).reduce((n,m)=>n+m.moving_seconds,0):month.moving_seconds)),lhCalendarMetric('Active days',nice(yearMode?data.days.length:month.active_days)));
+ const content=$('lhCalBoardBody');content.replaceChildren();
+ const byDay=new Map(data.days.map(x=>[x.day,x]));
+ if(yearMode){
+  const grid=document.createElement('div');grid.className='lh-cal-year-grid';
+  for(let m=0;m<12;m++){const tile=document.createElement('div');tile.className='lh-cal-year-mini';tile.append(lhCalendarMiniMonth(m,data,byDay,true));grid.append(tile)}content.append(grid);
+ }else{
+  const weekdays=document.createElement('div');weekdays.className='lh-cal-weekdays';for(const name of ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']){const x=document.createElement('span');x.textContent=name;weekdays.append(x)}content.append(weekdays);
+  const grid=document.createElement('div');grid.className='lh-cal-days';
+  const first=(new Date(lhCalState.year,lhCalState.month,1).getDay()+6)%7;
+  for(let i=0;i<first;i++){const blank=document.createElement('div');blank.className='lh-cal-empty-cell';blank.setAttribute('aria-hidden','true');grid.append(blank)}
+  const n=new Date(lhCalState.year,lhCalState.month+1,0).getDate();
+  for(let d=1;d<=n;d++){
+   const key=lhCalDate(lhCalState.year,lhCalState.month,d),info=byDay.get(key),button=document.createElement('button');button.type='button';
+   button.dataset.active=String(Boolean(info));button.setAttribute('aria-pressed',String(lhCalState.day===key));
+   button.setAttribute('aria-label',key+': '+(info?info.count+' recorded activities':'No recorded activities'));
+   const number=document.createElement('span');number.className='lh-cal-day-number';number.textContent=String(d);button.append(number);
+   const amount=document.createElement('span');amount.className='lh-cal-day-amount';amount.textContent=info?info.count+' '+(info.count===1?'activity':'activities'):' ';button.append(amount);
+   if(info){const distance=document.createElement('span');distance.className='lh-cal-day-distance';distance.textContent=distanceLabel(info.distance_m);button.append(distance)}
+   button.onclick=()=>{lhCalState.day=key;lhCalendarRender();lhCalendarRenderDay()};grid.append(button);
+  }content.append(grid);
+ }
+ const mini=$('lhCalMiniMonths');mini.replaceChildren();for(let m=0;m<12;m++)mini.append(lhCalendarMiniMonth(m,data,byDay,false));
+}
+function lhCalendarMiniMonth(month,data,byDay,large){
+ const info=data.months[String(lhCalState.year)+'-'+lhCalPad(month+1)],button=document.createElement('button');button.type='button';button.setAttribute('aria-pressed',String(!large&&lhCalState.view==='month'&&lhCalState.month===month));
+ const name=document.createElement('strong');name.textContent=lhCalMonthNames[month];const sum=document.createElement('small');sum.textContent=info.count+' activities · '+distanceLabel(info.distance_m);button.append(name,sum);
+ const dots=document.createElement('span');dots.className='lh-cal-mini-dots';const first=(new Date(lhCalState.year,month,1).getDay()+6)%7;
+ for(let i=0;i<first;i++){const item=document.createElement('i');item.style.visibility='hidden';dots.append(item)}
+ const days=new Date(lhCalState.year,month+1,0).getDate();for(let d=1;d<=days;d++){
+  const visits=byDay.get(lhCalDate(lhCalState.year,month,d))?.count||0,item=document.createElement('i');item.dataset.level=String(visits>=3?3:visits>=2?2:visits>=1?1:0);dots.append(item)
+ }button.append(dots);
+ button.setAttribute('aria-label',lhCalMonthNames[month]+' '+lhCalState.year+', '+info.count+' activities');
+ button.onclick=()=>{lhCalState.month=month;lhCalState.view='month';lhCalendarRender();lhCalendarRenderDay()};return button;
+}
+async function lhCalendarRenderDay(){
+ const ticket=++lhCalState.dayLoading,day=lhCalState.day,data=lhCalState.data;
+ const title=$('lhCalDayTitle'),subtitle=$('lhCalDaySummary'),rides=$('lhCalRides');rides.replaceChildren();
+ if(!day||!data){title.textContent='Select a day';subtitle.textContent='Choose any calendar date to inspect its recorded GPS activity.';return}
+ const label=new Date(day+'T12:00:00').toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric',year:'numeric'});
+ title.textContent=label;subtitle.textContent='Reading activities for the selected date…';
+ try{
+  const result=await getJson('/api/calendar-day?day='+encodeURIComponent(day)+'&focus='+encodeURIComponent(lhCalFocus()));
+  if(ticket!==lhCalState.dayLoading||!lhCalState.open)return;
+  subtitle.textContent=result.total+' recorded '+(result.total===1?'activity':'activities')+(result.truncated?' · first 120 shown':'');
+  if(!result.activities.length){const text=document.createElement('p');text.className='lh-cal-no-ride';text.textContent='No matching activities on this date. Try another day or change the activity focus.';rides.append(text);return}
+  for(const ride of result.activities){
+   const row=document.createElement('div');row.className='lh-cal-ride';const name=document.createElement('strong');name.textContent=ride.name||'Unnamed activity';
+   const summary=document.createElement('small');summary.textContent=[ride.sport,distanceLabel(ride.distance_m),ride.moving_seconds?timeLabel(ride.moving_seconds):'Moving time unavailable',ride.bike].filter(Boolean).join(' · ');
+   const actions=document.createElement('div');actions.className='lh-cal-ride-actions';
+   for(const [label,action] of [['View route',()=>openRidePreview(ride.id)],['Elevation',()=>lhOpen3DFromList(ride.id)],['Flyover',()=>lhOpenFlyoverFromList(ride.id)]]){const b=document.createElement('button');b.type='button';b.textContent=label;b.setAttribute('aria-label',label==='Elevation'?'Open 3D elevation for '+(ride.name||'activity'):label+' for '+(ride.name||'activity'));b.onclick=action;actions.append(b)}
+   row.append(name,summary,actions);rides.append(row);
+  }
+ }catch(error){if(ticket===lhCalState.dayLoading)subtitle.textContent='Could not load day: '+error.message}
+}
+$('lhCalBack').onclick=lhReturnMap;
+$('lhCalMonthView').onclick=()=>{lhCalState.view='month';lhCalendarRender()};
+$('lhCalYearView').onclick=()=>{lhCalState.view='year';lhCalendarRender()};
+$('lhCalPrev').onclick=()=>{if(lhCalState.view==='year'){lhCalState.year=Math.max(1900,lhCalState.year-1);lhCalState.day=null;lhCalendarLoad();return}lhCalState.month--;if(lhCalState.month<0){lhCalState.month=11;lhCalState.year=Math.max(1900,lhCalState.year-1);lhCalState.day=null;lhCalendarLoad();return}lhCalState.day=null;lhCalendarRender();lhCalendarRenderDay()};
+$('lhCalNext').onclick=()=>{if(lhCalState.view==='year'){lhCalState.year=Math.min(2100,lhCalState.year+1);lhCalState.day=null;lhCalendarLoad();return}lhCalState.month++;if(lhCalState.month>11){lhCalState.month=0;lhCalState.year=Math.min(2100,lhCalState.year+1);lhCalState.day=null;lhCalendarLoad();return}lhCalState.day=null;lhCalendarRender();lhCalendarRenderDay()};
+$('lhCalToday').onclick=()=>lhCalendarLoad(true);
+$('lhCalLatest').onclick=()=>{lhCalState.view='month';lhCalendarLoad(true)};
+$('lhCalFocus').onchange=()=>{$('activityFocus').value=$('lhCalFocus').value;$('activityFocus').dispatchEvent(new Event('change',{bubbles:true}));};
+$('activityFocus').addEventListener('change',()=>{if(lhCalState.open){$('lhCalFocus').value=activityFocus;lhCalState.initialized=false;lhCalendarLoad(true)}});
+
+const lhJourneyResize=new ResizeObserver(()=>{if(lhJourney.active)lhJourneyDraw()});lhJourneyResize.observe($('lhJourneySpace'));
 
 </script></body></html>'''
 
@@ -7546,6 +12462,7 @@ def install_verified_release():
             destinations.append((directory / "USER_GUIDE.md", files["USER_GUIDE.md"]))
         staged, replaced = [], []
         backup_archive = None
+        update_phase = "staging release files"
         try:
             for dest, content in destinations:
                 fd, path = tempfile.mkstemp(prefix=".libreheatmaps-", dir=str(directory))
@@ -7556,6 +12473,7 @@ def install_verified_release():
                 if dest.exists():
                     os.chmod(path, dest.stat().st_mode & 0o777)
                 staged.append((dest, Path(path)))
+            update_phase = "creating application backup"
             backup_directory = directory / "LibreHeatmaps-backups"
             backup_directory.mkdir(parents=True, exist_ok=True)
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -7570,14 +12488,18 @@ def install_verified_release():
                     for dest in sorted(backup_paths, key=lambda p:p.name):
                         if dest.is_file():
                             backup_zip.write(dest, arcname=dest.name)
+                update_phase = "verifying application backup"
                 with zipfile.ZipFile(temp_archive) as verified_zip:
                     if verified_zip.testzip() is not None:
                         raise ValueError("Previous-version backup did not pass ZIP validation")
-                with open(temp_archive, "rb") as stored:
+                update_phase = "flushing verified backup"
+                 
+                with open(temp_archive, "r+b") as stored:
                     os.fsync(stored.fileno())
                 os.replace(temp_archive, backup_archive)
             finally:
                 Path(temp_archive).unlink(missing_ok=True)
+            update_phase = "replacing application files"
             for dest, stage in staged:
                 os.replace(stage, dest)
                 replaced.append(dest)
@@ -7608,7 +12530,9 @@ def install_verified_release():
                     restore_errors.append(str(exc))
             if restore_errors:
                 raise RuntimeError("Update failed and automatic restoration was incomplete. The previous-version ZIP is in LibreHeatmaps-backups. " + "; ".join(restore_errors)) from failure
-            raise RuntimeError("Update failed; previous files were preserved or restored from the backup ZIP") from failure
+            detail = "{}: {}".format(type(failure).__name__, str(failure))[:150]
+            status = "previous files were restored from the backup ZIP" if replaced else "existing application files were not replaced"
+            raise RuntimeError("Update failed while {} ({}); {}".format(update_phase, detail, status)) from failure
         finally:
             for _, stage in staged:
                 stage.unlink(missing_ok=True)
@@ -7723,17 +12647,21 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/":
                 self.send_bytes(PAGE.replace('__APP_TOKEN__', TOKEN).encode(), "text/html; charset=utf-8")
             elif parsed.path == "/api/preferences":
-                self.respond({"appearance":load_appearance(),"display_units":load_display_units()})
+                self.respond({"appearance":load_appearance(),"display_units":load_display_units(),"activity_focus":load_activity_focus()})
             elif parsed.path == "/api/system":
                 self.respond({"version":VERSION,"data_directory":str(DB_PATH.parent),"database":str(DB_PATH),"log":str(DB_PATH.parent/"application.log"),"script":str(Path(__file__).resolve())})
             elif parsed.path == "/api/stats":
                 self.respond(statistics())
+            elif parsed.path == "/api/calendar":
+                self.respond(calendar_overview(params))
+            elif parsed.path == "/api/calendar-day":
+                self.respond(calendar_day(params))
             elif parsed.path == "/api/stat-settings":
                 self.respond(statistics_preferences())
             elif parsed.path == "/api/watch-folder":
                 self.respond(watch_folder_status())
             elif parsed.path == "/api/settings":
-                self.respond({"appearance":load_appearance() or dict(DEFAULT_APPEARANCE),**statistics_preferences(),"display_units":load_display_units(),"watch_folder":load_watch_folder()})
+                self.respond({"appearance":load_appearance() or dict(DEFAULT_APPEARANCE),**statistics_preferences(),"display_units":load_display_units(),"watch_folder":load_watch_folder(),"activity_focus":load_activity_focus()})
             elif parsed.path == "/api/activity-edit":
                 self.respond(edit_activity_details(safe_activity_id(params)))
             elif parsed.path == "/api/activity-speed-estimate":
@@ -7748,8 +12676,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(speed_review_summary())
             elif parsed.path == "/api/activity-table.csv":
                 self.send_bytes(activity_table(params,True), "text/csv; charset=utf-8")
+            elif parsed.path == "/api/place-lens":
+                self.respond(place_lens(params))
             elif parsed.path == "/api/timeline":
-                self.respond(timeline_summary())
+                self.respond(timeline_summary(params))
+            elif parsed.path == "/api/source-preferences":
+                with db_connect() as con:self.respond(source_preference_review(con))
+            elif parsed.path == "/api/source-review":
+                source_id=safe_activity_id(params) if 'id' in params else None
+                with db_connect() as con:
+                    self.respond({'activities':source_version_review(con,source_id),'limited':source_id is None})
             elif parsed.path == "/api/duplicates":
                 self.respond(duplicate_library_scan())
             elif parsed.path == "/api/compare-options":
@@ -7882,13 +12818,25 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,TypeError,IndexError,KeyError,UnicodeDecodeError,sqlite3.Error,zlib.error) as exc:
                 self.respond({'error':str(exc)[:240]},400)
             return
+        if endpoint == "/api/source-preferences":
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if not 2<=size<=4096:raise ValueError('Invalid preferences request size')
+                payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                self.respond(save_source_preferences(payload))
+            except (ValueError,TypeError,KeyError,UnicodeDecodeError,sqlite3.Error) as exc:
+                self.respond({'error':str(exc)[:240]},400)
+            return
         if endpoint == "/api/duplicates/action":
             origin=self.headers.get('Origin','')
             if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
                 self.respond({'error':'Forbidden'},403);return
             try:
                 size=int(self.headers.get('Content-Length','0'))
-                if not 2<=size<=256:raise ValueError('Invalid duplicate request size')
+                if not 2<=size<=4096:raise ValueError('Invalid duplicate request size')
                 payload=json.loads(self.rfile.read(size).decode('utf-8'))
                 self.respond(duplicate_library_action(payload))
             except (ValueError,TypeError,KeyError,UnicodeDecodeError,sqlite3.Error) as exc:
@@ -8024,6 +12972,20 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=watch_folder_scan,daemon=True).start()
             self.respond({'status':'scan_started'},202)
             return
+        if endpoint == '/api/activity-focus':
+            origin=self.headers.get('Origin','')
+            if self.headers.get('X-LibreHeatmaps-Token')!=TOKEN or (origin and origin!='http://127.0.0.1:{}'.format(self.server.server_port)):
+                self.respond({'error':'Forbidden'},403);return
+            try:
+                size=int(self.headers.get('Content-Length','0'))
+                if not 2<=size<=128:raise ValueError('Invalid activity focus request')
+                payload=json.loads(self.rfile.read(size).decode('utf-8'))
+                if not isinstance(payload,dict) or set(payload)!={'activity_focus'} or type(payload['activity_focus']) is not str or payload['activity_focus'] not in ('cycling','foot','all'):
+                    raise ValueError('Invalid activity focus')
+                with db_connect() as con:con.execute("INSERT OR REPLACE INTO app_settings(key,value) VALUES ('activity_focus',?)",(payload['activity_focus'],))
+                self.respond({'activity_focus':payload['activity_focus']})
+            except (ValueError,UnicodeDecodeError,sqlite3.Error) as exc:self.respond({'error':str(exc)[:200]},400)
+            return
         if endpoint == "/api/settings":
             origin = self.headers.get("Origin", "")
             if self.headers.get("X-LibreHeatmaps-Token") != TOKEN or (origin and origin != "http://127.0.0.1:{}".format(self.server.server_port)):
@@ -8098,6 +13060,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with connection:
                         removed = connection.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
+                        connection.execute("DELETE FROM activity_source_versions")
+                        connection.execute("DELETE FROM activity_source_choices")
+                        connection.execute("DELETE FROM activity_source_baselines")
                         connection.execute("DELETE FROM activities")
                         connection.execute("DELETE FROM archived_duplicates")
                         connection.execute("DELETE FROM speed_filter_exceptions")
@@ -8106,8 +13071,8 @@ class Handler(BaseHTTPRequestHandler):
                         connection.execute("DELETE FROM activity_edit_log")
                         connection.execute("DELETE FROM activity_route_repairs")
                         connection.execute("DELETE FROM import_history")
-                        # Delete only import-derived Garmin ledger state. Retain original
-                        # FIT/GPX files, watched-folder path/history, accounts and settings.
+                         
+                         
                         connection.execute("DELETE FROM app_settings WHERE key LIKE 'garmin_personal_synced:%' OR key LIKE 'garmin_personal_nogps:%' OR key LIKE 'garmin_history_%'")
                 except sqlite3.Error:
                     self.respond({"error": "Unable to clear local activities"}, 500)
@@ -8191,7 +13156,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid file size")
             filename = unquote(self.headers.get("X-File-Name", "")).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             if not filename.lower().endswith((".zip", ".csv", ".gps") + FORMATS):
-                raise ValueError("Select a Strava or Garmin account ZIP, activities.csv, FIT, GPX or TCX file")
+                raise ValueError("Select a supported FIT, GPX, TCX, KML, KMZ, GeoJSON, GPS CSV or activity ZIP file")
             fd, temporary = tempfile.mkstemp(prefix="libreheatmaps-import-", suffix=".tmp", dir=str(DB_PATH.parent))
             with os.fdopen(fd, "wb") as output:
                 remaining = length
@@ -8314,13 +13279,13 @@ def log_startup_failure():
 def main():
     global DB_PATH, SERVER_STARTED
     parser = argparse.ArgumentParser(description="LibreHeatmaps local GPS activity viewer")
-    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--port", type=int, default=DEFAULT_WEB_PORT, help="Local browser port (default 63120; use 0 only for a temporary port)")
     parser.add_argument("--no-browser", action="store_true")
     default_data = Path.home() / ".libreheatmaps"
     parser.add_argument("--data-dir", type=Path, default=default_data)
     parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if os.name != "nt" and not args.background and not args.no_browser and args.port == 0 and args.data_dir == default_data:
+    if os.name != "nt" and not args.background and not args.no_browser and args.port == DEFAULT_WEB_PORT and args.data_dir == default_data:
         gui_python = Path(sys.executable)
         if not gui_python.is_file():
             gui_python = Path(sys.executable)
@@ -8335,17 +13300,38 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     DB_PATH = data_dir / "activities.sqlite3"
     init_db()
-    threading.Thread(target=watch_folder_loop,daemon=True).start()
-    threading.Thread(target=garmin_personal_loop,daemon=True).start()
-    threading.Thread(target=strava_sync_loop,daemon=True).start()
-    start_heat_warmup()
-    SERVER_STARTED = time.monotonic()
-    with LocalServer(("127.0.0.1", args.port), Handler) as server:
+    try:
+        server = LocalServer(("127.0.0.1", args.port), Handler)
+    except OSError as exc:
+        requested = args.port
+        message = ("LibreHeatmaps could not start on 127.0.0.1:{}: {}. "
+                   "Close the other instance or application using that port, then restart LibreHeatmaps. "
+                   "The port is not changed automatically, so your browser settings keep their origin."
+                   ).format(requested, exc)
+        print(message, file=sys.stderr, flush=True)
+        try:
+            with open(data_dir / "application.log", "a", encoding="utf-8") as log:
+                log.write(message + "\n")
+        except OSError:
+            pass
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, message, "LibreHeatmaps startup", 0x30)
+            except Exception:
+                pass
+        return
+    with server:
+        threading.Thread(target=watch_folder_loop,daemon=True).start()
+        threading.Thread(target=garmin_personal_loop,daemon=True).start()
+        threading.Thread(target=strava_sync_loop,daemon=True).start()
+        start_heat_warmup()
+        SERVER_STARTED = time.monotonic()
         url = "http://127.0.0.1:{}".format(server.server_port)
         print("\nLibreHeatmaps {}".format(VERSION), flush=True)
         print("Open {} in your browser".format(url), flush=True)
         print("Activity cache: {}".format(DB_PATH), flush=True)
-        if args.background or (os.name == "nt" and not args.no_browser and args.port == 0 and args.data_dir == default_data):
+        if args.background or (os.name == "nt" and not args.no_browser and args.port == DEFAULT_WEB_PORT and args.data_dir == default_data):
             threading.Thread(target=idle_watcher, args=(server,), daemon=True).start()
         if not args.no_browser:
             browser_launch = threading.Timer(0.65, lambda: open_launch_browser(url, data_dir))
